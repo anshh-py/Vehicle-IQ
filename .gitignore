@@ -1,0 +1,13 @@
+# Local environment and secrets
+.env
+.env.*
+!.env.example
+
+# Python virtual environments and generated files
+.venv/
+backend/.venv/
+venv/
+.local-storage/
+__pycache__/
+.pytest_cache/
+*.py[cod]
