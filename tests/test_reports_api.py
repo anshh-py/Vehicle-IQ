@@ -289,6 +289,9 @@ def test_incomplete_results_are_reported_as_pending_or_unavailable(report_api):
     assert data["market_valuation"]["status"] == "unavailable"
     assert data["market_valuation"]["market_asking_price_range"] is None
     assert data["market_valuation"]["evidence_count"] == 0
+    assert data["vehicle_details_lookup"]["status"] == "unavailable"
+    assert data["challan_lookup"]["status"] == "unavailable"
+    assert data["fastag_lookup"]["status"] == "unavailable"
 
 
 def test_report_retrieval_returns_existing_snapshot_and_404_when_absent(report_api):

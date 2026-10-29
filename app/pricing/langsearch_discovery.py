@@ -10,6 +10,7 @@ import httpx
 from pydantic import BaseModel, ConfigDict, Field
 
 from app.core.config import settings
+from app.core.http import ExternalResponseTooLarge, request_with_response_limit
 from app.pricing.market import MarketVehicleCriteria
 
 
@@ -72,8 +73,11 @@ class LangSearchDiscoveryClient:
             with httpx.Client(
                 timeout=httpx.Timeout(self.timeout_seconds), transport=self.transport
             ) as client:
-                response = client.post(
+                response = request_with_response_limit(
+                    client,
+                    "POST",
                     LANGSEARCH_ENDPOINT,
+                    max_bytes=settings.max_external_response_bytes,
                     headers={
                         "Authorization": f"Bearer {self._api_key}",
                         "Content-Type": "application/json",
@@ -81,6 +85,8 @@ class LangSearchDiscoveryClient:
                     },
                     json=payload,
                 )
+        except ExternalResponseTooLarge:
+            raise LangSearchInvalidResponse("LangSearch response exceeded the allowed size.") from None
         except httpx.TimeoutException:
             raise LangSearchError("LangSearch request timed out.") from None
         except httpx.RequestError:

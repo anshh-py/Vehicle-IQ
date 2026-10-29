@@ -1,7 +1,7 @@
 from collections.abc import Generator
 from contextlib import contextmanager
 from io import BytesIO
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 from fastapi.testclient import TestClient
 from PIL import Image
@@ -13,7 +13,7 @@ from sqlalchemy.pool import StaticPool
 from app.damage.inference import DamageDetection, DamageInferenceResult
 from app.damage.worker import DamageWorkerUnavailable
 from app.db.base import Base
-from app.db.models import DamageFinding, UploadedImage, VehicleAssessment
+from app.db.models import DamageFinding, EvidenceRecord, UploadedImage, VehicleAssessment
 from app.db.session import get_db
 from app.main import app
 from app.api.v1.damage import get_damage_provider
@@ -45,6 +45,19 @@ class FakeDamageProvider:
         if self.error:
             raise self.error
         return self.result
+
+
+class SequenceDamageProvider(FakeDamageProvider):
+    def __init__(self, results):
+        super().__init__()
+        self.results = iter(results)
+
+    def detect(self, content: bytes, extension: str) -> DamageInferenceResult:
+        self.calls.append((content, extension))
+        result = next(self.results)
+        if isinstance(result, Exception):
+            raise result
+        return result
 
 
 class DamageAPIFixture:
@@ -118,6 +131,24 @@ def damage_api_fixture(tmp_path):
 def count_findings(engine) -> int:
     with Session(engine) as session:
         return session.scalar(select(func.count()).select_from(DamageFinding)) or 0
+
+
+def add_stored_image(api, content: bytes) -> str:
+    object_key = api.storage.save(content, "png")
+    with Session(api.engine) as session:
+        image = UploadedImage(
+            assessment_id=UUID(api.assessment_id),
+            storage_provider="local",
+            storage_bucket="vehicle-images",
+            object_key=object_key,
+            original_filename="additional-vehicle.png",
+            content_type="image/png",
+            byte_size=len(content),
+            sha256="additional-test-sha256",
+        )
+        session.add(image)
+        session.commit()
+        return str(image.id)
 
 
 def test_damage_endpoint_persists_only_model_results(damage_api_fixture):
@@ -221,3 +252,136 @@ def test_damage_endpoint_does_not_persist_worker_failure(tmp_path):
         assert response.status_code == 503
         assert response.json()["detail"] == "Damage inference is unavailable."
         assert count_findings(api.engine) == 0
+
+
+def test_batch_damage_processes_ten_owned_images_and_report_aggregates_findings(damage_api_fixture):
+    api = damage_api_fixture
+    image_ids = [api.image_id] + [add_stored_image(api, api.content) for _ in range(9)]
+
+    response = api.client.post(
+        f"/api/v1/assessments/{api.assessment_id}/damage",
+        json={"image_ids": image_ids},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["status"] == "completed"
+    assert payload["processed_count"] == 10
+    assert payload["failed_count"] == 0
+    assert len(payload["results"]) == 10
+    assert all(item["status"] == "completed" and len(item["findings"]) == 2 for item in payload["results"])
+    assert {finding["image_id"] for item in payload["results"] for finding in item["findings"]} == set(image_ids)
+    assert count_findings(api.engine) == 20
+    assert len(api.provider.calls) == 10
+
+    repeated = api.client.post(
+        f"/api/v1/assessments/{api.assessment_id}/damage",
+        json={"image_ids": image_ids},
+    )
+    assert repeated.status_code == 200
+    assert all(item["reused"] for item in repeated.json()["results"])
+    assert count_findings(api.engine) == 20
+    assert len(api.provider.calls) == 10
+
+    report = api.client.post(f"/api/v1/assessments/{api.assessment_id}/report")
+    assert report.status_code == 200
+    report_data = report.json()["report_data"]
+    assert report_data["stages"]["damage_detection"]["finding_count"] == 20
+    assert report_data["stages"]["damage_detection"]["images_with_findings"] == 10
+
+
+def test_batch_damage_rejects_more_than_ten_and_duplicate_image_ids(damage_api_fixture):
+    api = damage_api_fixture
+    too_many = api.client.post(
+        f"/api/v1/assessments/{api.assessment_id}/damage",
+        json={"image_ids": [str(uuid4()) for _ in range(11)]},
+    )
+    duplicate = api.client.post(
+        f"/api/v1/assessments/{api.assessment_id}/damage",
+        json={"image_ids": [api.image_id, api.image_id]},
+    )
+
+    assert too_many.status_code == duplicate.status_code == 422
+    assert api.provider.calls == []
+
+
+def test_batch_damage_reports_cross_assessment_image_failure(damage_api_fixture):
+    api = damage_api_fixture
+    with Session(api.engine) as session:
+        other_assessment = VehicleAssessment()
+        session.add(other_assessment)
+        session.commit()
+        other_assessment_id = str(other_assessment.id)
+
+    response = api.client.post(
+        f"/api/v1/assessments/{other_assessment_id}/damage",
+        json={"image_ids": [api.image_id]},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "failed"
+    assert response.json()["results"][0]["error"] == "Image not found for assessment."
+    assert api.provider.calls == []
+    assert count_findings(api.engine) == 0
+
+
+def test_batch_damage_empty_detection_is_success_without_fabricated_findings(damage_api_fixture):
+    api = damage_api_fixture
+    api.provider.result = DamageInferenceResult(detections=(), inference_seconds=0.2)
+
+    response = api.client.post(
+        f"/api/v1/assessments/{api.assessment_id}/damage",
+        json={"image_ids": [api.image_id]},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "completed"
+    assert response.json()["results"][0]["findings"] == []
+    assert count_findings(api.engine) == 0
+    assert response.json()["results"][0]["reused"] is False
+
+    repeated = api.client.post(
+        f"/api/v1/assessments/{api.assessment_id}/damage",
+        json={"image_ids": [api.image_id]},
+    )
+    assert repeated.status_code == 200
+    assert repeated.json()["results"][0]["reused"] is True
+    assert len(api.provider.calls) == 1
+    with Session(api.engine) as session:
+        marker = session.scalar(select(EvidenceRecord).where(EvidenceRecord.evidence_type == "damage_detection"))
+        assert marker.evidence_data == {"status": "completed", "detection_count": 0}
+
+    report = api.client.post(f"/api/v1/assessments/{api.assessment_id}/report")
+    assert report.status_code == 200
+    assert report.json()["report_data"]["stages"]["damage_detection"]["status"] == "completed_no_findings"
+
+
+def test_batch_damage_continues_after_corrupt_image_and_inference_failure(tmp_path):
+    with damage_api(tmp_path, provider=FakeDamageProvider()) as api:
+        corrupt_id = add_stored_image(api, b"not an image")
+        second_id = add_stored_image(api, api.content)
+        third_id = add_stored_image(api, api.content)
+        api.provider = SequenceDamageProvider(
+            [DamageWorkerUnavailable("worker unavailable"), api.provider.result]
+        )
+        app.dependency_overrides[get_damage_provider] = lambda: api.provider
+
+        response = api.client.post(
+            f"/api/v1/assessments/{api.assessment_id}/damage",
+            json={"image_ids": [corrupt_id, second_id, third_id]},
+        )
+
+        assert response.status_code == 200
+        body = response.json()
+        assert body["status"] == "partial"
+        assert body["processed_count"] == 1
+        assert body["failed_count"] == 2
+        assert body["results"][0]["error"] == "Stored image is corrupt or unsupported."
+        assert body["results"][1]["error"] == "Damage inference is unavailable."
+        assert len(body["results"][2]["findings"]) == 2
+        assert len(api.provider.calls) == 2
+        assert count_findings(api.engine) == 2
+
+        report = api.client.post(f"/api/v1/assessments/{api.assessment_id}/report")
+        assert report.status_code == 200
+        assert report.json()["report_data"]["stages"]["damage_detection"]["status"] == "partial"

@@ -1,6 +1,6 @@
 from collections.abc import Generator
 from decimal import Decimal
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
 from fastapi.testclient import TestClient
@@ -150,6 +150,65 @@ def test_fake_provider_result_is_persisted_and_returned(pricing_api):
         assert estimate.estimate_data["vehicle"]["odometer_km"] == 42000
 
 
+def test_pricing_to_report_flow_keeps_ml_and_market_values_separate(pricing_api):
+    client, (engine, assessment_id) = pricing_api
+    fake = FakePriceProvider()
+    app.dependency_overrides[get_price_provider] = lambda: fake
+
+    with Session(engine) as session:
+        assessment = session.get(VehicleAssessment, UUID(assessment_id))
+        assessment.asking_price_inr = Decimal("675000.00")
+        session.commit()
+
+    estimate_response = client.post(
+        f"/api/v1/assessments/{assessment_id}/price-estimates", json=VALID_REQUEST
+    )
+    report_response = client.post(f"/api/v1/assessments/{assessment_id}/report")
+
+    assert estimate_response.status_code == 201
+    assert report_response.status_code == 200
+    report = report_response.json()["report_data"]
+    assert report["assessment"]["asking_price_inr"] == "675000.00"
+    assert report["price_estimates"][-1]["amount"] == "625000.00"
+    assert report["market_valuation"]["status"] == "unavailable"
+    assert report["market_valuation"]["market_asking_price_range"] is None
+    recommendation = report["buyer_recommendation"]
+    assert recommendation["status"] == "negotiate"
+    assert recommendation["comparison_basis"] == "ml_estimate_only"
+    assert recommendation["asking_price_inr"] == "675000.00"
+    assert recommendation["ml_estimate_inr"] == "625000.00"
+    assert recommendation["absolute_difference_inr"] == "50000.00"
+    assert recommendation["difference_percent_of_ml_estimate"] == "8.00"
+    assert "not verified market value" in recommendation["explanation"]
+
+    retrieved = client.get(f"/api/v1/assessments/{assessment_id}/report")
+    assert retrieved.status_code == 200
+    assert retrieved.json()["report_data"]["buyer_recommendation"] == recommendation
+
+
+def test_pricing_to_report_flow_without_asking_price(pricing_api):
+    client, (_engine, assessment_id) = pricing_api
+    app.dependency_overrides[get_price_provider] = lambda: FakePriceProvider()
+
+    estimate_response = client.post(
+        f"/api/v1/assessments/{assessment_id}/price-estimates", json=VALID_REQUEST
+    )
+    report_response = client.post(f"/api/v1/assessments/{assessment_id}/report")
+
+    assert estimate_response.status_code == 201
+    assert report_response.status_code == 200
+    report = report_response.json()["report_data"]
+    assert report["assessment"]["asking_price_inr"] is None
+    assert report["price_estimates"][-1]["amount"] == "625000.00"
+    assert report["market_valuation"]["status"] == "unavailable"
+    recommendation = report["buyer_recommendation"]
+    assert recommendation["status"] == "insufficient_evidence"
+    assert recommendation["asking_price_inr"] is None
+    assert recommendation["ml_estimate_inr"] == "625000.00"
+    assert recommendation["absolute_difference_inr"] is None
+    assert recommendation["difference_percent_of_ml_estimate"] is None
+
+
 @pytest.mark.parametrize("artifact_state", ["missing", "invalid"])
 def test_model_artifact_failure_returns_safe_502_without_persisting(
     pricing_api, tmp_path, artifact_state
@@ -174,6 +233,11 @@ def test_model_artifact_failure_returns_safe_502_without_persisting(
 def test_provider_failure_does_not_persist_estimate(pricing_api):
     client, (engine, assessment_id) = pricing_api
 
+    with Session(engine) as session:
+        assessment = session.get(VehicleAssessment, UUID(assessment_id))
+        assessment.asking_price_inr = Decimal("650000.00")
+        session.commit()
+
     class BrokenProvider:
         def predict(self, _vehicle):
             raise RuntimeError("sensitive internal provider detail")
@@ -186,3 +250,15 @@ def test_provider_failure_does_not_persist_estimate(pricing_api):
     assert "sensitive" not in response.text
     with Session(engine) as session:
         assert session.scalar(select(PriceEstimate)) is None
+
+    report_response = client.post(f"/api/v1/assessments/{assessment_id}/report")
+    assert report_response.status_code == 200
+    report = report_response.json()["report_data"]
+    assert report["assessment"]["asking_price_inr"] == "650000.00"
+    assert report["price_estimates"] == []
+    assert report["market_valuation"]["status"] == "unavailable"
+    recommendation = report["buyer_recommendation"]
+    assert recommendation["status"] == "insufficient_evidence"
+    assert recommendation["asking_price_inr"] == "650000.00"
+    assert recommendation["ml_estimate_inr"] is None
+    assert recommendation["absolute_difference_inr"] is None

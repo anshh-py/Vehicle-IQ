@@ -13,6 +13,7 @@ from app.core.config import settings
 from app.db.models import (
     AssessmentReport,
     DamageFinding,
+    EvidenceRecord,
     OCRResult,
     PriceEstimate,
     UploadedImage,
@@ -30,8 +31,8 @@ from app.schemas.reports import AssessmentReportResponse
 
 router = APIRouter(prefix="/api/v1/assessments", tags=["assessment reports"])
 _DAMAGE_COMPLETION_LIMITATION = (
-    "The database stores positive damage findings only; an empty finding list cannot "
-    "distinguish a completed scan with no detections from a scan that has not run."
+    "Legacy damage records may have no scan-completion evidence; an empty finding list "
+    "for those records cannot distinguish a completed scan from a scan that has not run."
 )
 
 
@@ -46,6 +47,66 @@ def _ocr_confidence(result: OCRResult) -> float | None:
         if math.isfinite(confidence):
             return confidence
     return None
+
+
+def _latest_vehicle_service(results: list[OCRResult], result_type: str, allowed_fields: set[str]):
+    matches = [result for result in results if result.result_type == result_type]
+    if not matches:
+        return {"status": "unavailable", "provider": None, "details": None, "error_code": "not_run"}
+    latest = matches[-1]
+    data = latest.result_data if isinstance(latest.result_data, dict) else {}
+    details = data.get("details") if isinstance(data.get("details"), dict) else None
+    safe_details = (
+        {key: value for key, value in details.items() if key in allowed_fields}
+        if details is not None
+        else None
+    )
+    state = data.get("state")
+    if state not in {"available", "unavailable", "partial", "failed"}:
+        state = latest.status if latest.status in {"unavailable", "partial", "failed"} else "failed"
+    return {
+        "status": state,
+        "provider": latest.provider,
+        "details": safe_details,
+        "error_code": data.get("error_code") if isinstance(data.get("error_code"), str) else None,
+    }
+
+
+def _vehicle_details_lookup(results: list[OCRResult]) -> dict[str, Any]:
+    matches = [result for result in results if result.result_type == "registration_lookup"]
+    if not matches:
+        return {"status": "unavailable", "result_count": 0, "details": None}
+    latest = matches[-1]
+    source = latest.result_data if isinstance(latest.result_data, dict) else {}
+    allowed_fields = {
+        "registration_number",
+        "make",
+        "model",
+        "variant",
+        "fuel_type",
+        "registration_date",
+        "manufacturing_year",
+        "vehicle_class",
+        "registration_valid_until",
+        "rto",
+        "fitness_expiry",
+        "puc_expiry",
+        "insurance_expiry",
+        "blacklisted",
+    }
+    details = {key: value for key, value in source.items() if key in allowed_fields}
+    if latest.status != "completed":
+        result_status = "failed"
+    elif details.get("make") and details.get("model"):
+        result_status = "available"
+    else:
+        result_status = "partial"
+    return {
+        "status": result_status,
+        "result_count": len(matches),
+        "provider": latest.provider,
+        "details": details or None,
+    }
 
 
 def _market_inputs(assessment: VehicleAssessment, estimates: list[PriceEstimate]):
@@ -244,6 +305,7 @@ def _build_report_data(
     images: list[UploadedImage],
     ocr_results: list[OCRResult],
     damage_findings: list[DamageFinding],
+    damage_scans: list[EvidenceRecord],
     price_estimates: list[PriceEstimate],
     market_valuation: dict[str, Any],
 ) -> dict[str, Any]:
@@ -251,7 +313,10 @@ def _build_report_data(
     completed_ocr_image_ids = {
         result.image_id
         for result in ocr_results
-        if result.status == "completed" and result.image_id is not None and result.image_id in image_ids
+        if result.result_type == "image_ocr"
+        and result.status == "completed"
+        and result.image_id is not None
+        and result.image_id in image_ids
     }
     if image_ids:
         completed_ocr_count = len(completed_ocr_image_ids)
@@ -261,15 +326,28 @@ def _build_report_data(
             ocr_status = "partial"
         else:
             ocr_status = "pending"
-    elif any(result.status == "completed" for result in ocr_results):
+    elif any(result.result_type == "image_ocr" and result.status == "completed" for result in ocr_results):
         ocr_status = "available"
-    elif ocr_results:
+    elif any(result.result_type == "image_ocr" for result in ocr_results):
         ocr_status = "pending"
     else:
         ocr_status = "unavailable"
 
-    if damage_findings:
+    scanned_image_ids = {
+        scan.image_id
+        for scan in damage_scans
+        if scan.image_id is not None
+        and scan.image_id in image_ids
+        and (scan.evidence_data or {}).get("status") == "completed"
+    }
+    if image_ids and scanned_image_ids and len(scanned_image_ids) < len(image_ids):
+        damage_status = "partial"
+    elif damage_findings:
         damage_status = "results_available"
+    elif image_ids and len(scanned_image_ids) == len(image_ids):
+        damage_status = "completed_no_findings"
+    elif scanned_image_ids:
+        damage_status = "partial"
     else:
         damage_status = "pending_or_no_findings" if images else "unavailable"
 
@@ -305,7 +383,7 @@ def _build_report_data(
         "stages": {
             "ocr": {
                 "status": ocr_status,
-                "result_count": len(ocr_results),
+                "result_count": sum(result.result_type == "image_ocr" for result in ocr_results),
                 "completed_image_count": len(completed_ocr_image_ids),
             },
             "damage_detection": {
@@ -332,7 +410,50 @@ def _build_report_data(
                 "created_at": _iso(result.created_at),
             }
             for result in ocr_results
+            if result.result_type == "image_ocr"
         ],
+        "registration_lookup_results": [
+            {
+                "id": str(result.id),
+                "image_id": str(result.image_id) if result.image_id else None,
+                "status": result.status,
+                "provider": result.provider,
+                "details": {
+                    key: value
+                    for key, value in (result.result_data or {}).items()
+                    if key in {
+                        "registration_number",
+                        "make",
+                        "model",
+                        "variant",
+                        "fuel_type",
+                        "registration_date",
+                        "manufacturing_year",
+                        "vehicle_class",
+                        "registration_valid_until",
+                        "rto",
+                        "fitness_expiry",
+                        "puc_expiry",
+                        "insurance_expiry",
+                        "blacklisted",
+                    }
+                },
+                "created_at": _iso(result.created_at),
+            }
+            for result in ocr_results
+            if result.result_type == "registration_lookup"
+        ],
+        "vehicle_details_lookup": _vehicle_details_lookup(ocr_results),
+        "challan_lookup": _latest_vehicle_service(
+            ocr_results,
+            "challan_lookup",
+            {"status", "records"},
+        ),
+        "fastag_lookup": _latest_vehicle_service(
+            ocr_results,
+            "fastag_lookup",
+            {"status", "issuing_bank", "issue_date", "vehicle_class"},
+        ),
         "damage_findings": [
             {
                 "id": str(finding.id),
@@ -494,6 +615,16 @@ def _load_stage_records(db: Session, assessment_id: UUID):
             .order_by(DamageFinding.created_at, DamageFinding.id)
         ).all()
     )
+    damage_scans = list(
+        db.scalars(
+            select(EvidenceRecord)
+            .where(
+                EvidenceRecord.assessment_id == assessment_id,
+                EvidenceRecord.evidence_type == "damage_detection",
+            )
+            .order_by(EvidenceRecord.created_at, EvidenceRecord.id)
+        ).all()
+    )
     price_estimates = list(
         db.scalars(
             select(PriceEstimate)
@@ -501,7 +632,7 @@ def _load_stage_records(db: Session, assessment_id: UUID):
             .order_by(PriceEstimate.created_at, PriceEstimate.id)
         ).all()
     )
-    return images, ocr_results, damage_findings, price_estimates
+    return images, ocr_results, damage_findings, damage_scans, price_estimates
 
 
 @router.post(
@@ -548,14 +679,14 @@ def generate_assessment_report(
             if assessment is None:
                 raise HTTPException(status_code=404, detail="Assessment not found.")
 
-            images, ocr_results, damage_findings, price_estimates = _load_stage_records(db, assessment_id)
+            images, ocr_results, damage_findings, damage_scans, price_estimates = _load_stage_records(db, assessment_id)
             report = db.scalar(
                 select(AssessmentReport)
                 .where(AssessmentReport.assessment_id == assessment_id)
                 .with_for_update()
             )
             report_data = _build_report_data(
-                assessment, images, ocr_results, damage_findings, price_estimates, market_valuation
+                assessment, images, ocr_results, damage_findings, damage_scans, price_estimates, market_valuation
             )
             if report is None:
                 report = AssessmentReport(assessment_id=assessment_id)

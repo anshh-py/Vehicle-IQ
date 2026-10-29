@@ -19,10 +19,16 @@ from app.damage.worker import (
     DamageWorkerUnavailable,
     IsolatedDamageProvider,
 )
-from app.db.models import DamageFinding, UploadedImage, VehicleAssessment
+from app.db.models import DamageFinding, EvidenceRecord, UploadedImage, VehicleAssessment
 from app.db.session import get_db
 from app.images.validation import InvalidImageError, inspect_image
-from app.schemas.damage import DamageFindingResponse, ImageDamageResponse
+from app.schemas.damage import (
+    AssessmentDamageRequest,
+    AssessmentDamageResponse,
+    AssessmentImageDamageResult,
+    DamageFindingResponse,
+    ImageDamageResponse,
+)
 from app.storage.images import ImageStorage, ImageStorageError, get_image_storage
 
 
@@ -90,15 +96,21 @@ def _existing_findings(db: Session, assessment_id: UUID, image_id: UUID) -> list
     )
 
 
+def _existing_scan(db: Session, assessment_id: UUID, image_id: UUID) -> EvidenceRecord | None:
+    return db.scalar(
+        select(EvidenceRecord).where(
+            EvidenceRecord.assessment_id == assessment_id,
+            EvidenceRecord.image_id == image_id,
+            EvidenceRecord.evidence_type == "damage_detection",
+            EvidenceRecord.source_reference == MODEL_NAME,
+        )
+    )
 def _persist_findings(
     db: Session,
     assessment_id: UUID,
     image_id: UUID,
     result: DamageInferenceResult,
 ) -> ImageDamageResponse:
-    if not result.detections:
-        return _analysis_response(assessment_id, image_id, [], reused=False)
-
     try:
         db.rollback()
         with db.begin():
@@ -111,7 +123,7 @@ def _persist_findings(
                 raise HTTPException(status_code=404, detail="Image not found for assessment.")
 
             existing = _existing_findings(db, assessment_id, image_id)
-            if existing:
+            if _existing_scan(db, assessment_id, image_id) is not None or existing:
                 return _analysis_response(assessment_id, image_id, existing, reused=True)
 
             findings: list[DamageFinding] = []
@@ -134,6 +146,18 @@ def _persist_findings(
                 )
                 db.add(finding)
                 findings.append(finding)
+            db.add(
+                EvidenceRecord(
+                    assessment_id=assessment_id,
+                    image_id=image_id,
+                    evidence_type="damage_detection",
+                    source_reference=MODEL_NAME,
+                    evidence_data={
+                        "status": "completed",
+                        "detection_count": len(result.detections),
+                    },
+                )
+            )
             db.flush()
             response = _analysis_response(assessment_id, image_id, findings, reused=False)
         return response
@@ -185,7 +209,7 @@ def inspect_assessment_image_damage(
 
     try:
         existing = _existing_findings(db, assessment_id, image_id)
-        if existing:
+        if _existing_scan(db, assessment_id, image_id) is not None:
             db.rollback()
             return _analysis_response(assessment_id, image_id, existing, reused=True)
         db.rollback()
@@ -211,3 +235,63 @@ def inspect_assessment_image_damage(
         raise HTTPException(status_code=502, detail="Damage inference failed.") from None
 
     return _persist_findings(db, assessment_id, image_id, result)
+
+
+@router.post(
+    "/{assessment_id}/damage",
+    response_model=AssessmentDamageResponse,
+    responses={404: {"description": "Assessment not found."}},
+)
+def inspect_assessment_damage(
+    assessment_id: UUID,
+    payload: AssessmentDamageRequest,
+    db: Session = Depends(get_db),
+    storage: ImageStorage = Depends(get_image_storage),
+    provider: DamageProvider = Depends(get_damage_provider),
+) -> AssessmentDamageResponse:
+    """Run the existing per-image detector for up to ten selected assessment images."""
+    try:
+        if db.get(VehicleAssessment, assessment_id) is None:
+            raise HTTPException(status_code=404, detail="Assessment not found.")
+    except SQLAlchemyError:
+        raise HTTPException(status_code=500, detail="Unable to retrieve assessment.") from None
+
+    results: list[AssessmentImageDamageResult] = []
+    for image_id in payload.image_ids:
+        try:
+            item = inspect_assessment_image_damage(
+                assessment_id=assessment_id,
+                image_id=image_id,
+                db=db,
+                storage=storage,
+                provider=provider,
+            )
+            results.append(
+                AssessmentImageDamageResult(
+                    image_id=image_id,
+                    status="completed",
+                    reused=item.reused,
+                    findings=item.findings,
+                )
+            )
+        except HTTPException as exc:
+            db.rollback()
+            results.append(
+                AssessmentImageDamageResult(
+                    image_id=image_id,
+                    status="failed",
+                    error=str(exc.detail),
+                )
+            )
+
+    failed_count = sum(result.status == "failed" for result in results)
+    status_value = (
+        "completed" if failed_count == 0 else "failed" if failed_count == len(results) else "partial"
+    )
+    return AssessmentDamageResponse(
+        assessment_id=assessment_id,
+        status=status_value,
+        processed_count=len(results) - failed_count,
+        failed_count=failed_count,
+        results=results,
+    )

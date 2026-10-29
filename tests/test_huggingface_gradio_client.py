@@ -230,6 +230,24 @@ def test_public_space_base_mode_is_configurable():
     assert seen_body["mode"] == "base"
 
 
+def test_public_space_oversized_response_is_rejected_safely(monkeypatch):
+    from app.core.config import settings
+
+    monkeypatch.setattr(settings, "max_external_response_bytes", 16)
+    client = HuggingFaceGradioOCRClient(
+        BASE_URL,
+        transport=httpx.MockTransport(
+            lambda _request: httpx.Response(200, content=b"sensitive-upstream-body")
+        ),
+    )
+
+    with pytest.raises(OCRInvalidResponse) as error:
+        client.recognize(b"image", "vehicle.png", "image/png")
+
+    assert "exceeded the allowed size" in str(error.value)
+    assert "sensitive-upstream-body" not in str(error.value)
+
+
 def test_provider_selection_defaults_and_keeps_local_baidu_provider(monkeypatch):
     import app.api.v1.ocr as ocr_api
 

@@ -160,6 +160,22 @@ def test_malformed_responses_raise_safe_error(response):
         client.search(CRITERIA)
 
 
+def test_oversized_response_is_rejected_without_exposing_provider_body(monkeypatch):
+    monkeypatch.setattr(settings, "max_external_response_bytes", 16)
+    client = LangSearchDiscoveryClient(
+        "fake",
+        transport=httpx.MockTransport(
+            lambda _request: httpx.Response(200, content=b"sensitive-provider-response")
+        ),
+    )
+
+    with pytest.raises(LangSearchInvalidResponse) as error:
+        client.search(CRITERIA)
+
+    assert "exceeded the allowed size" in str(error.value)
+    assert "sensitive-provider-response" not in str(error.value)
+
+
 def test_factory_requires_configured_secret_without_exposing_it(monkeypatch):
     monkeypatch.setattr(settings, "langsearch_api_key", None)
     assert get_langsearch_discovery_client() is None

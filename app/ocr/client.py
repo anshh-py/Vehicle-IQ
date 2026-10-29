@@ -13,6 +13,9 @@ from urllib.parse import quote, urljoin
 
 import httpx
 
+from app.core.config import settings
+from app.core.http import ExternalResponseTooLarge, request_with_response_limit
+
 
 class OCRServiceUnavailable(Exception):
     """The configured OCR service could not be reached or is unavailable."""
@@ -201,10 +204,15 @@ class BaiduUnlimitedOCRClient:
     def recognize(self, content: bytes, filename: str, content_type: str) -> OCRRecognition:
         try:
             with httpx.Client(timeout=self.timeout_seconds, transport=self.transport) as client:
-                response = client.post(
+                response = request_with_response_limit(
+                    client,
+                    "POST",
                     self.endpoint,
+                    max_bytes=settings.max_external_response_bytes,
                     files={"file": (filename, content, content_type)},
                 )
+        except ExternalResponseTooLarge:
+            raise OCRInvalidResponse("OCR service response exceeded the allowed size.") from None
         except httpx.TimeoutException as exc:
             raise OCRServiceUnavailable("OCR service timed out") from exc
         except httpx.RequestError as exc:
@@ -264,8 +272,11 @@ class HuggingFaceGradioOCRClient:
     def recognize(self, content: bytes, filename: str, content_type: str) -> OCRRecognition:
         try:
             with httpx.Client(timeout=self.timeout, transport=self.transport) as client:
-                upload_response = client.post(
+                upload_response = request_with_response_limit(
+                    client,
+                    "POST",
                     urljoin(self.base_url, "gradio_api/upload"),
+                    max_bytes=settings.max_external_response_bytes,
                     files={"files": (filename, content, content_type)},
                 )
                 self._check_http_response(upload_response, "upload")
@@ -278,8 +289,11 @@ class HuggingFaceGradioOCRClient:
                 ):
                     raise OCRInvalidResponse("Hugging Face Space returned an invalid upload path")
 
-                start_response = client.post(
+                start_response = request_with_response_limit(
+                    client,
+                    "POST",
                     urljoin(self.base_url, "gradio_api/call/v2/run_ocr"),
+                    max_bytes=settings.max_external_response_bytes,
                     json={
                         "image_path": {
                             "path": uploaded[0],
@@ -295,11 +309,16 @@ class HuggingFaceGradioOCRClient:
                 if not isinstance(event_id, str) or not event_id.strip():
                     raise OCRInvalidResponse("Hugging Face Space response has no event ID")
 
-                result_response = client.get(
+                result_response = request_with_response_limit(
+                    client,
+                    "GET",
                     urljoin(self.base_url, f"gradio_api/call/run_ocr/{quote(event_id, safe='')}"),
+                    max_bytes=settings.max_external_response_bytes,
                 )
                 self._check_http_response(result_response, "OCR result")
                 text = self._parse_result_sse(result_response.text)
+        except ExternalResponseTooLarge:
+            raise OCRInvalidResponse("Hugging Face OCR Space response exceeded the allowed size") from None
         except httpx.TimeoutException as exc:
             raise OCRServiceUnavailable("Hugging Face OCR Space request timed out") from exc
         except httpx.RequestError as exc:
