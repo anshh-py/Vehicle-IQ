@@ -35,10 +35,20 @@ def request_with_response_limit(
                 raise ExternalResponseTooLarge
             chunks.append(chunk)
 
+        content = b"".join(chunks)
+        
+        # response.iter_bytes() returns decompressed content, so we must remove
+        # Content-Encoding header to prevent double-decompression when the
+        # response is later processed. Also update Content-Length to match
+        # the actual decompressed content length.
+        response_headers = dict(response.headers)
+        response_headers.pop("content-encoding", None)
+        response_headers["content-length"] = str(len(content))
+
         return httpx.Response(
             response.status_code,
-            headers=response.headers,
-            content=b"".join(chunks),
+            headers=response_headers,
+            content=content,
             request=response.request,
             extensions=response.extensions,
         )

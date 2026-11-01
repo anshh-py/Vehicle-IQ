@@ -94,6 +94,30 @@ def test_uploads_valid_supported_image_and_lists_metadata(upload_api, image_form
     assert listed.status_code == 200
     assert listed.json() == [metadata]
 
+    content = client.get(f"/api/v1/assessments/{assessment_id}/images/{metadata['id']}/content")
+    assert content.status_code == 200
+    assert content.content == image_bytes(image_format)
+    assert content.headers["content-type"].startswith(content_type)
+    assert content.headers["cache-control"] == "private, no-store"
+    assert content.headers["x-content-type-options"] == "nosniff"
+
+
+def test_image_content_requires_matching_assessment(upload_api):
+    client, assessment_id, _storage, _engine = upload_api
+    upload = client.post(
+        f"/api/v1/assessments/{assessment_id}/images",
+        files={"file": ("photo.png", image_bytes("PNG"), "image/png")},
+    )
+    assert upload.status_code == 201
+
+    other_assessment = client.post("/api/v1/assessments", json={})
+    assert other_assessment.status_code == 201
+    response = client.get(
+        f"/api/v1/assessments/{other_assessment.json()['id']}/images/{upload.json()['id']}/content"
+    )
+    assert response.status_code == 404
+    assert response.json() == {"detail": "Image content not found."}
+
 
 def test_rejects_invalid_content_even_when_headers_claim_png(upload_api):
     client, assessment_id, storage, _engine = upload_api

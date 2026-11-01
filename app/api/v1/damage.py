@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from datetime import datetime, timezone
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -19,13 +20,21 @@ from app.damage.worker import (
     DamageWorkerUnavailable,
     IsolatedDamageProvider,
 )
-from app.db.models import DamageFinding, EvidenceRecord, UploadedImage, VehicleAssessment
+from app.db.models import DamageFinding, EvidenceRecord, OCRResult, UploadedImage, VehicleAssessment
+from app.images.classification import (
+    ImageEligibilityDecision,
+    cached_decision,
+    classify_image,
+    classification_cache_key,
+    store_classification,
+)
 from app.db.session import get_db
 from app.images.validation import InvalidImageError, inspect_image
 from app.schemas.damage import (
     AssessmentDamageRequest,
     AssessmentDamageResponse,
     AssessmentImageDamageResult,
+    DamageInspectionStatus,
     DamageFindingResponse,
     ImageDamageResponse,
 )
@@ -63,6 +72,7 @@ def _analysis_response(
     findings: list[DamageFinding],
     *,
     reused: bool,
+    status: DamageInspectionStatus | None = None,
 ) -> ImageDamageResponse:
     ordered_findings = sorted(
         findings,
@@ -76,7 +86,9 @@ def _analysis_response(
         assessment_id=assessment_id,
         image_id=image_id,
         provider=IsolatedDamageProvider.provider_name,
-        status="completed",
+        status=status or (
+            "completed_with_findings" if ordered_findings else "completed_no_findings"
+        ),
         reused=reused,
         findings=[_finding_response(finding) for finding in ordered_findings],
     )
@@ -98,13 +110,106 @@ def _existing_findings(db: Session, assessment_id: UUID, image_id: UUID) -> list
 
 def _existing_scan(db: Session, assessment_id: UUID, image_id: UUID) -> EvidenceRecord | None:
     return db.scalar(
-        select(EvidenceRecord).where(
+        select(EvidenceRecord)
+        .where(
             EvidenceRecord.assessment_id == assessment_id,
             EvidenceRecord.image_id == image_id,
             EvidenceRecord.evidence_type == "damage_detection",
             EvidenceRecord.source_reference == MODEL_NAME,
         )
+        .order_by(EvidenceRecord.created_at.desc(), EvidenceRecord.id.desc())
     )
+
+
+def _existing_eligibility_scan(db: Session, assessment_id: UUID, image_id: UUID) -> EvidenceRecord | None:
+    return db.scalar(
+        select(EvidenceRecord).where(
+            EvidenceRecord.assessment_id == assessment_id,
+            EvidenceRecord.image_id == image_id,
+            EvidenceRecord.evidence_type == "damage_eligibility",
+        )
+    )
+
+
+_COMPLETED_DAMAGE_STATUSES = {
+    "completed_with_findings",
+    "completed_no_findings",
+}
+
+
+def _stored_damage_status(
+    scan: EvidenceRecord | None,
+    findings: list[DamageFinding],
+) -> DamageInspectionStatus:
+    if findings:
+        return "completed_with_findings"
+    if scan is None or not isinstance(scan.evidence_data, dict):
+        return "unavailable"
+    data = scan.evidence_data
+    status = data.get("status")
+    if status == "completed_with_findings":
+        return "unavailable"
+    if status == "completed_no_findings" and data.get("detection_count", 0) == 0:
+        return "completed_no_findings"
+    if status == "completed":
+        if data.get("detection_count") == 0:
+            return "completed_no_findings"
+        return "unavailable"
+    if status == "unavailable":
+        return "unavailable"
+    if status == "failed":
+        return "failed"
+    return "unavailable"
+
+
+def _record_inspection_outcome(
+    db: Session,
+    assessment_id: UUID,
+    image_id: UUID,
+    status: DamageInspectionStatus,
+    *,
+    reason: str | None = None,
+    image_type: str | None = None,
+    detection_count: int = 0,
+) -> None:
+    try:
+        db.rollback()
+        with db.begin():
+            locked_image_id = db.scalar(
+                select(UploadedImage.id)
+                .where(
+                    UploadedImage.id == image_id,
+                    UploadedImage.assessment_id == assessment_id,
+                )
+                .with_for_update()
+            )
+            if locked_image_id is None:
+                raise HTTPException(status_code=404, detail="Image not found for assessment.")
+            record = _existing_scan(db, assessment_id, image_id)
+            evidence_data = {
+                "status": status,
+                "detection_count": detection_count,
+            }
+            if reason:
+                evidence_data["reason"] = reason
+            if image_type:
+                evidence_data["image_type"] = image_type
+            if record is None:
+                record = EvidenceRecord(
+                    assessment_id=assessment_id,
+                    image_id=image_id,
+                    evidence_type="damage_detection",
+                    source_reference=MODEL_NAME,
+                )
+                db.add(record)
+            record.evidence_data = evidence_data
+    except HTTPException:
+        raise
+    except SQLAlchemyError:
+        db.rollback()
+        raise HTTPException(status_code=500, detail="Unable to save damage inspection status.") from None
+
+
 def _persist_findings(
     db: Session,
     assessment_id: UUID,
@@ -123,8 +228,15 @@ def _persist_findings(
                 raise HTTPException(status_code=404, detail="Image not found for assessment.")
 
             existing = _existing_findings(db, assessment_id, image_id)
-            if _existing_scan(db, assessment_id, image_id) is not None or existing:
-                return _analysis_response(assessment_id, image_id, existing, reused=True)
+            scan = _existing_scan(db, assessment_id, image_id)
+            if _stored_damage_status(scan, existing) in _COMPLETED_DAMAGE_STATUSES:
+                return _analysis_response(
+                    assessment_id,
+                    image_id,
+                    existing,
+                    reused=True,
+                    status=_stored_damage_status(scan, existing),
+                )
 
             findings: list[DamageFinding] = []
             for detection in result.detections:
@@ -146,19 +258,24 @@ def _persist_findings(
                 )
                 db.add(finding)
                 findings.append(finding)
-            db.add(
-                EvidenceRecord(
+            if scan is None:
+                scan = EvidenceRecord(
                     assessment_id=assessment_id,
                     image_id=image_id,
                     evidence_type="damage_detection",
                     source_reference=MODEL_NAME,
-                    evidence_data={
-                        "status": "completed",
-                        "detection_count": len(result.detections),
-                    },
                 )
-            )
+                db.add(scan)
+            scan.evidence_data = {
+                "status": (
+                    "completed_with_findings"
+                    if findings
+                    else "completed_no_findings"
+                ),
+                "detection_count": len(findings),
+            }
             db.flush()
+
             response = _analysis_response(assessment_id, image_id, findings, reused=False)
         return response
     except HTTPException:
@@ -200,18 +317,164 @@ def inspect_assessment_image_damage(
     try:
         content = storage.read(object_key)
     except ImageStorageError:
-        raise HTTPException(status_code=500, detail="Stored image is unavailable.") from None
+        reason = "Stored image is unavailable."
+        _record_inspection_outcome(
+            db, assessment_id, image_id, "unavailable", reason=reason
+        )
+        return ImageDamageResponse(
+            assessment_id=assessment_id,
+            image_id=image_id,
+            provider=IsolatedDamageProvider.provider_name,
+            status="unavailable",
+            reused=False,
+            findings=[],
+            reason=reason,
+        )
 
     try:
         extension, _content_type = inspect_image(content)
     except InvalidImageError:
-        raise HTTPException(status_code=422, detail="Stored image is corrupt or unsupported.") from None
+        reason = "Stored image is corrupt or unsupported."
+        _record_inspection_outcome(
+            db, assessment_id, image_id, "unavailable", reason=reason
+        )
+        return ImageDamageResponse(
+            assessment_id=assessment_id,
+            image_id=image_id,
+            provider=IsolatedDamageProvider.provider_name,
+            status="unavailable",
+            reused=False,
+            findings=[],
+            reason=reason,
+        )
+
+    ocr_results = list(
+        db.scalars(
+            select(OCRResult).where(
+                OCRResult.assessment_id == assessment_id,
+                OCRResult.image_id == image_id,
+            )
+        ).all()
+    )
+
+    # Fail-safe classification: any classification error makes the image
+    # ineligible, so YOLO is never called for an unclassified image.
+    classification_failed = False
+    try:
+        decision = cached_decision(image, content, ocr_results)
+        if decision is None:
+            decision = classify_image(
+                content=content,
+                ocr_results=ocr_results,
+                original_filename=image.original_filename,
+            )
+            store_classification(image, decision)
+            db.add(image)
+            db.flush()
+    except Exception as exc:
+        classification_failed = True
+        logger.warning("Image classification failed: %s", type(exc).__name__)
+        decision = ImageEligibilityDecision(
+            image_type="unknown",
+            classification_method="classification_exception",
+            eligible_for_damage_inference=False,
+            rejection_reason=f"classification_failed: {type(exc).__name__}",
+            classified_at=datetime.now(timezone.utc),
+            signals={},
+            cache_key=classification_cache_key(content, ocr_results),
+        )
+        store_classification(image, decision)
+        try:
+            db.add(image)
+            db.flush()
+        except SQLAlchemyError:
+            db.rollback()
+
+    if classification_failed:
+        reason = "Image eligibility classification failed; damage inference was not run."
+        _record_inspection_outcome(
+            db,
+            assessment_id,
+            image_id,
+            "failed",
+            reason=reason,
+            image_type=decision.image_type,
+        )
+        return ImageDamageResponse(
+            assessment_id=assessment_id,
+            image_id=image_id,
+            provider="image_classification",
+            status="failed",
+            reused=False,
+            findings=[],
+            image_type=decision.image_type,
+            reason=reason,
+        )
+
+    if not decision.eligible_for_damage_inference:
+        existing_eligibility = _existing_eligibility_scan(db, assessment_id, image_id)
+        reused = existing_eligibility is not None
+        if existing_eligibility is None:
+            try:
+                db.rollback()
+                with db.begin():
+                    locked_image_id = db.scalar(
+                        select(UploadedImage.id).where(
+                            UploadedImage.id == image_id,
+                            UploadedImage.assessment_id == assessment_id,
+                        ).with_for_update()
+                    )
+                    if locked_image_id is None:
+                        raise HTTPException(status_code=404, detail="Image not found for assessment.")
+                    if _existing_eligibility_scan(db, assessment_id, image_id) is None:
+                        db.add(
+                            EvidenceRecord(
+                                assessment_id=assessment_id,
+                                image_id=image_id,
+                                evidence_type="damage_eligibility",
+                                source_reference="image_classification",
+                                evidence_data={
+                                    "status": "unavailable",
+                                    "image_type": decision.image_type,
+                                    "reason": decision.rejection_reason,
+                                    "classified_at": decision.classified_at.isoformat(),
+                                },
+                            )
+                        )
+                db.commit()
+            except HTTPException:
+                raise
+            except SQLAlchemyError:
+                db.rollback()
+                raise HTTPException(status_code=500, detail="Unable to save image eligibility.") from None
+        _record_inspection_outcome(
+            db,
+            assessment_id,
+            image_id,
+            "unavailable",
+            reason=decision.rejection_reason,
+            image_type=decision.image_type,
+        )
+        return ImageDamageResponse(
+            assessment_id=assessment_id,
+            image_id=image_id,
+            provider="image_classification",
+            status="unavailable",
+            reused=reused,
+            findings=[],
+            image_type=decision.image_type,
+            reason=decision.rejection_reason,
+        )
 
     try:
         existing = _existing_findings(db, assessment_id, image_id)
-        if _existing_scan(db, assessment_id, image_id) is not None:
+        scan = _existing_scan(db, assessment_id, image_id)
+        stored_status = _stored_damage_status(scan, existing)
+        if stored_status in _COMPLETED_DAMAGE_STATUSES:
             db.rollback()
-            return _analysis_response(assessment_id, image_id, existing, reused=True)
+            return _analysis_response(
+                assessment_id, image_id, existing, reused=True, status=stored_status
+            )
         db.rollback()
     except SQLAlchemyError:
         db.rollback()
@@ -220,21 +483,40 @@ def inspect_assessment_image_damage(
     try:
         result = provider.detect(content, extension)
     except DamageInputError:
-        raise HTTPException(status_code=422, detail="Stored image is corrupt or unsupported.") from None
+        status_value: DamageInspectionStatus = "unavailable"
+        reason = "Stored image is corrupt or unsupported."
     except DamageWorkerUnavailable:
-        raise HTTPException(status_code=503, detail="Damage inference is unavailable.") from None
+        status_value = "unavailable"
+        reason = "Damage inference is unavailable."
     except DamageWorkerTimeout:
-        raise HTTPException(status_code=504, detail="Damage inference timed out.") from None
+        status_value = "unavailable"
+        reason = "Damage inference timed out."
     except DamageWorkerInvalidResponse:
-        raise HTTPException(status_code=502, detail="Damage inference returned an invalid response.") from None
+        status_value = "unavailable"
+        reason = "Damage inference returned an invalid response."
     except DamageWorkerInferenceFailed as exc:
         logger.warning("Damage inference worker failed: %s", type(exc).__name__)
-        raise HTTPException(status_code=502, detail="Damage inference failed.") from None
+        status_value = "failed"
+        reason = "Damage inference failed."
     except Exception as exc:
         logger.warning("Damage inference provider failed: %s", type(exc).__name__)
-        raise HTTPException(status_code=502, detail="Damage inference failed.") from None
+        status_value = "failed"
+        reason = "Damage inference failed."
+    else:
+        return _persist_findings(db, assessment_id, image_id, result)
 
-    return _persist_findings(db, assessment_id, image_id, result)
+    _record_inspection_outcome(
+        db, assessment_id, image_id, status_value, reason=reason
+    )
+    return ImageDamageResponse(
+        assessment_id=assessment_id,
+        image_id=image_id,
+        provider=IsolatedDamageProvider.provider_name,
+        status=status_value,
+        reused=False,
+        findings=[],
+        reason=reason,
+    )
 
 
 @router.post(
@@ -269,9 +551,12 @@ def inspect_assessment_damage(
             results.append(
                 AssessmentImageDamageResult(
                     image_id=image_id,
-                    status="completed",
+                    status=item.status,
                     reused=item.reused,
                     findings=item.findings,
+                    error=item.reason,
+                    image_type=item.image_type,
+                    reason=item.reason,
                 )
             )
         except HTTPException as exc:
@@ -281,17 +566,40 @@ def inspect_assessment_damage(
                     image_id=image_id,
                     status="failed",
                     error=str(exc.detail),
+                    reason=str(exc.detail),
+                )
+            )
+        except Exception as exc:
+            db.rollback()
+            logger.warning(
+                "Damage processing failed for image (%s).", type(exc).__name__
+            )
+            results.append(
+                AssessmentImageDamageResult(
+                    image_id=image_id,
+                    status="failed",
+                    error="Damage inspection failed.",
+                    reason="Damage inspection failed.",
                 )
             )
 
     failed_count = sum(result.status == "failed" for result in results)
-    status_value = (
-        "completed" if failed_count == 0 else "failed" if failed_count == len(results) else "partial"
-    )
+    unavailable_count = sum(result.status == "unavailable" for result in results)
+    if any(result.status == "completed_with_findings" for result in results):
+        status_value = "completed_with_findings"
+    elif failed_count:
+        status_value = "failed"
+    elif unavailable_count:
+        status_value = "unavailable"
+    else:
+        status_value = "completed_no_findings"
     return AssessmentDamageResponse(
         assessment_id=assessment_id,
         status=status_value,
-        processed_count=len(results) - failed_count,
+        processed_count=sum(
+            result.status in _COMPLETED_DAMAGE_STATUSES for result in results
+        ),
         failed_count=failed_count,
+        unavailable_count=unavailable_count,
         results=results,
     )

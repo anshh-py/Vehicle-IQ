@@ -27,6 +27,9 @@ class Settings(BaseSettings):
     langsearch_api_key: SecretStr | None = None
     langsearch_timeout_seconds: float = Field(default=20.0, gt=0, le=60)
     langsearch_result_limit: int = Field(default=10, ge=1, le=50)
+    tavily_api_key: SecretStr | None = None
+    tavily_timeout_seconds: float = Field(default=15.0, gt=0, le=60)
+    tavily_result_limit: int = Field(default=20, ge=1, le=50)
     ocr_service_url: str | None = None
     ocr_service_provider: Literal["baidu_unlimited_ocr", "huggingface_gradio", "paddleocr_local"] = "baidu_unlimited_ocr"
     ocr_gradio_space_url: str = "https://baidu-unlimited-ocr.hf.space"
@@ -61,6 +64,13 @@ class Settings(BaseSettings):
     fastag_lookup_enabled: bool = False
     fastag_lookup_base_url: str = "https://abhigyan-fastag-info.vercel.app/vehtofastaginfo"
     fastag_lookup_timeout_seconds: float = Field(default=10.0, gt=0, le=30)
+    llm_api_key: SecretStr | None = None
+    llm_base_url: str = "https://api.groq.com/openai/v1"
+    llm_model: str = "openai/gpt-oss-20b"
+    llm_timeout_seconds: float = Field(default=20.0, gt=0, le=120)
+    market_listings_source_path: Path | None = None
+    market_listings_source_format: str | None = None
+    llm_enabled: bool = False
     price_model_path: Path = Path(
         r"C:\Users\ansha\vehicle-iq-model-research\artifacts\vehicle_iq_price_model.joblib"
     )

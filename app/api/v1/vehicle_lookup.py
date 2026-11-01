@@ -8,6 +8,7 @@ from sqlalchemy.orm import Session
 
 from app.db.models import OCRResult, UploadedImage, VehicleAssessment
 from app.db.session import get_db
+from app.ocr.registration import normalize_registration_candidate
 from app.schemas.vehicle_lookup import VehicleRegistrationDetails, VehicleRegistrationLookupResponse
 from app.schemas.vehicle_services import (
     ChallanDetails,
@@ -35,25 +36,77 @@ from app.vehicle_lookup.vehicle_services import (
 router = APIRouter(prefix="/api/v1/assessments", tags=["vehicle registration lookup"])
 
 # Covers common Indian state registration numbers and BH-series numbers.
-_STANDARD_REGISTRATION = re.compile(r"^[A-Z]{2}[0-9]{2}[A-Z]{0,3}[0-9]{1,4}$")
+_STANDARD_REGISTRATION = re.compile(r"^[A-Z]{2}[0-9]{1,2}[A-Z]{1,4}[0-9]{1,4}$")
 _BH_REGISTRATION = re.compile(r"^[0-9]{2}BH[0-9]{4}[A-Z]{1,2}$")
-_REGISTRATION_CANDIDATE = re.compile(
-    r"(?<![A-Z0-9])(?:[A-Z]{2}[\s-]*[0-9]{2}[\s-]*[A-Z]{0,3}[\s-]*[0-9]{1,4}|"
-    r"[0-9]{2}[\s-]*BH[\s-]*[0-9]{4}[\s-]*[A-Z]{1,2})(?![A-Z0-9])",
-    re.IGNORECASE,
-)
 
 
 def _registration_from_ocr(text: str | None) -> str:
-    if not text:
-        raise HTTPException(status_code=422, detail="OCR result contains no registration number.")
-    candidate = _REGISTRATION_CANDIDATE.search(text)
-    if candidate is None:
-        raise HTTPException(status_code=422, detail="OCR text is not a supported registration-number format.")
-    normalized = re.sub(r"[\s-]", "", candidate.group()).upper()
-    if not (_STANDARD_REGISTRATION.fullmatch(normalized) or _BH_REGISTRATION.fullmatch(normalized)):
+    normalized = normalize_registration_candidate(text)
+    if normalized is None:
         raise HTTPException(status_code=422, detail="OCR text is not a supported registration-number format.")
     return normalized
+
+
+def normalize_manual_registration(text: str | None) -> str:
+    if not isinstance(text, str) or not text:
+        raise HTTPException(status_code=422, detail="Manual registration number is invalid.")
+    normalized = re.sub(r"\s+", "", text).upper()
+    if not (_STANDARD_REGISTRATION.fullmatch(normalized) or _BH_REGISTRATION.fullmatch(normalized)):
+        raise HTTPException(status_code=422, detail="Manual registration number is invalid.")
+    return normalized
+
+
+def lookup_registration_from_manual(
+    assessment_id: UUID,
+    registration_number: str,
+    db: Session,
+    provider: VehicleRegistrationProvider | None,
+) -> VehicleRegistrationDetails:
+    try:
+        assessment = db.get(VehicleAssessment, assessment_id)
+        if assessment is None:
+            raise HTTPException(status_code=404, detail="Assessment not found.")
+    except HTTPException:
+        raise
+    except SQLAlchemyError:
+        raise HTTPException(status_code=500, detail="Unable to retrieve assessment.") from None
+
+    registration_number = normalize_manual_registration(registration_number)
+    if provider is None:
+        raise HTTPException(status_code=503, detail="Vehicle registration lookup is not configured.")
+
+    try:
+        details = VehicleRegistrationDetails.model_validate(provider.lookup(registration_number))
+        returned_registration = normalize_manual_registration(details.registration_number)
+        if returned_registration != registration_number:
+            raise ValueError("provider registration number does not match manual input")
+    except VehicleLookupAuthenticationError:
+        raise HTTPException(status_code=503, detail="Vehicle registration provider authentication failed.") from None
+    except VehicleLookupUnavailable:
+        raise HTTPException(status_code=503, detail="Vehicle registration provider is unavailable.") from None
+    except VehicleLookupRejected:
+        raise HTTPException(status_code=422, detail="Vehicle registration provider rejected the lookup.") from None
+    except VehicleLookupInvalidResponse:
+        raise HTTPException(status_code=502, detail="Vehicle registration provider returned an invalid response.") from None
+    except Exception:
+        raise HTTPException(status_code=502, detail="Vehicle registration provider returned no valid result.") from None
+
+    record = OCRResult(
+        assessment_id=assessment_id,
+        image_id=None,
+        result_type="registration_lookup",
+        status="completed",
+        provider=provider.provider_name,
+        raw_text=registration_number,
+        result_data=details.model_dump(mode="json"),
+    )
+    try:
+        db.add(record)
+        db.commit()
+    except SQLAlchemyError:
+        db.rollback()
+        raise HTTPException(status_code=500, detail="Unable to save vehicle registration lookup.") from None
+    return details
 
 
 @router.post(

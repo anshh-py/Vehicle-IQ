@@ -82,7 +82,7 @@ def test_empty_or_insufficient_evidence_never_returns_a_price_range():
         valuation_date=NOW,
     )
 
-    assert empty.status == "low_evidence"
+    assert empty.status == "unavailable"
     assert empty.price_range is None
     assert four.status == "low_evidence"
     assert four.evidence_count == 4
@@ -90,7 +90,7 @@ def test_empty_or_insufficient_evidence_never_returns_a_price_range():
 
 
 def test_robust_range_removes_outlier_and_uses_advertised_price_iqr():
-    prices = [800_000, 810_000, 820_000, 830_000, 840_000, 5_000_000]
+    prices = [800_000, 810_000, 820_000, 830_000, 840_000, 850_000, 5_000_000]
 
     result = calculate_market_comparables(
         [listing(index, price) for index, price in enumerate(prices)],
@@ -99,12 +99,12 @@ def test_robust_range_removes_outlier_and_uses_advertised_price_iqr():
     )
 
     assert result.status == "available"
-    assert result.evidence_count == 5
+    assert result.evidence_count == 6
     assert result.rejected_counts["price_outlier"] == 1
     assert result.price_range is not None
-    assert result.price_range.lower_inr == Decimal("810000.00")
-    assert result.price_range.median_inr == Decimal("820000.00")
-    assert result.price_range.upper_inr == Decimal("830000.00")
+    assert result.price_range.lower_inr == Decimal("812500.00")
+    assert result.price_range.median_inr == Decimal("825000.00")
+    assert result.price_range.upper_inr == Decimal("837500.00")
     assert all(str(entry.source_url).startswith("https://") for entry in result.listings)
 
 
@@ -122,5 +122,5 @@ def test_malformed_market_listing_is_rejected(override):
         [invalid], CRITERIA, valuation_date=NOW
     )
 
-    assert result.status == "low_evidence"
+    assert result.status == "unavailable"
     assert result.rejected_counts["malformed_listing"] == 1

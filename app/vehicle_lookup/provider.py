@@ -1,6 +1,7 @@
 from datetime import date, datetime
+import logging
 import re
-from typing import Any, Protocol
+from typing import Any, Callable, Protocol
 from urllib.parse import urlsplit
 
 import httpx
@@ -8,6 +9,9 @@ import httpx
 from app.core.config import settings
 from app.core.http import ExternalResponseTooLarge, request_with_response_limit
 from app.schemas.vehicle_lookup import VehicleRegistrationDetails
+
+
+logger = logging.getLogger(__name__)
 
 
 class VehicleLookupError(Exception):
@@ -49,21 +53,31 @@ class VehicleDetailsHTTPProvider:
         r"^(?:[A-Z]{2}[0-9]{2}[A-Z]{0,3}[0-9]{1,4}|[0-9]{2}BH[0-9]{4}[A-Z]{1,2})$"
     )
     _ALIASES = {
-        "make": {"make", "manufacturer", "manufacturername", "makerdescription", "brand"},
-        "model": {"model", "modeldesc", "modeldescription", "vehiclemodel"},
-        "variant": {"variant", "modelvariant", "version"},
-        "fuel_type": {"fuel", "fueltype", "fueltypedescription"},
-        "registration_date": {"registrationdate", "dateofregistration", "regdate"},
-        "manufacturing_year": {"manufacturingyear", "manufacturedyear", "manufactureyear", "mfgyear"},
-        "vehicle_class": {"vehicleclass", "vehclass", "class"},
+        "make": {"make", "manufacturer", "manufacturername", "makerdescription", "brand", "flamakerdesc", "manfname"},
+        "model": {"model", "modeldesc", "modeldescription", "vehiclemodel", "flamodeldesc", "modelname"},
+        "variant": {"variant", "modelvariant", "version", "flavariant", "versionname"},
+        "fuel_type": {"fuel", "fueltype", "fueltypedescription", "flafueltypedesc"},
+        "registration_date": {"registrationdate", "dateofregistration", "regdate", "regndt", "vehicleregiat"},
+        "manufacturing_year": {"manufacturingyear", "manufacturedyear", "manufactureyear", "mfgyear", "manuyr", "regyear"},
+        "vehicle_class": {"vehicleclass", "vehclass", "class", "vhclassdesc"},
         "registration_valid_until": {"registrationvaliduntil", "registrationvalidity", "regvalidupto"},
         "rto": {"rto", "rtoname", "rtooffice"},
         "fitness_expiry": {"fitupto", "fitnessexpiry", "fitnessvaliduntil"},
         "puc_expiry": {"pucvaliduntil", "puccupto", "pucexpiry"},
         "insurance_expiry": {"insuranceexpiry", "insurancevaliduntil", "insuranceupto", "insurancevalidupto"},
-        "blacklisted": {"blacklisted", "blackliststatus", "isblacklisted"},
+        "blacklisted": {"blacklisted", "blackliststatus", "isblacklisted", "blacklistflag"},
+        "engine_cc": {"enginecc", "cubiccap", "flacubiccap", "enginecapacity"},
+        "seats": {"seats", "seatcap", "flaseatcap", "seatingcapacity"},
+        "max_power_bhp": {"maxpowerbhp", "maxpower", "bhp", "maxpowerhp", "flamaxpowerbhp"},
+        "transmission": {"transmission", "transmissiontype", "gearbox", "flatransmission"},
+        "owner_count": {"ownercount", "owner", "owners", "ownercount", "flaownercount"},
+        "mileage_kmpl": {"mileagekmpl", "mileage", "fuelfefficiency", "kmpl", "flamileage"},
     }
     _CONTAINERS = {"data", "result", "vehicle", "vehicledetails", "response", "details"}
+    _VEHICLE_CONTAINERS = {"vehicle", "insurance"}
+    # VehicleX provider-specific success status codes. These are NOT HTTP status
+    # codes and must not be interpreted using generic HTTP semantics.
+    _VEHICLEX_SUCCESS_STATUSES = {100}
 
     def __init__(
         self,
@@ -93,88 +107,180 @@ class VehicleDetailsHTTPProvider:
                     params={"regn": normalized},
                 )
         except ExternalResponseTooLarge:
+            logger.warning("Vehicle lookup provider response exceeded the allowed size.")
             raise VehicleLookupInvalidResponse("Vehicle registration provider response exceeded the allowed size.") from None
-        except httpx.TimeoutException:
+        except httpx.TimeoutException as exc:
+            logger.exception("Vehicle lookup provider timed out.", extra={"exception_class": "TimeoutException", "timeout_seconds": self.timeout_seconds})
             raise VehicleLookupUnavailable("Vehicle registration provider timed out.") from None
-        except httpx.RequestError:
+        except httpx.RequestError as exc:
+            logger.exception("Vehicle lookup provider request error.", extra={"exception_class": type(exc).__name__})
             raise VehicleLookupUnavailable("Vehicle registration provider is unavailable.") from None
 
+        logger.debug("Vehicle lookup provider HTTP response received", extra={"http_status": response.status_code, "content_length": len(response.content) if response.content else 0})
+
         if response.status_code in {401, 403}:
+            logger.warning("Vehicle lookup provider HTTP authentication failed (status=%s).", response.status_code)
             raise VehicleLookupAuthenticationError("Vehicle registration provider authentication failed.")
         if response.status_code == 429 or response.status_code >= 500:
+            logger.warning(
+                "Vehicle lookup provider HTTP error (status=%s).", response.status_code
+            )
             raise VehicleLookupUnavailable("Vehicle registration provider is unavailable.")
         if response.status_code in {400, 404, 422}:
+            logger.debug("Vehicle lookup provider rejected the lookup (status=%s).", response.status_code)
             raise VehicleLookupRejected("Vehicle registration provider rejected the lookup.")
         if not response.is_success:
+            logger.debug("Vehicle lookup provider returned HTTP error (status=%s).", response.status_code)
             raise VehicleLookupInvalidResponse("Vehicle registration provider returned an HTTP error.")
         try:
             payload = response.json()
+            logger.debug("Vehicle lookup provider JSON decoded", extra={"body_length": len(response.text), "json_keys": list(payload.keys()) if isinstance(payload, dict) else "non-dict"})
         except ValueError:
+            logger.debug("Vehicle lookup provider returned malformed JSON", extra={"body_preview": response.text[:200]})
             raise VehicleLookupInvalidResponse("Vehicle registration provider returned malformed JSON.") from None
         if not isinstance(payload, dict):
+            logger.debug("Vehicle lookup provider returned non-dict JSON", extra={"json_type": type(payload).__name__})
             raise VehicleLookupInvalidResponse("Vehicle registration provider returned an unexpected response.")
         if self._is_error_envelope(payload):
+            logger.debug("Vehicle lookup provider error envelope detected", extra={"error_envelope": True})
             raise VehicleLookupRejected("Vehicle registration provider did not complete the lookup.")
 
         fields = self._extract_fields(payload)
+        logger.debug("Extracted fields from provider response", extra={"field_count": len(fields), "non_null_fields": sum(1 for v in fields.values() if v is not None)})
         if not any(value is not None for value in fields.values()):
+            logger.debug("No supported vehicle details extracted from provider response")
             raise VehicleLookupInvalidResponse("Vehicle registration provider returned no supported vehicle details.")
         fields["registration_number"] = normalized
         try:
-            return VehicleRegistrationDetails.model_validate(fields)
-        except Exception:
+            result = VehicleRegistrationDetails.model_validate(fields)
+            logger.info("Vehicle lookup successful", extra={"make": result.make, "model": result.model})
+            return result
+        except Exception as exc:
+            logger.debug("Vehicle registration details validation failed", extra={"exception_class": type(exc).__name__})
             raise VehicleLookupInvalidResponse("Vehicle registration provider returned invalid supported fields.") from None
 
     @classmethod
     def _is_error_envelope(cls, payload: dict[str, Any]) -> bool:
         if payload.get("success") is False or payload.get("ok") is False:
+            logger.debug("Error envelope: success/ok is False")
             return True
         if payload.get("error") not in (None, False, ""):
+            logger.debug("Error envelope: error field present", extra={"error_value": payload.get("error")})
             return True
-        status = payload.get("status")
-        code = payload.get("code")
-        for candidate in (status, code):
-            if isinstance(candidate, int) and not isinstance(candidate, bool):
+
+        data = cls._top_level_data(payload)
+        service_response = data.get("serviceResponse") if isinstance(data, dict) else None
+
+        status_candidates: list[Any] = [payload.get("status"), payload.get("code")]
+        if isinstance(data, dict):
+            status_candidates.append(data.get("status"))
+        if isinstance(service_response, dict):
+            status_candidates.append(service_response.get("status"))
+            status_candidates.append(service_response.get("code"))
+
+        logger.debug("Evaluating status candidates", extra={"candidates": status_candidates})
+
+        for candidate in status_candidates:
+            if isinstance(candidate, bool):
+                # VehicleX uses boolean True for success; False is an explicit failure.
+                if candidate is False:
+                    logger.debug("Error envelope: boolean status is False")
+                    return True
+                continue
+            if isinstance(candidate, int):
+                if candidate in cls._VEHICLEX_SUCCESS_STATUSES:
+                    continue
                 if candidate in {401, 403}:
+                    logger.warning(
+                        "Vehicle lookup provider authentication failed (body status=%s)",
+                        candidate,
+                    )
                     raise VehicleLookupAuthenticationError(
                         "Vehicle registration provider authentication failed."
                     )
                 if candidate == 429 or candidate >= 500:
+                    logger.warning(
+                        "Vehicle lookup provider returned body-level status %s",
+                        candidate,
+                    )
                     raise VehicleLookupUnavailable("Vehicle registration provider is unavailable.")
                 if candidate not in {0, 1} and not 200 <= candidate < 300:
-                    raise VehicleLookupRejected("Vehicle registration provider did not complete the lookup.")
-        if isinstance(status, str) and status.strip().casefold() in {
-            "error", "failed", "failure", "not_found", "unauthorized"
-        }:
-            if status.strip().casefold() == "unauthorized":
-                raise VehicleLookupAuthenticationError("Vehicle registration provider authentication failed.")
-            return True
+                    logger.debug("Error envelope: int status not in success range", extra={"candidate": candidate})
+                    return True
+            elif isinstance(candidate, str):
+                folded = candidate.strip().casefold()
+                if folded == "unauthorized":
+                    logger.warning(
+                        "Vehicle lookup provider authentication failed (body status=%s)",
+                        candidate,
+                    )
+                    raise VehicleLookupAuthenticationError(
+                        "Vehicle registration provider authentication failed."
+                    )
+                if folded in {"error", "failed", "failure", "not_found", "invalid_registration"}:
+                    logger.debug("Error envelope: string status indicates rejection", extra={"body_status": candidate})
+                    return True
+
+        if isinstance(service_response, dict):
+            description = service_response.get("description")
+            if isinstance(description, str) and description.strip():
+                folded = description.strip().casefold()
+                if folded == "unauthorized":
+                    logger.warning(
+                        "Vehicle lookup provider authentication failed (description=%s)",
+                        description,
+                    )
+                    raise VehicleLookupAuthenticationError(
+                        "Vehicle registration provider authentication failed."
+                    )
+                if folded in {"error", "failed", "failure", "not_found", "invalid_registration"}:
+                    logger.debug("Error envelope: description indicates rejection", extra={"description": description})
+                    return True
+
         return False
+
+    @staticmethod
+    def _top_level_data(payload: dict[str, Any]) -> dict[str, Any] | None:
+        for key, value in payload.items():
+            if (
+                isinstance(value, dict)
+                and re.sub(r"[^a-z0-9]", "", str(key).casefold()) == "data"
+            ):
+                return value
+        return None
 
     @classmethod
     def _extract_fields(cls, payload: dict[str, Any]) -> dict[str, Any]:
-        flattened: list[dict[str, Any]] = []
+        contexts: list[dict[str, Any]] = []
+        seen: set[int] = set()
 
-        def visit(value: Any, *, depth: int = 0) -> None:
-            if depth > 5:
-                return
-            if isinstance(value, dict):
-                flattened.append(value)
-                for key, child in value.items():
-                    normalized_key = re.sub(r"[^a-z0-9]", "", str(key).casefold())
-                    if normalized_key in cls._CONTAINERS or isinstance(child, (dict, list)):
-                        visit(child, depth=depth + 1)
-            elif isinstance(value, list):
-                for child in value[:10]:
-                    visit(child, depth=depth + 1)
+        def add(mapping: Any) -> None:
+            if isinstance(mapping, dict) and id(mapping) not in seen:
+                seen.add(id(mapping))
+                contexts.append(mapping)
 
-        visit(payload)
+        data = cls._top_level_data(payload)
+        if isinstance(data, dict):
+            service_response = data.get("serviceResponse")
+            if isinstance(service_response, dict):
+                results = service_response.get("results")
+                if isinstance(results, list):
+                    for result in results[:10]:
+                        if isinstance(result, dict):
+                            for key in cls._VEHICLE_CONTAINERS:
+                                add(result.get(key))
+            add(data)
+        add(payload)
+
+        # Backward-compatible traversal for older flat/nested shapes (lowest priority).
+        cls._visit_payload(payload, add)
+
         normalized_items = [
             {
                 re.sub(r"[^a-z0-9]", "", str(key).casefold()): value
                 for key, value in mapping.items()
             }
-            for mapping in flattened
+            for mapping in contexts
         ]
         result: dict[str, Any] = {}
         for field, aliases in cls._ALIASES.items():
@@ -199,6 +305,20 @@ class VehicleDetailsHTTPProvider:
                 result[field] = cls._safe_text(raw)
         return result
 
+    @classmethod
+    def _visit_payload(cls, value: Any, sink: Callable[[Any], None], depth: int = 0) -> None:
+        if depth > 5:
+            return
+        if isinstance(value, dict):
+            sink(value)
+            for key, child in value.items():
+                normalized_key = re.sub(r"[^a-z0-9]", "", str(key).casefold())
+                if normalized_key in cls._CONTAINERS or isinstance(child, (dict, list)):
+                    cls._visit_payload(child, sink, depth=depth + 1)
+        elif isinstance(value, list):
+            for child in value[:10]:
+                cls._visit_payload(child, sink, depth=depth + 1)
+
     @staticmethod
     def _safe_text(value: Any) -> str | None:
         if not isinstance(value, (str, int, float)) or isinstance(value, bool):
@@ -215,7 +335,7 @@ class VehicleDetailsHTTPProvider:
         if not isinstance(value, str):
             return None
         text = value.strip()
-        for pattern in ("%Y-%m-%d", "%d-%m-%Y", "%d/%m/%Y", "%d-%b-%Y", "%d/%b/%Y"):
+        for pattern in ("%Y-%m-%d", "%d-%m-%Y", "%d/%m/%y", "%d/%m/%Y", "%d-%b-%Y", "%d/%b/%Y"):
             try:
                 return datetime.strptime(text, pattern).date()
             except ValueError:

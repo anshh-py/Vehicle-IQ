@@ -1,0 +1,15 @@
+{
+  "make": "Maruti Suzuki",
+  "model": "Swift",
+  "variant": "VXi",
+  "registration_year": 2021,
+  "odometer_km": 42000,
+  "fuel_type": "petrol",
+  "transmission": "manual",
+  "seller_type": "Individual",
+  "mileage_kmpl": 21.5,
+  "engine_cc": 1197,
+  "max_power_bhp": 88.5,
+  "seats": 5,
+  "owner_count": 1
+}

@@ -2,6 +2,7 @@ from datetime import date
 from math import log1p
 import pytest
 
+from app.core.config import settings
 from app.pricing.provider import PipelinePriceProvider, PriceProviderError
 from app.schemas.pricing import VehiclePriceInput
 
@@ -91,3 +92,30 @@ def test_invalid_artifact_fails_safely(tmp_path, vehicle):
 
     with pytest.raises(PriceProviderError, match="artifact is invalid"):
         provider.predict(vehicle)
+
+
+def test_brand_normalization_matches_training_vocabulary():
+    from app.pricing.provider import _normalize_brand
+
+    assert _normalize_brand("Maruti Suzuki") == "Maruti"
+    assert _normalize_brand("Maruti Suzuki India") == "Maruti"
+    assert _normalize_brand("Maruti") == "Maruti"
+    assert _normalize_brand("Toyota") == "Toyota"
+
+
+def test_real_model_produces_genuine_estimate(vehicle):
+    """End-to-end inference against the trained artifact, not a mock.
+
+    Verifies the configured artifact loads and returns a finite, positive
+    INR estimate. This does not claim the estimate is market-accurate.
+    """
+    provider = PipelinePriceProvider(settings.price_model_path)
+    prediction = provider.predict(vehicle)
+
+    assert float(prediction.amount) > 0
+    assert prediction.currency == "INR"
+    assert prediction.method == "xgboost_pipeline_log1p_expm1"
+    assert "research_candidate_not_production_validated" in prediction.model_name
+    assert prediction.lower_bound is None
+    assert prediction.upper_bound is None
+

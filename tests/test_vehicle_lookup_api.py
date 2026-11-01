@@ -104,6 +104,8 @@ def test_ocr_registration_lookup_normalizes_persists_and_appears_in_report(looku
     assert body["details"]["registration_number"] == "RJ45CA1879"
     assert body["details"]["make"] == "Maruti Suzuki"
     assert body["details"]["registration_date"] == "2021-05-12"
+    assert body["field_provenance"]["make"] == "vehicle_api"
+    assert body["field_provenance"]["registration_date"] == "vehicle_api"
     with Session(engine) as session:
         rows = session.scalars(
             select(OCRResult).where(OCRResult.result_type == "registration_lookup")
@@ -118,6 +120,24 @@ def test_ocr_registration_lookup_normalizes_persists_and_appears_in_report(looku
     report_data = report.json()["report_data"]
     assert report_data["registration_lookup_results"][0]["details"]["model"] == "Swift"
     assert report_data["stages"]["ocr"]["result_count"] == 1
+
+
+def test_registration_lookup_removes_leading_ocr_noise(lookup_api):
+    client, engine, assessment_id, ocr_id = lookup_api
+    with Session(engine) as session:
+        ocr = session.get(OCRResult, UUID(ocr_id))
+        ocr.raw_text = "4 RJ45CA1879"
+        session.commit()
+    provider = FakeVehicleProvider()
+    app.dependency_overrides[get_vehicle_registration_provider] = lambda: provider
+
+    response = client.post(
+        f"/api/v1/assessments/{assessment_id}/ocr-results/{ocr_id}/registration-lookup"
+    )
+
+    assert response.status_code == 201
+    assert provider.received == ["RJ45CA1879"]
+    assert response.json()["details"]["registration_number"] == "RJ45CA1879"
 
 
 def test_partial_lookup_response_keeps_unknown_fields_unavailable(lookup_api):

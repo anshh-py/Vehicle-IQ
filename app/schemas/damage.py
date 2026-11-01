@@ -4,6 +4,14 @@ from uuid import UUID
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
+DamageInspectionStatus = Literal[
+    "completed_with_findings",
+    "completed_no_findings",
+    "unavailable",
+    "failed",
+]
+
+
 class DamageFindingResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
@@ -21,9 +29,11 @@ class ImageDamageResponse(BaseModel):
     assessment_id: UUID
     image_id: UUID
     provider: str
-    status: Literal["completed"]
+    status: DamageInspectionStatus
     reused: bool
     findings: list[DamageFindingResponse]
+    image_type: str | None = None
+    reason: str | None = None
 
 
 class AssessmentDamageRequest(BaseModel):
@@ -40,15 +50,18 @@ class AssessmentDamageRequest(BaseModel):
 
 class AssessmentImageDamageResult(BaseModel):
     image_id: UUID
-    status: Literal["completed", "failed"]
+    status: DamageInspectionStatus
     reused: bool = False
     findings: list[DamageFindingResponse] = Field(default_factory=list)
     error: str | None = None
+    image_type: str | None = None
+    reason: str | None = None
 
 
 class AssessmentDamageResponse(BaseModel):
     assessment_id: UUID
-    status: Literal["completed", "partial", "failed"]
+    status: DamageInspectionStatus
     processed_count: int
     failed_count: int
+    unavailable_count: int = 0
     results: list[AssessmentImageDamageResult]

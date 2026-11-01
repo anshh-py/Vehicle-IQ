@@ -187,4 +187,81 @@ class AssessmentReport(Base):
     assessment: Mapped[VehicleAssessment] = relationship(back_populates="report")
 
 
+class VehicleSpecification(Base):
+    __tablename__ = "vehicle_specifications"
+    __table_args__ = (
+        UniqueConstraint(
+            "make",
+            "model",
+            "variant",
+            "fuel_type",
+            "year_start",
+            "year_end",
+            name="uq_vehicle_specifications_identity",
+        ),
+        Index("ix_vehicle_specifications_lookup", "make", "model", "variant", "fuel_type"),
+    )
+
+    id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid4)
+    make: Mapped[str] = mapped_column(String(100), nullable=False, index=True)
+    model: Mapped[str] = mapped_column(String(120), nullable=False, index=True)
+    variant: Mapped[str | None] = mapped_column(String(120), index=True)
+    fuel_type: Mapped[str | None] = mapped_column(String(50), index=True)
+    year_start: Mapped[int | None] = mapped_column(nullable=True)
+    year_end: Mapped[int | None] = mapped_column(nullable=True)
+    engine_cc: Mapped[int | None] = mapped_column(nullable=True)
+    max_power_bhp: Mapped[float | None] = mapped_column(Float, nullable=True)
+    transmission: Mapped[str | None] = mapped_column(String(50), nullable=True)
+    mileage_kmpl: Mapped[float | None] = mapped_column(Float, nullable=True)
+    seats: Mapped[int | None] = mapped_column(nullable=True)
+    owner_count: Mapped[int | None] = mapped_column(nullable=True)
+    source_provider: Mapped[str] = mapped_column(String(100), nullable=False)
+    source_reference: Mapped[str | None] = mapped_column(String(1024), nullable=True)
+    verification_status: Mapped[str] = mapped_column(
+        String(32), nullable=False, default="unverified", server_default="unverified"
+    )
+    verified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    confidence: Mapped[float | None] = mapped_column(Float, nullable=True)
+    field_sources: Mapped[dict[str, Any] | None] = mapped_column(JSON_DOCUMENT)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now()
+    )
+
+
 Index("ix_vehicle_assessments_status_created_at", VehicleAssessment.status, VehicleAssessment.created_at)
+class MarketListing(Base):
+    __tablename__ = "market_listings"
+    __table_args__ = (
+        UniqueConstraint(
+            "source_name",
+            "source_listing_id",
+            name="uq_market_listings_source_identity",
+        ),
+        Index("ix_market_listings_lookup", "make", "model", "manufacturing_year", "fuel_type", "transmission"),
+    )
+
+    id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid4)
+    source_name: Mapped[str] = mapped_column(String(100), nullable=False, index=True)
+    source_listing_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    source_url: Mapped[str] = mapped_column(String(1024), nullable=False)
+    make: Mapped[str] = mapped_column(String(100), nullable=False, index=True)
+    model: Mapped[str] = mapped_column(String(120), nullable=False, index=True)
+    variant: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    manufacturing_year: Mapped[int] = mapped_column(nullable=False, index=True)
+    fuel_type: Mapped[str | None] = mapped_column(String(50), nullable=True)
+    transmission: Mapped[str | None] = mapped_column(String(50), nullable=True)
+    odometer_km: Mapped[int | None] = mapped_column(nullable=True)
+    asking_price_inr: Mapped[Decimal] = mapped_column(Numeric(14, 2), nullable=False)
+    city: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    state: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    seller_type: Mapped[str | None] = mapped_column(String(50), nullable=True)
+    listed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    collected_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    raw_data: Mapped[dict[str, Any] | None] = mapped_column(JSON_DOCUMENT)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now()
+    )
+
+Index("ix_vehicle_specifications_status", VehicleSpecification.verification_status, VehicleSpecification.created_at)

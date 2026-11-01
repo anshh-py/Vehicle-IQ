@@ -1,7 +1,7 @@
 from datetime import date, datetime
 from decimal import Decimal
 from enum import Enum
-from typing import Annotated, Literal
+from typing import Annotated, Any, Literal
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints, model_validator
@@ -36,7 +36,7 @@ class SellerType(str, Enum):
 
 
 class VehiclePriceInput(BaseModel):
-    """User-supplied vehicle features; no missing value is inferred by the API."""
+    """Complete, source-resolved inputs passed to the pricing model."""
 
     model_config = ConfigDict(extra="forbid")
 
@@ -50,23 +50,53 @@ class VehiclePriceInput(BaseModel):
     )
     odometer_km: int = Field(ge=0, le=2_000_000, description="Odometer reading in kilometres.")
     fuel_type: FuelType
-    transmission: TransmissionType
+    transmission: TransmissionType | None = None
     seller_type: SellerType
-    mileage_kmpl: float = Field(gt=0, le=100, description="Fuel efficiency in kilometres per litre.")
-    engine_cc: int = Field(gt=0, le=10_000, description="Engine displacement in cubic centimetres.")
-    max_power_bhp: float = Field(gt=0, le=2_000, description="Maximum engine power in brake horsepower.")
-    seats: int = Field(ge=1, le=9)
-    owner_count: int = Field(
+    mileage_kmpl: float | None = Field(default=None, gt=0, le=100, description="Fuel efficiency in kilometres per litre.")
+    engine_cc: int | None = Field(default=None, ge=1, le=10_000, description="Engine displacement in cubic centimetres.")
+    max_power_bhp: float | None = Field(default=None, gt=0, le=2_000, description="Maximum engine power in brake horsepower.")
+    seats: int | None = Field(default=None, ge=1, le=9)
+    owner_count: int | None = Field(
+        default=None,
         ge=1,
         le=20,
         description="Ownership count including the current registered owner (first owner is 1).",
     )
 
 
+class PricingUserInput(BaseModel):
+    """Permitted manual pricing inputs and explicit vehicle-spec corrections."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    odometer_km: int | None = Field(default=None, ge=0, le=2_000_000)
+    seller_type: SellerType | None = None
+    transmission: TransmissionType | None = None
+    mileage_kmpl: float | None = Field(default=None, gt=0, le=100)
+    max_power_bhp: float | None = Field(default=None, gt=0, le=2_000)
+    seller_asking_price: Decimal | None = Field(
+        default=None,
+        gt=0,
+        le=Decimal("100000000"),
+        max_digits=12,
+        decimal_places=2,
+    )
+
+
 class PriceEstimateRequest(BaseModel):
+    """Internal request containing a fully resolved model input."""
+
     model_config = ConfigDict(extra="forbid")
 
     vehicle: VehiclePriceInput
+
+
+class PriceEstimateSubmission(BaseModel):
+    """Public request containing only permitted manual inputs."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    vehicle: PricingUserInput | None = None
 
 
 class PricePrediction(BaseModel):
@@ -102,3 +132,5 @@ class PriceEstimateResponse(BaseModel):
     method: str | None
     model_name: str | None
     created_at: datetime
+    vehicle: dict[str, Any] = Field(default_factory=dict)
+    provenance: dict[str, str] = Field(default_factory=dict)

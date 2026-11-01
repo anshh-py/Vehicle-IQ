@@ -27,6 +27,7 @@ from app.ocr.client import (
     OCRUnreadableText,
     PaddleOCRLocalClient,
 )
+from app.ocr.preprocessing import preprocess_ocr_image
 from app.storage.images import LocalImageStorage, get_image_storage
 
 
@@ -126,6 +127,15 @@ def test_ocr_success_persists_output_and_omits_missing_confidence(ocr_api):
         assert record.raw_text == "Text read from the image"
         assert record.result_type == "image_ocr"
         assert record.status == "completed"
+
+
+def test_ocr_preprocessing_orients_scales_and_returns_supported_png():
+    prepared = preprocess_ocr_image(valid_png())
+
+    with Image.open(BytesIO(prepared)) as image:
+        assert image.format == "PNG"
+        assert max(image.size) >= 1000
+        assert image.mode == "RGB"
 
 
 def _make_local_paddle_model_dirs(root):

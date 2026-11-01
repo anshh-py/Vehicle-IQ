@@ -20,6 +20,7 @@ from app.ocr.client import (
     OCRUnreadableText,
     PaddleOCRLocalClient,
 )
+from app.ocr.preprocessing import preprocess_ocr_image
 from app.schemas.ocr import OCRRecognitionResponse
 from app.storage.images import ImageStorage, ImageStorageError, get_image_storage
 
@@ -82,15 +83,19 @@ def recognize_assessment_image(
         raise HTTPException(status_code=500, detail="Stored image is unavailable.") from None
 
     try:
-        extension, content_type = inspect_image(content)
+        inspect_image(content)
     except InvalidImageError:
         raise HTTPException(status_code=422, detail="Stored image is corrupt or unsupported.") from None
 
     try:
-        filename = f"image.{extension}"
+        ocr_content = preprocess_ocr_image(content)
+        filename = "image.png"
         if isinstance(client, HuggingFaceGradioOCRClient):
-            filename = image.original_filename or filename
-        result = client.recognize(content, filename, content_type)
+            original_name = (image.original_filename or "image").rsplit(".", 1)[0]
+            filename = f"{original_name or 'image'}.png"
+        result = client.recognize(ocr_content, filename, "image/png")
+    except ValueError:
+        raise HTTPException(status_code=422, detail="Stored image could not be prepared for OCR.") from None
     except OCRServiceUnavailable as exc:
         if isinstance(client, PaddleOCRLocalClient):
             logger.warning("Local PaddleOCR unavailable: %s", exc)

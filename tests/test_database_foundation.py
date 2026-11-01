@@ -93,7 +93,9 @@ def test_application_settings_point_at_project_root_env():
 def test_migration_metadata_matches_models():
     expected_tables = {
         "vehicle_assessments",
+        "vehicle_specifications",
         "uploaded_images",
+        "market_listings",
         "ocr_results",
         "damage_findings",
         "price_estimates",

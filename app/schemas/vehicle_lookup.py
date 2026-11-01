@@ -1,7 +1,7 @@
 from datetime import date, datetime
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, computed_field
 
 
 class VehicleRegistrationDetails(BaseModel):
@@ -23,6 +23,13 @@ class VehicleRegistrationDetails(BaseModel):
     puc_expiry: date | None = None
     insurance_expiry: date | None = None
     blacklisted: bool | None = None
+    # Pricing-relevant fields from VehicleX
+    engine_cc: int | None = Field(default=None, ge=1, le=10000, description="Engine displacement in cubic centimetres.")
+    seats: int | None = Field(default=None, ge=1, le=9, description="Number of seats.")
+    max_power_bhp: float | None = Field(default=None, ge=0, le=2000, description="Maximum engine power in brake horsepower.")
+    transmission: str | None = Field(default=None, max_length=50, description="Transmission type (e.g., Manual, Automatic).")
+    owner_count: int | None = Field(default=None, ge=1, le=20, description="Number of previous owners.")
+    mileage_kmpl: float | None = Field(default=None, gt=0, le=100, description="Fuel efficiency in kilometres per litre.")
 
 
 class VehicleRegistrationLookupResponse(BaseModel):
@@ -35,3 +42,12 @@ class VehicleRegistrationLookupResponse(BaseModel):
     status: str
     details: VehicleRegistrationDetails
     created_at: datetime
+
+    @computed_field
+    @property
+    def field_provenance(self) -> dict[str, str]:
+        return {
+            key: "vehicle_api"
+            for key, value in self.details.model_dump(exclude_none=True).items()
+            if value is not None
+        }

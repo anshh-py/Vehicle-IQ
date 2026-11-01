@@ -32,6 +32,30 @@ def _load_pipeline(path: Path) -> Any:
     return joblib.load(path)
 
 
+_BRAND_NORMALIZATION = {
+    "Maruti Suzuki": "Maruti",
+    "Maruti Suzuki India": "Maruti",
+}
+MODEL_FEATURE_ORDER = (
+    "brand",
+    "model",
+    "seller_type",
+    "fuel_type",
+    "transmission_type",
+    "vehicle_age",
+    "km_driven",
+    "mileage",
+    "engine",
+    "max_power",
+    "seats",
+    "km_per_year",
+)
+
+
+def _normalize_brand(value: str) -> str:
+    return _BRAND_NORMALIZATION.get(value, value)
+
+
 class PipelinePriceProvider:
     model_name = (
         "Vehicle IQ Used-Car Price Model 0.1.0-research "
@@ -62,6 +86,30 @@ class PipelinePriceProvider:
     def map_features(vehicle: VehiclePriceInput) -> dict[str, Any]:
         from datetime import date
 
+        # Validate all 12 model features are present before inference.
+        # Never silently convert None into a numerical value for XGBoost.
+        missing = [
+            name
+            for name, value in (
+                ("make", vehicle.make),
+                ("model", vehicle.model),
+                ("seller_type", vehicle.seller_type),
+                ("fuel_type", vehicle.fuel_type),
+                ("transmission", vehicle.transmission),
+                ("registration_year", vehicle.registration_year),
+                ("odometer_km", vehicle.odometer_km),
+                ("mileage_kmpl", vehicle.mileage_kmpl),
+                ("engine_cc", vehicle.engine_cc),
+                ("max_power_bhp", vehicle.max_power_bhp),
+                ("seats", vehicle.seats),
+            )
+            if value is None
+        ]
+        if missing:
+            raise PriceProviderError(
+                "Price model inference requires all features: " + ", ".join(missing)
+            )
+
         vehicle_age = date.today().year - vehicle.registration_year
         fuel = {
             FuelType.PETROL: "Petrol",
@@ -73,8 +121,8 @@ class PipelinePriceProvider:
         transmission = (
             "Manual" if vehicle.transmission is TransmissionType.MANUAL else "Automatic"
         )
-        return {
-            "brand": vehicle.make,
+        features = {
+            "brand": _normalize_brand(vehicle.make),
             "model": vehicle.model,
             "seller_type": vehicle.seller_type.value,
             "fuel_type": fuel,
@@ -87,6 +135,9 @@ class PipelinePriceProvider:
             "seats": vehicle.seats,
             "km_per_year": vehicle.odometer_km / max(vehicle_age, 1),
         }
+        if tuple(features) != MODEL_FEATURE_ORDER:
+            raise PriceProviderError("Price feature mapping does not match the trained model contract.")
+        return features
 
     def predict(self, vehicle: VehiclePriceInput) -> PricePrediction:
         features = self.map_features(vehicle)

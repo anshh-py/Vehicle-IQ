@@ -11,7 +11,8 @@ def test_root():
     response = client.get("/")
 
     assert response.status_code == 200
-    assert response.json()["name"] == "Vehicle IQ"
+    assert response.headers["content-type"].startswith("text/html")
+    assert 'id="landing-page"' in response.text
 
 
 def test_liveness():

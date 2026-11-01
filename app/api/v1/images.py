@@ -5,7 +5,7 @@ import logging
 from typing import Annotated
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, status
+from fastapi import APIRouter, Depends, File, HTTPException, Response, UploadFile, status
 from sqlalchemy import select
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
@@ -15,7 +15,7 @@ from app.db.models import UploadedImage, VehicleAssessment
 from app.db.session import get_db
 from app.images.validation import InvalidImageError, inspect_image
 from app.schemas.images import UploadedImageResponse
-from app.storage.images import ImageStorage, get_image_storage
+from app.storage.images import ImageStorage, ImageStorageError, get_image_storage
 
 
 logger = logging.getLogger(__name__)
@@ -131,3 +131,46 @@ def list_assessment_images(assessment_id: UUID, db: Session = Depends(get_db)) -
     except SQLAlchemyError:
         raise HTTPException(status_code=500, detail="Unable to list assessment images.") from None
     return [UploadedImageResponse.model_validate(image) for image in images]
+
+
+@router.get("/{image_id}/content")
+def get_assessment_image_content(
+    assessment_id: UUID,
+    image_id: UUID,
+    db: Session = Depends(get_db),
+    storage: ImageStorage = Depends(get_image_storage),
+    max_bytes: int = Depends(get_image_upload_limit),
+) -> Response:
+    """Serve one previously validated image for its owning assessment only."""
+    try:
+        image = db.scalar(
+            select(UploadedImage).where(
+                UploadedImage.id == image_id,
+                UploadedImage.assessment_id == assessment_id,
+            )
+        )
+    except SQLAlchemyError:
+        raise HTTPException(status_code=500, detail="Unable to retrieve image content.") from None
+    if image is None:
+        raise HTTPException(status_code=404, detail="Image content not found.")
+
+    if image.byte_size is not None and image.byte_size > max_bytes:
+        raise HTTPException(status_code=404, detail="Image content not found.")
+    if image.content_type not in {"image/jpeg", "image/png", "image/webp"}:
+        raise HTTPException(status_code=404, detail="Image content not found.")
+    try:
+        content = storage.read(image.object_key)
+    except ImageStorageError:
+        raise HTTPException(status_code=404, detail="Image content not found.") from None
+    if len(content) > max_bytes or (image.byte_size is not None and len(content) != image.byte_size):
+        raise HTTPException(status_code=404, detail="Image content not found.")
+
+    return Response(
+        content=content,
+        media_type=image.content_type,
+        headers={
+            "Cache-Control": "private, no-store",
+            "X-Content-Type-Options": "nosniff",
+            "Content-Disposition": "inline",
+        },
+    )

@@ -4,7 +4,7 @@ from decimal import Decimal
 from typing import Annotated, Any
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field, StringConstraints, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, StringConstraints, computed_field, field_validator, model_validator
 
 
 NonEmptyVIN = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=17)]
@@ -71,6 +71,20 @@ class AssessmentResponse(BaseModel):
     asking_price_inr: Decimal | None
     created_at: datetime
     updated_at: datetime
+
+    @computed_field
+    @property
+    def vehicle_details_provenance(self) -> dict[str, str]:
+        return {
+            key: "user_input"
+            for key, value in (self.vehicle_details or {}).items()
+            if value is not None and key != "asking_price_inr"
+        }
+
+    @computed_field
+    @property
+    def asking_price_inr_provenance(self) -> str | None:
+        return "user_input" if self.asking_price_inr is not None else None
 
 
 class AssessmentListResponse(BaseModel):

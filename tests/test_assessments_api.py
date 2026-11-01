@@ -62,7 +62,14 @@ def test_create_retrieve_and_return_only_public_assessment_fields(client):
         "asking_price_inr",
         "created_at",
         "updated_at",
+        "vehicle_details_provenance",
+        "asking_price_inr_provenance",
     }
+    assert body["vehicle_details_provenance"] == {
+        "make": "user_input",
+        "year": "user_input",
+    }
+    assert body["asking_price_inr_provenance"] is None
 
     retrieved = client.get(f"/api/v1/assessments/{body['id']}")
     assert retrieved.status_code == 200
@@ -81,6 +88,7 @@ def test_asking_price_is_optional_nullable_and_persisted(client):
     assert omitted.json()["asking_price_inr"] is None
     assert explicit_null.json()["asking_price_inr"] is None
     assert supplied.json()["asking_price_inr"] == "845000.50"
+    assert supplied.json()["asking_price_inr_provenance"] == "user_input"
     assert supplied.json()["vehicle_details"]["make"] == "Example"
     assert supplied.json()["vehicle_details"]["asking_price_inr"] == "845000.50"
     assert client.get(f"/api/v1/assessments/{supplied.json()['id']}").json()["asking_price_inr"] == "845000.50"

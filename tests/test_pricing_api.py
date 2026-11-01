@@ -9,7 +9,7 @@ from sqlalchemy.orm import Session
 from sqlalchemy.pool import StaticPool
 
 from app.db.base import Base
-from app.db.models import PriceEstimate, VehicleAssessment
+from app.db.models import OCRResult, PriceEstimate, VehicleAssessment
 from app.db.session import get_db
 from app.main import app
 from app.pricing.provider import PipelinePriceProvider, get_price_provider
@@ -18,21 +18,39 @@ from app.schemas.pricing import PricePrediction, VehiclePriceInput
 
 VALID_REQUEST = {
     "vehicle": {
-        "make": "Maruti Suzuki",
-        "model": "Swift",
-        "variant": "VXi",
-        "registration_year": 2021,
         "odometer_km": 42000,
-        "fuel_type": "petrol",
-        "transmission": "manual",
         "seller_type": "Individual",
-        "mileage_kmpl": 21.5,
-        "engine_cc": 1197,
-        "max_power_bhp": 88.5,
-        "seats": 5,
-        "owner_count": 1,
     }
 }
+
+LOOKUP_RESULT = {
+    "registration_number": "MH12AB3456",
+    "make": "Maruti Suzuki",
+    "model": "Swift",
+    "variant": "VXi",
+    "fuel_type": "Petrol",
+    "registration_date": "2021-05-12",
+    "manufacturing_year": 2021,
+    "engine_cc": 1197,
+    "seats": 5,
+    "max_power_bhp": 88.5,
+    "transmission": "manual",
+    "owner_count": None,
+    "mileage_kmpl": 21.5,
+}
+
+
+def _save_lookup(engine, assessment_id):
+    with Session(engine) as session:
+        session.add(OCRResult(
+            assessment_id=UUID(assessment_id),
+            result_type="registration_lookup",
+            status="completed",
+            provider="verified_test_api",
+            raw_text="MH12AB3456",
+            result_data=LOOKUP_RESULT,
+        ))
+        session.commit()
 
 
 class FakePriceProvider:
@@ -86,20 +104,26 @@ def pricing_api() -> Generator[tuple[TestClient, object], None, None]:
 
 def test_price_request_rejects_invalid_or_missing_vehicle_fields(pricing_api):
     client, (_engine, assessment_id) = pricing_api
+    app.dependency_overrides[get_price_provider] = lambda: FakePriceProvider()
 
     missing = client.post(f"/api/v1/assessments/{assessment_id}/price-estimates", json={"vehicle": {}})
     invalid = {**VALID_REQUEST, "vehicle": {**VALID_REQUEST["vehicle"], "odometer_km": -1}}
     bad_value = client.post(f"/api/v1/assessments/{assessment_id}/price-estimates", json=invalid)
+    forbidden_specification = client.post(
+        f"/api/v1/assessments/{assessment_id}/price-estimates",
+        json={"vehicle": {**VALID_REQUEST["vehicle"], "engine_cc": 1200}},
+    )
 
     assert missing.status_code == 422
     assert bad_value.status_code == 422
+    assert forbidden_specification.status_code == 422
 
 
 @pytest.mark.parametrize(
     ("field", "value"),
-    [("seller_type", "broker"), ("mileage_kmpl", 0), ("engine_cc", 10001), ("max_power_bhp", -1), ("seats", 10)],
+    [("seller_type", "broker"), ("odometer_km", -1)],
 )
-def test_price_request_validates_model_features(pricing_api, field, value):
+def test_price_request_validates_manual_inputs(pricing_api, field, value):
     client, (_engine, assessment_id) = pricing_api
     invalid = {**VALID_REQUEST, "vehicle": {**VALID_REQUEST["vehicle"], field: value}}
 
@@ -129,6 +153,7 @@ def test_unconfigured_provider_returns_503_and_persists_nothing(pricing_api):
 
 def test_fake_provider_result_is_persisted_and_returned(pricing_api):
     client, (engine, assessment_id) = pricing_api
+    _save_lookup(engine, assessment_id)
     fake = FakePriceProvider()
     app.dependency_overrides[get_price_provider] = lambda: fake
 
@@ -141,6 +166,16 @@ def test_fake_provider_result_is_persisted_and_returned(pricing_api):
     assert body["model_name"] == "test-only-fake"
     assert body["assessment_id"] == assessment_id
     assert fake.received.make == "Maruti Suzuki"
+    assert fake.received.transmission.value == "manual"
+    assert fake.received.mileage_kmpl == 21.5
+    assert fake.received.max_power_bhp == 88.5
+    assert body["provenance"]["make"] == "vehicle_api"
+    assert body["provenance"]["transmission"] == "vehicle_api"
+    assert body["provenance"]["mileage_kmpl"] == "vehicle_api"
+    assert body["provenance"]["max_power_bhp"] == "vehicle_api"
+    assert body["provenance"]["odometer_km"] == "user_input"
+    assert body["provenance"]["seller_type"] == "user_input"
+    assert body["vehicle"]["owner_count"] is None
     with Session(engine) as session:
         estimate = session.scalar(select(PriceEstimate))
         assert estimate is not None
@@ -152,6 +187,7 @@ def test_fake_provider_result_is_persisted_and_returned(pricing_api):
 
 def test_pricing_to_report_flow_keeps_ml_and_market_values_separate(pricing_api):
     client, (engine, assessment_id) = pricing_api
+    _save_lookup(engine, assessment_id)
     fake = FakePriceProvider()
     app.dependency_overrides[get_price_provider] = lambda: fake
 
@@ -170,8 +206,14 @@ def test_pricing_to_report_flow_keeps_ml_and_market_values_separate(pricing_api)
     report = report_response.json()["report_data"]
     assert report["assessment"]["asking_price_inr"] == "675000.00"
     assert report["price_estimates"][-1]["amount"] == "625000.00"
+    assert report["price_estimates"][-1]["provenance"]["make"] == "vehicle_api"
+    assert report["price_estimates"][-1]["provenance"]["odometer_km"] == "user_input"
+    assert report["assessment"]["asking_price_inr_provenance"] == "user_input"
     assert report["market_valuation"]["status"] == "unavailable"
     assert report["market_valuation"]["market_asking_price_range"] is None
+    assert report["market_valuation"]["unavailable_reason"] == (
+        "Tavily web search is not configured. Set TAVILY_API_KEY in the backend environment."
+    )
     recommendation = report["buyer_recommendation"]
     assert recommendation["status"] == "negotiate"
     assert recommendation["comparison_basis"] == "ml_estimate_only"
@@ -187,7 +229,8 @@ def test_pricing_to_report_flow_keeps_ml_and_market_values_separate(pricing_api)
 
 
 def test_pricing_to_report_flow_without_asking_price(pricing_api):
-    client, (_engine, assessment_id) = pricing_api
+    client, (engine, assessment_id) = pricing_api
+    _save_lookup(engine, assessment_id)
     app.dependency_overrides[get_price_provider] = lambda: FakePriceProvider()
 
     estimate_response = client.post(
@@ -214,6 +257,7 @@ def test_model_artifact_failure_returns_safe_502_without_persisting(
     pricing_api, tmp_path, artifact_state
 ):
     client, (engine, assessment_id) = pricing_api
+    _save_lookup(engine, assessment_id)
     artifact = tmp_path / "price-model.joblib"
     if artifact_state == "invalid":
         artifact.write_bytes(b"not deserialized by this test")
@@ -232,6 +276,7 @@ def test_model_artifact_failure_returns_safe_502_without_persisting(
 
 def test_provider_failure_does_not_persist_estimate(pricing_api):
     client, (engine, assessment_id) = pricing_api
+    _save_lookup(engine, assessment_id)
 
     with Session(engine) as session:
         assessment = session.get(VehicleAssessment, UUID(assessment_id))
@@ -262,3 +307,114 @@ def test_provider_failure_does_not_persist_estimate(pricing_api):
     assert recommendation["asking_price_inr"] == "650000.00"
     assert recommendation["ml_estimate_inr"] is None
     assert recommendation["absolute_difference_inr"] is None
+
+
+def test_missing_api_features_return_unavailable_without_estimate(pricing_api):
+    client, (engine, assessment_id) = pricing_api
+    _save_lookup(engine, assessment_id)
+    with Session(engine) as session:
+        lookup = session.scalar(select(OCRResult))
+        result_data = dict(lookup.result_data)
+        result_data["mileage_kmpl"] = None
+        lookup.result_data = result_data
+        session.commit()
+    app.dependency_overrides[get_price_provider] = lambda: FakePriceProvider()
+
+    response = client.post(
+        f"/api/v1/assessments/{assessment_id}/price-estimates",
+        json=VALID_REQUEST,
+    )
+
+    assert response.status_code == 422
+    assert response.json()["detail"]["status"] == "unavailable"
+    assert "mileage_kmpl" in response.json()["detail"]["missing_features"]
+    with Session(engine) as session:
+        assert session.scalar(select(PriceEstimate)) is None
+
+
+def test_missing_api_specs_can_be_supplied_and_persisted_with_user_provenance(pricing_api):
+    client, (engine, assessment_id) = pricing_api
+    _save_lookup(engine, assessment_id)
+    with Session(engine) as session:
+        lookup = session.scalar(select(OCRResult))
+        result_data = dict(lookup.result_data)
+        for field in ("transmission", "mileage_kmpl", "max_power_bhp"):
+            result_data[field] = None
+        lookup.result_data = result_data
+        session.commit()
+
+    provider = FakePriceProvider()
+    app.dependency_overrides[get_price_provider] = lambda: provider
+    response = client.post(
+        f"/api/v1/assessments/{assessment_id}/price-estimates",
+        json={
+            "vehicle": {
+                **VALID_REQUEST["vehicle"],
+                "transmission": "automatic",
+                "mileage_kmpl": 19.2,
+                "max_power_bhp": 110,
+            }
+        },
+    )
+
+    assert response.status_code == 201
+    body = response.json()
+    assert body["vehicle"]["transmission"] == "automatic"
+    assert body["vehicle"]["mileage_kmpl"] == 19.2
+    assert body["vehicle"]["max_power_bhp"] == 110
+    assert all(body["provenance"][field] == "user_input" for field in (
+        "transmission", "mileage_kmpl", "max_power_bhp"
+    ))
+    assert provider.received.transmission.value == "automatic"
+    with Session(engine) as session:
+        assessment = session.get(VehicleAssessment, UUID(assessment_id))
+        assert assessment.vehicle_details["transmission"] == "automatic"
+        assert assessment.vehicle_details["mileage_kmpl"] == 19.2
+        assert assessment.vehicle_details["max_power_bhp"] == 110
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("transmission", "semi-automatic"),
+        ("mileage_kmpl", 0),
+        ("mileage_kmpl", -1),
+        ("max_power_bhp", 0),
+        ("max_power_bhp", -1),
+    ],
+)
+def test_price_api_rejects_invalid_manual_vehicle_specifications(pricing_api, field, value):
+    client, (_engine, assessment_id) = pricing_api
+    response = client.post(
+        f"/api/v1/assessments/{assessment_id}/price-estimates",
+        json={"vehicle": {**VALID_REQUEST["vehicle"], field: value}},
+    )
+    assert response.status_code == 422
+
+
+def test_seller_asking_price_is_user_input_and_persists_without_model_estimate(pricing_api):
+    client, (engine, assessment_id) = pricing_api
+    app.dependency_overrides[get_price_provider] = lambda: FakePriceProvider()
+
+    response = client.post(
+        f"/api/v1/assessments/{assessment_id}/price-estimates",
+        json={
+            "vehicle": {
+                "odometer_km": 42000,
+                "seller_type": "Individual",
+                "seller_asking_price": "675000.00",
+            }
+        },
+    )
+
+    assert response.status_code == 422
+    assert response.json()["detail"]["status"] == "unavailable"
+    with Session(engine) as session:
+        assessment = session.get(VehicleAssessment, UUID(assessment_id))
+        assert assessment.asking_price_inr == Decimal("675000.00")
+
+    report_response = client.post(f"/api/v1/assessments/{assessment_id}/report")
+    assert report_response.status_code == 200
+    report = report_response.json()["report_data"]
+    assert report["assessment"]["asking_price_inr"] == "675000.00"
+    assert report["assessment"]["asking_price_inr_provenance"] == "user_input"

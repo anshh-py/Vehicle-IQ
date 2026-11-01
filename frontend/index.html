@@ -1,0 +1,158 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#080d0c">
+  <meta name="description" content="A photo-led first look at a used car's condition and price, based on evidence actually returned.">
+  <title>Vehicle IQ — Inspect with more clarity</title>
+  <link rel="preload" as="image" href="./assets/vehicle-hero.png" fetchpriority="high">
+  <link rel="stylesheet" href="./styles.css">
+  <script src="./app.js" defer></script>
+</head>
+<body>
+  <header class="site-header">
+    <a class="brand" href="#/" aria-label="Vehicle IQ home">
+      <span class="brand-mark" aria-hidden="true"><i></i><i></i><i></i></span>
+      <span class="brand-word">vehicle<span>iq</span></span>
+    </a>
+    <span class="header-note"><i></i> A MORE INFORMED FIRST LOOK</span>
+    <nav class="main-nav" aria-label="Main navigation"><a href="#/how-it-works">The approach</a><a href="#/sample-report">Sample report</a><a href="#/inspect">Your review</a></nav>
+    <a class="header-action" href="#/inspect">Inspect a car <span aria-hidden="true">↗</span></a>
+  </header>
+
+  <main>
+    <div id="landing-page" class="route-page" data-route-page="landing">
+    <section class="hero" aria-labelledby="hero-title">
+      <div class="hero-copy-panel">
+        <p class="eyebrow"><span class="eyebrow-line"></span> BEFORE THE TEST DRIVE</p>
+        <h1 id="hero-title">Look closer.<br><em>Buy clearer.</em></h1>
+        <p class="hero-copy">A thoughtful first look at a used car, built from the photos and details you already have.</p>
+        <a class="hero-cta" href="#/inspect"><span>Inspect my car</span><span class="cta-arrow" aria-hidden="true">↗</span></a>
+        <p class="hero-footnote"><span class="hero-spark" aria-hidden="true">✳</span> Useful context for your own inspection — never a replacement for seeing the car in person.</p>
+      </div>
+      <div class="hero-visual" aria-label="Illustration of a vehicle in an inspection studio">
+        <div class="hero-image-wrap"><img class="hero-image" src="./assets/vehicle-hero.png" alt="Illustrative pearl-white sedan under cinematic studio lighting" fetchpriority="high"></div>
+        <div class="hero-image-shade"></div>
+        <div class="hero-grid" aria-hidden="true"></div>
+        <span class="hero-scanline" aria-hidden="true"></span>
+        <span class="hero-target target-one" aria-hidden="true"></span><span class="hero-target target-two" aria-hidden="true"></span>
+        <div class="hero-visual-label"><span class="live-pulse"></span> PHOTO-LED REVIEW <i>01 / 03</i></div>
+        <div class="hero-visual-caption">A clearer read on what to check next.</div>
+      </div>
+      <div class="hero-bottomline"><span>VEHICLE IQ <i>—</i> PRE-PURCHASE REVIEW</span><span>MADE FOR THE MOMENT BEFORE YOU BUY <b>↓</b></span></div>
+    </section>
+
+    <section class="intro-band" id="how-it-works" aria-label="What the review can help you see">
+      <div class="intro-band-title"><p class="eyebrow light"><span class="eyebrow-line"></span> SEE THE SIGNALS</p><h2>Start with what<br><em>you can see.</em></h2></div>
+      <div class="intro-band-copy">Photos may surface useful clues about visible condition, vehicle text and price context. Every result stays tied to the evidence available.</div>
+      <div class="intro-band-mark" aria-hidden="true"><span>V</span><i></i><span>IQ</span></div>
+    </section>
+    <section class="landing-preview" aria-label="A preview of your review">
+      <div class="preview-heading"><p class="eyebrow light"><span class="eyebrow-line"></span> ONE THOUGHTFUL FIRST LOOK</p><a href="#/how-it-works">How it works <span aria-hidden="true">↗</span></a></div>
+      <div class="preview-grid"><article><span>01</span><h3>Identity clues</h3><p>Image text, clearly marked for you to verify.</p></article><article><span>02</span><h3>Condition signals</h3><p>Visible findings only when supported by the photos.</p></article><article><span>03</span><h3>Price perspective</h3><p>A research estimate, never presented as market value.</p></article></div>
+    </section>
+
+    </div>
+
+    <div id="inspect-page" class="route-page" data-route-page="inspect" hidden>
+    <section class="inspection-section" id="inspection" aria-labelledby="inspection-title">
+      <div class="section-heading">
+        <div><p class="eyebrow light"><span class="eyebrow-line"></span> YOUR REVIEW</p><h2 id="inspection-title">Bring the car<br><em>into focus.</em></h2></div>
+        <p class="section-description">Photos are enough to begin. Add any vehicle or price details you already know; everything is optional apart from the photos.</p>
+      </div>
+
+      <form id="inspection-form" class="submission-layout" novalidate>
+        <section class="upload-card" aria-labelledby="photos-title">
+          <div class="card-overline"><span>YOUR PHOTOS</span><span id="photo-count">0 <i>/ 10</i></span></div>
+          <h3 id="photos-title">Show us around the car.</h3>
+          <p class="card-subcopy">A few clear angles are a good place to begin.</p>
+          <label class="upload-zone" id="upload-zone" for="photo-input">
+            <input id="photo-input" type="file" accept="image/jpeg,image/png,image/webp" multiple aria-describedby="upload-help">
+            <span class="upload-art" aria-hidden="true"><span class="upload-ring"><svg viewBox="0 0 24 24"><path d="M12 16V4m0 0L7.5 8.5M12 4l4.5 4.5M5 15v4h14v-4"/></svg></span><i class="upload-orbit orbit-a"></i><i class="upload-orbit orbit-b"></i></span>
+            <strong>Drop photos to begin</strong>
+            <span class="browse-prompt">or <u>choose from your device</u></span>
+            <span class="upload-format" id="upload-help">JPEG, PNG or WebP <b>·</b> up to 10 photos</span>
+          </label>
+          <div class="photo-grid" id="photo-grid" aria-live="polite"></div>
+          <p class="photo-tip"><span aria-hidden="true">✳</span> Exterior views, clear light, and close-ups can help.</p>
+        </section>
+
+        <section class="details-card" aria-labelledby="listing-title">
+          <div class="card-overline"><span>WHAT YOU KNOW</span><span class="optional-label">OPTIONAL</span></div>
+          <h3 id="listing-title">A little context.</h3>
+          <p class="card-subcopy">Share what you know. These details are optional and can help prepare a price perspective.</p>
+          <label class="field"><span>Registration number</span><input id="registration-number" name="registration_number" autocomplete="off" maxlength="32" placeholder="e.g. RJ45CA1879"></label>
+          <label class="field asking-field"><span>Seller's asking price</span><span class="optional-label inline">OPTIONAL</span><div class="money-input"><span aria-hidden="true">₹</span><input id="asking-price" name="asking_price" type="number" min="0.01" max="100000000" step="0.01" inputmode="decimal" placeholder="Amount in INR"></div></label>
+          <div class="vehicle-input-grid">
+            <label class="field"><span>Seller type</span><select name="seller_type"><option value="">Select if known</option><option value="Individual">Individual</option><option value="Dealer">Dealer</option><option value="Trustmark Dealer">Trustmark Dealer</option></select></label>
+            <label class="field"><span>Odometer · km</span><input name="odometer_km" type="number" min="0" max="2000000" step="1" inputmode="numeric" placeholder="e.g. 42,000"></label>
+            <label class="field"><span>Transmission type</span><select name="transmission"><option value="">Select if known</option><option value="manual">Manual</option><option value="automatic">Automatic</option><option value="amt">AMT</option><option value="cvt">CVT</option><option value="dct">DCT</option></select></label>
+            <label class="field"><span>Mileage · km/l</span><input name="mileage_kmpl" type="number" min="0.1" max="100" step="any" inputmode="decimal" placeholder="e.g. 18.5"></label>
+            <label class="field"><span>Maximum power · bhp</span><input name="max_power_bhp" type="number" min="0.1" max="2000" step="any" inputmode="decimal" placeholder="e.g. 88.5"><small class="field-help">Use vehicle documents or manufacturer specifications rather than guess.</small></label>
+          </div>
+          <p class="vehicle-input-note">Prefilled details returned by the vehicle lookup appear in your report and can be corrected there.</p>
+          <div class="details-spacer"></div>
+          <div class="privacy-note"><span class="privacy-lock" aria-hidden="true">⌑</span><span>Your details are used to prepare this review.</span></div>
+          <button class="start-button" id="start-button" type="submit"><span>Start my inspection</span><span class="button-arrow" aria-hidden="true">↗</span></button>
+          <div class="form-message" id="form-message" role="alert" aria-live="assertive" hidden></div>
+        </section>
+      </form>
+      <div class="inspection-bottom"><span>1–10 PHOTOS <i>—</i> YOUR FIRST LOOK STARTS HERE</span><span>NO EXTRA DETAILS REQUIRED</span></div>
+    </section>
+
+    <section class="promise-strip" aria-label="Review limitations">
+      <div class="promise-intro"><span class="eyebrow-line"></span><span>MADE TO INFORM YOUR NEXT STEP</span></div>
+      <article><span class="promise-index">01</span><div><h3>Clues, not guarantees</h3><p>Image results reflect what was visible and returned.</p></div></article>
+      <article><span class="promise-index">02</span><div><h3>Estimate, not market value</h3><p>Model output stays separate from live comparable evidence.</p></div></article>
+      <article><span class="promise-index">03</span><div><h3>See it for yourself</h3><p>Use this review alongside an in-person inspection.</p></div></article>
+    </section>
+
+    </div>
+
+    <div id="how-page" class="route-page" data-route-page="how" hidden>
+      <section class="how-hero"><p class="eyebrow light"><span class="eyebrow-line"></span> A SIMPLE FIRST LOOK</p><h1>Good questions<br><em>start with good clues.</em></h1><p>Vehicle IQ helps organize the details a buyer can gather before meeting a seller. It is a useful first read, with clear limits.</p><a class="hero-cta" href="#/inspect"><span>Inspect a car</span><span class="cta-arrow" aria-hidden="true">↗</span></a></section>
+      <section class="how-steps" aria-labelledby="steps-title"><div class="how-section-heading"><p class="eyebrow light"><span class="eyebrow-line"></span> THE EXPERIENCE</p><h2 id="steps-title">From photos<br>to a clearer next step.</h2></div><div class="step-grid"><article><span>01</span><h3>Share what you have</h3><p>Add up to ten vehicle photos. Registration and asking price are optional.</p></article><article><span>02</span><h3>Review the available clues</h3><p>Image text, visible findings and price estimates appear only when services return them.</p></article><article><span>03</span><h3>Decide what to check next</h3><p>Use the evidence and limitations to guide your own questions and in-person inspection.</p></article></div></section>
+      <section class="how-capabilities"><div><p class="eyebrow light"><span class="eyebrow-line"></span> WHAT IT CAN — AND CANNOT — TELL YOU</p><h2>Evidence first.<br><em>Always.</em></h2></div><div class="capability-columns"><article><h3>Useful signals</h3><ul><li>Text recognized in photos, for you to verify</li><li>Visible image findings with available confidence and evidence</li><li>A research-only estimate when details and a model are available</li><li>A recommendation based on stored results and asking price, when supplied</li></ul></article><article><h3>Important limits</h3><ul><li>Photo review cannot certify a vehicle as damage-free</li><li>Text read from photos does not confirm identity or document authenticity</li><li>Model estimates are not verified market value or sale prices</li><li>Missing evidence and unavailable services stay clearly unavailable</li></ul></article></div></section>
+      <section class="faq-section"><div class="how-section-heading"><p class="eyebrow light"><span class="eyebrow-line"></span> GOOD TO KNOW</p><h2>Frequently<br>asked.</h2></div><div class="faq-list"><details><summary>Do I need every vehicle detail to start?</summary><p>No. Begin with photos. The page asks for specifications only if the a price estimate needs them.</p></details><details><summary>Does a price estimate mean the asking price is fair?</summary><p>No. A configured research model estimate is separate from market valuation. Without sufficient permitted comparable evidence, market valuation is unavailable.</p></details><details><summary>Can this replace an independent inspection?</summary><p>No. Use the review to prepare questions, then inspect the car and its documents in person with a qualified professional.</p></details><details><summary>Why might part of a review be unavailable?</summary><p>Image quality, missing details or unavailable services can limit results. The report identifies gaps rather than filling them in.</p></details></div></section>
+      <section class="how-end"><h2>Start with the<br><em>evidence you have.</em></h2><a class="hero-cta" href="#/inspect"><span>Begin your review</span><span class="cta-arrow" aria-hidden="true">↗</span></a></section>
+    </div>
+
+    <div id="inspection-page" class="route-page" data-route-page="inspection" hidden><section class="processing-page"><p class="eyebrow light"><span class="eyebrow-line"></span> YOUR REVIEW</p><h1>Taking a moment<br><em>to look closer.</em></h1><p>We’re reviewing the photos you shared. Timing depends on the number and detail of the images.</p></section></div>
+
+    <div id="route-error-page" class="route-page" data-route-page="error" hidden><section class="route-error"><p class="eyebrow light"><span class="eyebrow-line"></span> LET’S TRY THAT AGAIN</p><h1 id="route-error-title">This review isn’t available.</h1><p id="route-error-copy">We couldn’t open this page. Check the link or start a new review.</p><div class="route-error-actions"><a class="header-action" id="route-continue" href="#/inspect" hidden>Continue review</a><a class="header-action" href="#/inspect">Start a review <span>↗</span></a><a class="quiet-link" href="#/">Return home</a></div></section></div>
+
+    <div id="report-page" class="route-page" data-route-page="report" hidden>
+    <section class="report-shell" id="report-shell" aria-live="polite" tabindex="-1">
+      <p class="sample-report-banner" id="sample-report-banner" hidden>Illustrative sample report · all vehicle and estimate details below are synthetic demonstration content, not a real inspection.</p>
+      <div class="report-masthead"><div><p class="eyebrow light"><span class="eyebrow-line"></span> YOUR VEHICLE IQ REVIEW</p><h2>A closer look.<br><em>A clearer next step.</em></h2><p class="report-subtitle" id="report-subtitle"></p></div><button type="button" class="new-inspection" id="new-inspection">Review another car <span aria-hidden="true">↗</span></button></div>
+      <div class="report-overview" id="report-overview"></div>
+      <p class="report-load-note" id="report-load-note" hidden></p>
+      <div class="report-grid">
+        <section class="report-card vehicle-card"><div class="report-card-heading"><span class="report-index">01</span><div><h3>Vehicle details</h3><p>Submitted details and information returned</p></div><span class="result-status" id="vehicle-status"></span></div><div id="vehicle-evidence" class="card-content"></div><div id="vehicle-specs" class="card-content"></div></section>
+        <section class="report-card condition-card"><div class="report-card-heading"><span class="report-index">02</span><div><h3>Condition review</h3><p>Visible findings returned from your photos</p></div><span class="result-status" id="condition-status"></span></div><div id="condition-findings" class="card-content"></div></section>
+        <section class="report-card valuation-card"><div class="report-card-heading"><span class="report-index">03</span><div><h3>Price perspective</h3><p>Research estimate and seller asking price</p></div><span class="result-status" id="price-status"></span></div><div id="price-content" class="card-content"></div><div class="pricing-details-prompt" id="pricing-details-prompt" hidden><button type="button" class="add-details-button" id="edit-pricing-details"><span>Review or correct pricing details</span><span aria-hidden="true">+</span></button><form id="pricing-form" class="pricing-form" hidden><p class="dialog-copy">Only details still needed for the estimate are shown. Existing vehicle details are prefilled when available.</p><div class="pricing-fields" id="pricing-fields"></div><p class="form-note">Research estimate only — not verified market value.</p><div class="dialog-actions"><button type="button" class="text-button" id="cancel-pricing">Cancel</button><button type="submit" class="start-button"><span>Get price perspective</span><span class="button-arrow" aria-hidden="true">↗</span></button></div><div class="form-message" id="pricing-message" role="alert" aria-live="assertive" hidden></div></form></div></section>
+        <section class="report-card recommendation-card"><div class="report-card-heading"><span class="report-index">04</span><div><h3>What to consider</h3><p>Next steps based on available evidence</p></div><span class="result-status" id="report-status"></span></div><div id="recommendation-content" class="card-content"></div></section>
+      </div>
+      <p class="report-footnote">This review is a starting point. Have the vehicle, its documents, and its condition checked in person before purchase.</p>
+    </section>
+    </div>
+  </main>
+
+  <footer class="site-footer"><a class="brand" href="#/"><span class="brand-mark" aria-hidden="true"><i></i><i></i><i></i></span><span class="brand-word">vehicle<span>iq</span></span></a><nav aria-label="Footer navigation"><a href="#/how-it-works">How it works</a><a href="#/sample-report">Sample report</a><a href="#/inspect">Start a review</a></nav><span>More clarity for the road ahead.</span><span>© Vehicle IQ</span></footer>
+
+  <div class="inspection-overlay" id="inspection-overlay" hidden aria-hidden="true" aria-modal="true" role="dialog" aria-labelledby="overlay-title" aria-describedby="overlay-status" tabindex="-1">
+    <div class="overlay-blur"></div><div class="overlay-grain"></div><div class="particles" aria-hidden="true"><i></i><i></i><i></i><i></i><i></i><i></i></div>
+    <div class="overlay-content">
+      <p class="overlay-eyebrow"><span class="live-pulse"></span> A CLOSER LOOK IS UNDER WAY</p>
+      <h2 id="overlay-title">Taking a moment<br>to look <em>closer.</em></h2>
+      <div class="inspection-visual" aria-hidden="true"><div class="visual-grid"></div><div class="radar radar-a"></div><div class="radar radar-b"></div><div class="radar radar-c"></div><div class="vehicle-frame"><img src="./assets/vehicle-hero.png" alt=""><span class="vehicle-frame-shade"></span></div><span class="scan-beam"></span><span class="scan-point point-a"></span><span class="scan-point point-b"></span><span class="scan-point point-c"></span><span class="visual-label label-a">SURFACE</span><span class="visual-label label-b">DETAIL</span></div>
+      <div class="progress-readout"><span id="progress-value">—</span><span class="percent-sign">%</span></div>
+      <p class="progress-copy" id="overlay-status" aria-live="polite">Preparing your inspection</p>
+      <div class="progress-track" aria-hidden="true"><span id="progress-bar"></span></div>
+      <p class="overlay-small" id="overlay-footnote">Timing varies with the number of photos and detail in each image.</p>
+    </div>
+  </div>
+
+</body>
+</html>

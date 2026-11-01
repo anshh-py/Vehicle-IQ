@@ -11,7 +11,7 @@ from sqlalchemy.orm import Session
 from sqlalchemy.pool import StaticPool
 
 from app.damage.inference import DamageDetection, DamageInferenceResult
-from app.damage.worker import DamageWorkerUnavailable
+from app.damage.worker import MODEL_NAME, DamageWorkerUnavailable
 from app.db.base import Base
 from app.db.models import DamageFinding, EvidenceRecord, UploadedImage, VehicleAssessment
 from app.db.session import get_db
@@ -161,7 +161,7 @@ def test_damage_endpoint_persists_only_model_results(damage_api_fixture):
     assert response.status_code == 200
     payload = response.json()
     assert payload["provider"] == "yolo11m_local"
-    assert payload["status"] == "completed"
+    assert payload["status"] == "completed_with_findings"
     assert payload["reused"] is False
     assert [finding["damage_type"] for finding in payload["findings"]] == ["dent", "broken_lamp"]
     assert [finding["confidence"] for finding in payload["findings"]] == [0.91, 0.84]
@@ -189,6 +189,30 @@ def test_repeated_damage_request_reuses_existing_findings(damage_api_fixture):
     assert second.json()["findings"] == first.json()["findings"]
     assert len(api.provider.calls) == 1
     assert count_findings(api.engine) == 2
+
+
+def test_legacy_completed_zero_detection_record_maps_to_no_findings(damage_api_fixture):
+    api = damage_api_fixture
+    with Session(api.engine) as session:
+        session.add(
+            EvidenceRecord(
+                assessment_id=UUID(api.assessment_id),
+                image_id=UUID(api.image_id),
+                evidence_type="damage_detection",
+                source_reference=MODEL_NAME,
+                evidence_data={"status": "completed", "detection_count": 0},
+            )
+        )
+        session.commit()
+
+    response = api.client.post(
+        f"/api/v1/assessments/{api.assessment_id}/images/{api.image_id}/damage"
+    )
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "completed_no_findings"
+    assert response.json()["reused"] is True
+    assert api.provider.calls == []
 
 
 def test_damage_endpoint_returns_404_for_image_outside_assessment(damage_api_fixture):
@@ -228,10 +252,14 @@ def test_damage_endpoint_rejects_unsupported_stored_image_format(tmp_path):
             f"/api/v1/assessments/{api.assessment_id}/images/{api.image_id}/damage"
         )
 
-        assert response.status_code == 422
-        assert response.json()["detail"] == "Stored image is corrupt or unsupported."
+        assert response.status_code == 200
+        assert response.json()["status"] == "unavailable"
+        assert response.json()["reason"] == "Stored image is corrupt or unsupported."
         assert api.provider.calls == []
         assert count_findings(api.engine) == 0
+        with Session(api.engine) as session:
+            marker = session.scalar(select(EvidenceRecord).where(EvidenceRecord.evidence_type == "damage_detection"))
+            assert marker.evidence_data["status"] == "unavailable"
 
 
 def test_damage_endpoint_rejects_corrupt_stored_image(tmp_path):
@@ -239,19 +267,45 @@ def test_damage_endpoint_rejects_corrupt_stored_image(tmp_path):
         response = api.client.post(
             f"/api/v1/assessments/{api.assessment_id}/images/{api.image_id}/damage"
         )
-        assert response.status_code == 422
+        assert response.status_code == 200
+        assert response.json()["status"] == "unavailable"
         assert api.provider.calls == []
         assert count_findings(api.engine) == 0
+        with Session(api.engine) as session:
+            marker = session.scalar(select(EvidenceRecord).where(EvidenceRecord.evidence_type == "damage_detection"))
+            assert marker.evidence_data["status"] == "unavailable"
 
 
-def test_damage_endpoint_does_not_persist_worker_failure(tmp_path):
+def test_damage_endpoint_persists_unavailable_model_outcome(tmp_path):
     with damage_api(tmp_path, provider=FakeDamageProvider(error=DamageWorkerUnavailable())) as api:
         response = api.client.post(
             f"/api/v1/assessments/{api.assessment_id}/images/{api.image_id}/damage"
         )
-        assert response.status_code == 503
-        assert response.json()["detail"] == "Damage inference is unavailable."
+        assert response.status_code == 200
+        assert response.json()["status"] == "unavailable"
+        assert response.json()["reason"] == "Damage inference is unavailable."
         assert count_findings(api.engine) == 0
+        with Session(api.engine) as session:
+            marker = session.scalar(select(EvidenceRecord).where(EvidenceRecord.evidence_type == "damage_detection"))
+            assert marker.evidence_data["status"] == "unavailable"
+
+
+def test_damage_endpoint_persists_unexpected_inference_exception_as_failed(tmp_path):
+    with damage_api(
+        tmp_path,
+        provider=FakeDamageProvider(error=RuntimeError("private inference detail")),
+    ) as api:
+        response = api.client.post(
+            f"/api/v1/assessments/{api.assessment_id}/images/{api.image_id}/damage"
+        )
+
+        assert response.status_code == 200
+        assert response.json()["status"] == "failed"
+        assert response.json()["reason"] == "Damage inference failed."
+        assert "private inference detail" not in response.text
+        with Session(api.engine) as session:
+            marker = session.scalar(select(EvidenceRecord).where(EvidenceRecord.evidence_type == "damage_detection"))
+            assert marker.evidence_data["status"] == "failed"
 
 
 def test_batch_damage_processes_ten_owned_images_and_report_aggregates_findings(damage_api_fixture):
@@ -265,11 +319,11 @@ def test_batch_damage_processes_ten_owned_images_and_report_aggregates_findings(
 
     assert response.status_code == 200
     payload = response.json()
-    assert payload["status"] == "completed"
+    assert payload["status"] == "completed_with_findings"
     assert payload["processed_count"] == 10
     assert payload["failed_count"] == 0
     assert len(payload["results"]) == 10
-    assert all(item["status"] == "completed" and len(item["findings"]) == 2 for item in payload["results"])
+    assert all(item["status"] == "completed_with_findings" and len(item["findings"]) == 2 for item in payload["results"])
     assert {finding["image_id"] for item in payload["results"] for finding in item["findings"]} == set(image_ids)
     assert count_findings(api.engine) == 20
     assert len(api.provider.calls) == 10
@@ -325,7 +379,9 @@ def test_batch_damage_reports_cross_assessment_image_failure(damage_api_fixture)
     assert count_findings(api.engine) == 0
 
 
-def test_batch_damage_empty_detection_is_success_without_fabricated_findings(damage_api_fixture):
+def test_batch_damage_empty_detection_is_success_without_fabricated_findings(
+    damage_api_fixture, monkeypatch
+):
     api = damage_api_fixture
     api.provider.result = DamageInferenceResult(detections=(), inference_seconds=0.2)
 
@@ -335,7 +391,8 @@ def test_batch_damage_empty_detection_is_success_without_fabricated_findings(dam
     )
 
     assert response.status_code == 200
-    assert response.json()["status"] == "completed"
+    assert response.json()["status"] == "completed_no_findings"
+    assert response.json()["results"][0]["status"] == "completed_no_findings"
     assert response.json()["results"][0]["findings"] == []
     assert count_findings(api.engine) == 0
     assert response.json()["results"][0]["reused"] is False
@@ -349,11 +406,38 @@ def test_batch_damage_empty_detection_is_success_without_fabricated_findings(dam
     assert len(api.provider.calls) == 1
     with Session(api.engine) as session:
         marker = session.scalar(select(EvidenceRecord).where(EvidenceRecord.evidence_type == "damage_detection"))
-        assert marker.evidence_data == {"status": "completed", "detection_count": 0}
+        assert marker.evidence_data == {
+            "status": "completed_no_findings",
+            "detection_count": 0,
+        }
 
+    from app.llm.schemas import LLMReportNarrative
+
+    narrative = LLMReportNarrative(
+        vehicle_overview="Vehicle.",
+        overall_condition_summary="This vehicle is damage-free.",
+        detected_damage_explanation="No issues were found.",
+        potential_inspection_risks="None.",
+        buyer_recommendations="Proceed.",
+        price_estimate_explanation="Model estimate.",
+        missing_information_and_limitations="None.",
+    )
+    monkeypatch.setattr(
+        "app.api.v1.reports.generate_llm_narrative",
+        lambda _report_data: narrative,
+    )
     report = api.client.post(f"/api/v1/assessments/{api.assessment_id}/report")
     assert report.status_code == 200
     assert report.json()["report_data"]["stages"]["damage_detection"]["status"] == "completed_no_findings"
+    assert report.json()["report_data"]["stages"]["damage_detection"]["image_results"][0]["status"] == "completed_no_findings"
+    assert report.json()["report_data"]["llm_narrative"]["detected_damage_explanation"] == (
+        "No damage was detected in the supplied images. This does not establish "
+        "that the vehicle is damage-free."
+    )
+    assert report.json()["report_data"]["llm_narrative"]["overall_condition_summary"] == (
+        "No damage was detected in the supplied images. This does not establish "
+        "that the vehicle is damage-free."
+    )
 
 
 def test_batch_damage_continues_after_corrupt_image_and_inference_failure(tmp_path):
@@ -373,9 +457,13 @@ def test_batch_damage_continues_after_corrupt_image_and_inference_failure(tmp_pa
 
         assert response.status_code == 200
         body = response.json()
-        assert body["status"] == "partial"
+        assert body["status"] == "completed_with_findings"
         assert body["processed_count"] == 1
-        assert body["failed_count"] == 2
+        assert body["failed_count"] == 0
+        assert body["unavailable_count"] == 2
+        assert body["results"][0]["status"] == "unavailable"
+        assert body["results"][1]["status"] == "unavailable"
+        assert body["results"][2]["status"] == "completed_with_findings"
         assert body["results"][0]["error"] == "Stored image is corrupt or unsupported."
         assert body["results"][1]["error"] == "Damage inference is unavailable."
         assert len(body["results"][2]["findings"]) == 2
@@ -384,4 +472,79 @@ def test_batch_damage_continues_after_corrupt_image_and_inference_failure(tmp_pa
 
         report = api.client.post(f"/api/v1/assessments/{api.assessment_id}/report")
         assert report.status_code == 200
-        assert report.json()["report_data"]["stages"]["damage_detection"]["status"] == "partial"
+        assert report.json()["report_data"]["stages"]["damage_detection"]["status"] == "completed_with_findings"
+        assert report.json()["report_data"]["stages"]["damage_detection"]["unavailable_count"] == 3
+def png_plate_bytes():
+    output = BytesIO()
+    Image.new("RGB", (141, 59), color=(200, 200, 200)).save(output, format="PNG")
+    return output.getvalue()
+
+
+def test_ineligible_plate_image_is_not_evaluated_and_provider_not_called(tmp_path):
+    engine = create_engine(
+        "sqlite+pysqlite:///:memory:",
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
+
+    @event.listens_for(engine, "connect")
+    def enable_foreign_keys(dbapi_connection, _connection_record):
+        dbapi_connection.execute("PRAGMA foreign_keys=ON")
+
+    Base.metadata.create_all(engine)
+    storage = LocalImageStorage(tmp_path / "damage-images")
+    content = png_plate_bytes()
+    image_key = storage.save(content, "png")
+    with Session(engine) as session:
+        assessment = VehicleAssessment()
+        session.add(assessment)
+        session.flush()
+        image = UploadedImage(
+            assessment_id=assessment.id,
+            storage_provider="local",
+            storage_bucket="vehicle-images",
+            object_key=image_key,
+            original_filename="plate.png",
+            content_type="image/png",
+            byte_size=len(content),
+            sha256="test-sha256",
+        )
+        session.add(image)
+        session.commit()
+        assessment_id, image_id = str(assessment.id), str(image.id)
+
+    fake = FakeDamageProvider()
+
+    def override_get_db():
+        with Session(engine) as session:
+            yield session
+
+    app.dependency_overrides[get_db] = override_get_db
+    app.dependency_overrides[get_image_storage] = lambda: storage
+    app.dependency_overrides[get_damage_provider] = lambda: fake
+    try:
+        with TestClient(app) as client:
+            response = client.post(f"/api/v1/assessments/{assessment_id}/images/{image_id}/damage")
+            assert response.status_code == 200
+            payload = response.json()
+            assert payload["status"] == "unavailable"
+            assert payload["findings"] == []
+            assert payload["image_type"] == "registration_plate"
+            assert len(fake.calls) == 0
+            second = client.post(f"/api/v1/assessments/{assessment_id}/images/{image_id}/damage")
+            assert second.status_code == 200
+            assert second.json()["reused"] is True
+            with Session(engine) as session:
+                markers = session.scalars(
+                    select(EvidenceRecord).where(EvidenceRecord.evidence_type == "damage_eligibility")
+                ).all()
+                assert len(markers) == 1
+                scan = session.scalar(
+                    select(EvidenceRecord).where(
+                        EvidenceRecord.evidence_type == "damage_detection"
+                    )
+                )
+                assert scan.evidence_data["status"] == "unavailable"
+    finally:
+        app.dependency_overrides.clear()
+        engine.dispose()

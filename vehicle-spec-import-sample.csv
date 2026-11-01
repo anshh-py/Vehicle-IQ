@@ -1,0 +1,2 @@
+manufacturer,model,variant,fuel_type,year_start,year_end,engine_cc,max_power_bhp,transmission,mileage_kmpl,seats,source_name,source_reference,verification_status,confidence,field_sources
+Maruti Suzuki,Swift,VXi,Petrol,2018,2024,1197,88.5,manual,21.5,5,vehiclex_candidate,vehicle-features.json,unverified,0.9,"engine_cc=vehiclex_candidate,max_power_bhp=vehiclex_candidate"
