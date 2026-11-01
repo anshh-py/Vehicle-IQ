@@ -107,12 +107,29 @@ def test_migration_metadata_matches_models():
     assert inspect(AssessmentReport).relationships.assessment.uselist is False
 
 
-def test_production_configuration_requires_secret_and_explicit_storage_path():
+def valid_production_config(**overrides):
+    values = {
+        "_env_file": None,
+        "app_env": "production",
+        "database_url": "postgresql+psycopg://user:password@localhost/vehicle_iq?sslmode=require",
+        "api_access_token": SecretStr("a" * 40),
+        "image_storage_provider": "supabase",
+        "supabase_url": "https://vehicle-iq-project.supabase.co",
+        "supabase_storage_bucket": "vehicle-images",
+        "supabase_service_role_key": SecretStr("test-service-role-key"),
+        "ocr_service_provider": "huggingface_gradio",
+        "cors_allowed_origins": "https://vehicle-iq.example",
+    }
+    values.update(overrides)
+    return Settings(**values)
+
+
+def test_production_configuration_requires_secret_and_remote_storage_and_ocr():
     private_marker = "do-not-display-this-token"
     config = Settings(
         _env_file=None,
         app_env="production",
-        database_url="postgresql+psycopg://user:password@localhost/vehicle_iq",
+        database_url="postgresql+psycopg://user:password@localhost/vehicle_iq?sslmode=require",
         api_access_token=SecretStr(private_marker),
     )
 
@@ -120,21 +137,16 @@ def test_production_configuration_requires_secret_and_explicit_storage_path():
         validate_production_settings(config)
 
     assert "API_ACCESS_TOKEN" in str(error.value)
-    assert "IMAGE_STORAGE_DIR" in str(error.value)
+    assert "IMAGE_STORAGE_PROVIDER" in str(error.value)
+    assert "SUPABASE_SERVICE_ROLE_KEY" in str(error.value)
+    assert "OCR_SERVICE_URL" in str(error.value)
+    assert "CORS_ALLOWED_ORIGINS" in str(error.value)
     assert private_marker not in str(error.value)
     assert "password" not in str(error.value)
 
 
-def test_production_configuration_accepts_postgres_secret_and_explicit_storage(tmp_path):
-    config = Settings(
-        _env_file=None,
-        app_env="production",
-        database_url="postgresql+psycopg://user:password@localhost/vehicle_iq",
-        api_access_token=SecretStr("a" * 40),
-        image_storage_dir=tmp_path / "mounted-images",
-    )
-
-    validate_production_settings(config)
+def test_production_configuration_accepts_postgres_supabase_and_remote_ocr():
+    validate_production_settings(valid_production_config())
 
 
 def test_production_configuration_rejects_non_postgres_database(tmp_path):
@@ -143,8 +155,39 @@ def test_production_configuration_rejects_non_postgres_database(tmp_path):
         app_env="production",
         database_url="sqlite+pysqlite:///tmp/vehicle_iq.db",
         api_access_token=SecretStr("a" * 40),
-        image_storage_dir=tmp_path / "mounted-images",
+        image_storage_provider="supabase",
+        supabase_url="https://vehicle-iq-project.supabase.co",
+        supabase_storage_bucket="vehicle-images",
+        supabase_service_role_key=SecretStr("test-service-role-key"),
+        ocr_service_provider="huggingface_gradio",
+        cors_allowed_origins="https://vehicle-iq.example",
     )
 
     with pytest.raises(RuntimeError, match="DATABASE_URL"):
         validate_production_settings(config)
+
+
+def test_production_rejects_local_paddle_ocr_and_requires_tls():
+    with pytest.raises(RuntimeError, match="OCR_SERVICE_PROVIDER"):
+        validate_production_settings(valid_production_config(ocr_service_provider="paddleocr_local"))
+
+    with pytest.raises(RuntimeError, match="sslmode"):
+        validate_production_settings(
+            valid_production_config(database_url="postgresql+psycopg://user:password@localhost/vehicle_iq")
+        )
+
+
+def test_production_requires_configured_https_baidu_provider():
+    config = valid_production_config(
+        ocr_service_provider="baidu_unlimited_ocr",
+        ocr_service_url="http://ocr.example/ocr",
+    )
+
+    with pytest.raises(RuntimeError, match="OCR_SERVICE_URL"):
+        validate_production_settings(config)
+
+
+def test_price_model_default_is_repository_relative_and_missing_artifact_is_not_required():
+    config = Settings(_env_file=None, database_url="sqlite+pysqlite:///:memory:")
+
+    assert config.price_model_path == Path(__file__).resolve().parents[1] / "artifacts" / "vehicle_iq_price_model.joblib"

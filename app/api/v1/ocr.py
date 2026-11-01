@@ -39,10 +39,11 @@ def get_ocr_client() -> OCRClient | None:
         return HuggingFaceGradioOCRClient(
             settings.ocr_gradio_space_url,
             mode=settings.ocr_gradio_mode,
+            read_timeout_seconds=settings.ocr_timeout_seconds,
         )
     if not settings.ocr_service_url:
         return None
-    return BaiduUnlimitedOCRClient(settings.ocr_service_url)
+    return BaiduUnlimitedOCRClient(settings.ocr_service_url, timeout_seconds=settings.ocr_timeout_seconds)
 
 
 @router.post(

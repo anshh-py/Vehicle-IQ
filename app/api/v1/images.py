@@ -88,8 +88,8 @@ def upload_assessment_image(
         key = storage.save(content, extension)
         image = UploadedImage(
             assessment_id=assessment.id,
-            storage_provider="local",
-            storage_bucket="vehicle-images",
+            storage_provider=getattr(storage, "provider_name", "local"),
+            storage_bucket=getattr(storage, "bucket", "vehicle-images"),
             object_key=key,
             original_filename=filename,
             content_type=content_type,
