@@ -89,7 +89,7 @@ def test_search_builds_vehicle_and_location_query_and_extracts_supported_fields(
     assert observed["payloads"][0] == {
         "api_key": "test-secret",
         "query": (
-            '"Hyundai Creta" 2021 SX petrol manual used car prices India -Grand -Nios near Jaipur'
+            '"Hyundai Creta" 2021 SX petrol manual 42000 km used car prices India -Grand -Nios near Jaipur'
         ),
         "search_depth": "basic",
         "topic": "general",
@@ -276,8 +276,9 @@ def test_missing_values_are_never_fabricated_and_secret_not_logged(caplog):
 
     listings = provider.fetch_listings(CRITERIA)
 
-    assert listings == []
-    assert provider.rejected_listing_counts["fuel_not_reported"] == 1
+    assert len(listings) == 1
+    assert listings[0].fuel_type is None
+    assert "fuel_type: not reported" in listings[0].match_differences
     assert "test-secret" not in caplog.text
 
 
@@ -408,14 +409,14 @@ def test_progressive_search_expands_year_then_model_and_records_match_types():
 
     assert len(observed_queries) == 2
     assert observed_queries[0].startswith('"Hyundai Creta" ')
-    assert "2021 SX petrol manual" in observed_queries[0]
+    assert "2021 SX petrol manual 42000 km" in observed_queries[0]
     assert observed_queries[1] == '"Hyundai Creta" 2021 used car prices India -Grand -Nios near Jaipur'
     assert all("India" in query for query in observed_queries)
     assert all("Jaipur" in query for query in observed_queries)
     assert [item.match_type for item in listings].count("exact_match") == 1
-    assert [item.match_type for item in listings].count("close_match") == 2
-    assert [item.match_type for item in listings].count("approximate_match") == 2
-    assert any("variant:" in diff for item in listings for diff in item.match_differences)
+    assert [item.match_type for item in listings].count("close_match") >= 2
+    assert len(listings) >= MIN_COMPARABLE_COUNT
+    assert all(item.variant == "SX" for item in listings)
     assert provider.search_observability["queries_issued"] == 2
     assert provider.search_observability["raw_results_returned"] == 5
     assert provider.search_observability["listings_extracted"] == 5
@@ -522,7 +523,7 @@ def test_duplicate_advertisements_are_removed_across_expansion_queries():
     provider = _provider(handler)
     listings = provider.fetch_listings(CRITERIA)
 
-    assert len(listings) == MIN_COMPARABLE_COUNT
+    assert len(listings) == 5
     assert provider.search_observability["duplicates_removed"] == 1
     assert provider.search_observability["queries_issued"] == 2
 
@@ -557,7 +558,7 @@ def test_search_candidates_are_ranked_and_capped_at_two_without_broad_fallback()
     provider.fetch_listings(CRITERIA)
 
     assert observed_queries == [
-        '"Hyundai Creta" 2021 SX petrol manual used car prices India -Grand -Nios near Jaipur',
+        '"Hyundai Creta" 2021 SX petrol manual 42000 km used car prices India -Grand -Nios near Jaipur',
         '"Hyundai Creta" 2021 used car prices India -Grand -Nios near Jaipur',
     ]
     assert provider.search_scopes == [
@@ -624,13 +625,29 @@ def test_different_year_and_variant_are_retained_as_optional_listing_details():
     assert research["year"] == 2019
     assert research["variant"] == "EX"
     assert research["asking_price_inr"] == "320000.00"
+    assert research["title"] == "Hyundai Creta EX 2019 petrol manual Jaipur"
+    assert research["make"] == "Hyundai"
+    assert research["model"] == "Creta"
+    assert research["currency"] == "INR"
+    assert research["retrieved_at"]
+    assert 0 <= research["relevance_score"] <= 100
     assert research["priced_used_listing"] is True
     assert set(research) == {
+        "title",
         "source_url",
         "source_name",
+        "make",
+        "model",
         "year",
         "variant",
+        "fuel_type",
+        "transmission",
+        "mileage_km",
+        "location",
+        "currency",
         "asking_price_inr",
+        "retrieved_at",
+        "relevance_score",
         "priced_used_listing",
     }
 
@@ -683,6 +700,74 @@ def test_exact_vehicle_match_has_highest_relevance():
     assert research["year"] == 2021
     assert research["variant"] == "SX"
     assert research["asking_price_inr"] == "1200000.00"
+    assert research["relevance_score"] > 50
+
+
+@pytest.mark.parametrize(
+    ("label", "expected"),
+    [
+        ("asking price ₹2.5 lakh", Decimal("250000.00")),
+        ("asking price Rs 2,50,000", Decimal("250000.00")),
+        ("asking price 250000", Decimal("250000.00")),
+    ],
+)
+def test_common_indian_asking_price_formats(label, expected):
+    assert TavilyMarketListingProvider._asking_price(label) == expected
+
+
+def test_missing_fuel_is_retained_as_approximate_when_needed_for_minimum_evidence():
+    provider = _provider(
+        _first_query_only([
+            _result(1, title="Hyundai Creta SX 2021 Jaipur 42000 km", content="Used car asking price Rs 12 lakh"),
+            _result(2, title="Hyundai Creta SX 2021 petrol manual Jaipur 42000 km", content="Used car asking price Rs 12,10,000"),
+            _result(3, title="Hyundai Creta SX 2021 petrol manual Jaipur 42000 km", content="Used car asking price Rs 12,20,000"),
+        ])
+    )
+    listings = provider.fetch_listings(CRITERIA)
+    result = calculate_market_comparables(listings, CRITERIA)
+    assert result.status == "available"
+    assert result.evidence_count == MIN_COMPARABLE_COUNT
+    assert any("fuel_type: not reported" in diff for item in result.listings for diff in item.match_differences)
+
+
+def test_missing_fuel_is_not_used_when_enough_same_fuel_matches_exist():
+    raw = [
+        TavilyMarketListingProvider._listing_from_result(
+            _result(
+                index,
+                title=("Hyundai Creta SX 2021 Jaipur 42000 km" if index == 9 else None),
+                content="Used car asking price Rs 12 lakh" if index == 9 else f"Used car asking price Rs {12_00_000 + index * 10000:,}",
+            ),
+            CRITERIA,
+            datetime.now(timezone.utc),
+        )[0]
+        for index in (1, 2, 3, 9)
+    ]
+    result = calculate_market_comparables([item for item in raw if item], CRITERIA)
+    assert result.status == "available"
+    assert result.evidence_count == MIN_COMPARABLE_COUNT
+    assert result.rejected_counts["fuel_not_reported_excluded"] == 1
+
+
+def test_unknown_target_fuel_and_unknown_listing_fuel_do_not_crash():
+    criteria = CRITERIA.model_copy(update={"fuel_type": None})
+    listings = [
+        TavilyMarketListingProvider._listing_from_result(
+            _result(
+                index,
+                title=f"Hyundai Creta SX 2021 Jaipur {42_000 + index} km",
+                content=f"Used car asking price Rs {12_00_000 + index * 10_000:,}",
+            ),
+            criteria,
+            datetime.now(timezone.utc),
+        )[0]
+        for index in range(1, MIN_COMPARABLE_COUNT + 1)
+    ]
+    result = calculate_market_comparables(
+        [listing for listing in listings if listing is not None], criteria
+    )
+    assert result.status == "available"
+    assert result.evidence_count == MIN_COMPARABLE_COUNT
 
 
 def test_editorial_information_is_not_in_the_used_listing_output():

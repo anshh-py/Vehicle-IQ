@@ -19,6 +19,7 @@ from app.pricing.market import (
     YEAR_TOLERANCE,
     MarketListing,
     MarketVehicleCriteria,
+    _locations_overlap,
     calculate_market_comparables,
 )
 
@@ -32,7 +33,12 @@ _PRICE_PATTERN = re.compile(
 )
 _YEAR_PATTERN = re.compile(r"\b(?:19|20)\d{2}\b")
 _MILEAGE_PATTERN = re.compile(
-    r"\b([\d,]+(?:\.\d+)?)\s*(?:km|kms|kilomet(?:er|re)s?)\b(?!\s*/)",
+    r"\b([\d,]+(?:\.\d+)?)\s*(?:km|kms|kilomet(?:er|re)s?)\b(?!\s*/|pl)",
+    re.IGNORECASE,
+)
+_LABELED_BARE_PRICE_PATTERN = re.compile(
+    r"\b(?:asking\s+price|sale\s+price|selling\s+price|listed\s+(?:at|for)|price)"
+    r"\s*[:\-]?\s*(\d{1,2}(?:,\d{2})*(?:,\d{3})|\d{5,8})(?!\d)",
     re.IGNORECASE,
 )
 _MULTIPLIERS = {
@@ -475,6 +481,7 @@ class TavilyMarketListingProvider:
             str(criteria.variant).strip() if criteria.variant else None,
             criteria.fuel_type.strip() if criteria.fuel_type else None,
             criteria.transmission.strip() if criteria.transmission else None,
+            f"{criteria.mileage_km} km" if criteria.mileage_km is not None else None,
         ]
         detailed = " ".join(term for term in detailed_terms if term)
         candidates.append(
@@ -631,7 +638,7 @@ class TavilyMarketListingProvider:
             (
                 parsed_year
                 for text in (title, content, raw_content)
-                if (parsed_year := cls._year(text, None)) is not None
+                if (parsed_year := cls._year(text, criteria.year)) is not None
             ),
             None,
         )
@@ -660,13 +667,78 @@ class TavilyMarketListingProvider:
         host = parts.hostname.casefold()
         source_name = host[4:] if host.startswith("www.") else host
         return {
+            "title": title.strip(),
             "source_url": url,
             "source_name": source_name,
+            "make": criteria.make,
+            "model": criteria.model,
             "year": year,
             "variant": variant,
+            "fuel_type": cls._fuel_type(evidence),
+            "transmission": cls._transmission(evidence),
+            "mileage_km": cls._mileage(evidence),
+            "location": cls._reported_location(evidence, criteria.location),
+            "currency": "INR" if re.search(r"(?:₹|INR\b|Rs\.?\s*)", evidence, re.IGNORECASE) else None,
             "asking_price_inr": format(price, "f") if price is not None else None,
+            "retrieved_at": retrieved_at.isoformat(),
+            "relevance_score": cls._research_relevance_score(
+                variant,
+                year,
+                cls._fuel_type(evidence),
+                cls._transmission(evidence),
+                cls._mileage(evidence),
+                cls._reported_location(evidence, criteria.location),
+                criteria,
+            ),
             "priced_used_listing": True,
         }, None
+
+    @staticmethod
+    def _research_relevance_score(
+        variant: str | None,
+        year: int | None,
+        fuel_type: str | None,
+        transmission: str | None,
+        mileage_km: int | None,
+        location: str | None,
+        criteria: MarketVehicleCriteria,
+    ) -> int:
+        score = 30  # exact make/model identity was required by extraction
+        if criteria.variant:
+            if variant:
+                from difflib import SequenceMatcher
+
+                similarity = SequenceMatcher(None, variant.casefold(), criteria.variant.casefold()).ratio()
+                score += 20 if similarity >= 0.95 else 14 if similarity >= 0.65 else 5
+            else:
+                score += 8
+        else:
+            score += 12
+        if criteria.year is not None:
+            score += max(0, 15 - 5 * abs((year or criteria.year) - criteria.year)) if year else 0
+        else:
+            score += 8 if fuel_type else 4
+        if criteria.fuel_type:
+            score += 15 if fuel_type and fuel_type.casefold() == criteria.fuel_type.casefold() else 5 if fuel_type is None else 0
+        else:
+            score += 10
+        if criteria.transmission:
+            score += 10 if transmission and transmission.casefold() == criteria.transmission.casefold() else 5 if transmission is None else 1
+        else:
+            score += 6 if transmission else 3
+        if criteria.mileage_km is not None:
+            if mileage_km is None:
+                score += 2
+            else:
+                allowed = max(5_000, int(criteria.mileage_km * 0.15))
+                score += 5 if abs(mileage_km - criteria.mileage_km) <= allowed else 1
+        else:
+            score += 3
+        if criteria.location:
+            score += 5 if _locations_overlap(location, criteria.location) else 3 if location is None else 1
+        else:
+            score += 3
+        return score
 
     @staticmethod
     def _credible_listing_source(hostname: str) -> bool:
@@ -740,10 +812,11 @@ class TavilyMarketListingProvider:
     @staticmethod
     def _research_rank(
         result: dict[str, Any], criteria: MarketVehicleCriteria
-    ) -> tuple[int, int, int, int]:
+    ) -> tuple[int, int, int, int, int]:
         year = result.get("year")
         variant = result.get("variant")
         return (
+            int(result.get("relevance_score", 0) or 0),
             int(
                 bool(criteria.variant)
                 and isinstance(variant, str)
@@ -800,13 +873,40 @@ class TavilyMarketListingProvider:
 
     @staticmethod
     def _reported_location(evidence: str, target_location: str | None) -> str | None:
-        if not target_location:
-            return None
-        locations = [part.strip() for part in target_location.split(",") if part.strip()]
-        return next(
-            (location for location in locations if TavilyMarketListingProvider._contains_phrase(evidence, location)),
-            None,
+        if target_location:
+            locations = [part.strip() for part in target_location.split(",") if part.strip()]
+            matched = next(
+                (location for location in locations if TavilyMarketListingProvider._contains_phrase(evidence, location)),
+                None,
+            )
+            if matched:
+                return matched
+        # Extract only an explicitly stated "in/near/located in <place>" value.
+        # Stop before common listing/specification words to avoid treating them
+        # as part of the location.
+        stop_words = {
+            "used", "preowned", "pre-owned", "car", "cars", "available", "for",
+            "sale", "petrol", "diesel", "manual", "automatic", "with", "and",
+            "price", "listing", "vehicle", "india", "km", "kms",
+        }
+        state_names = {
+            "rajasthan", "delhi", "gujarat", "maharashtra", "karnataka", "tamil",
+            "nadu", "punjab", "haryana", "uttar", "pradesh", "madhya", "bengal",
+            "kerala", "bihar", "assam", "odisha", "telangana", "goa",
+        }
+        pattern = re.compile(
+            r"\b(?:located\s+in|available\s+in|in|near)\s+([a-z][a-z-]+(?:\s+[a-z][a-z-]+)?)",
+            re.IGNORECASE,
         )
+        for match in pattern.finditer(evidence):
+            tokens = match.group(1).split()
+            if not tokens or tokens[0].casefold() in stop_words:
+                continue
+            selected = [tokens[0]]
+            if len(tokens) > 1 and tokens[1].casefold() in state_names:
+                selected.append(tokens[1])
+            return " ".join(selected)
+        return None
 
     @classmethod
     def _listing_from_result(
@@ -849,7 +949,14 @@ class TavilyMarketListingProvider:
             path = parts.path.casefold()
             if not any(marker in path for marker in _USED_LISTING_PATH_MARKERS):
                 return None, "not_a_used_listing"
-        year = cls._year(evidence, criteria.year)
+        year = next(
+            (
+                parsed
+                for text in (title, content, raw_content)
+                if (parsed := cls._year(text, criteria.year)) is not None
+            ),
+            None,
+        )
         if year is None:
             return None, "missing_or_ambiguous_year"
         price, price_status = cls._asking_price_from_fields(
@@ -892,6 +999,7 @@ class TavilyMarketListingProvider:
                 source_url=url,
                 listed_at=None,
                 retrieved_at=retrieved_at,
+                relevance_score=0,
             )
         except (TypeError, ValueError):
             return None, "malformed_listing"
@@ -948,6 +1056,17 @@ class TavilyMarketListingProvider:
                 continue
             normalized_amount = amount.quantize(Decimal("0.01"))
             prices.add(normalized_amount)
+        # Some Indian listing snippets omit the currency symbol but explicitly label
+        # the amount as an asking/listing price. Accept this form without claiming
+        # that the currency was stated in the source.
+        if not matches:
+            for match in _LABELED_BARE_PRICE_PATTERN.finditer(text):
+                try:
+                    amount = Decimal(match.group(1).replace(",", ""))
+                except Exception:
+                    continue
+                if amount > 0 and not TavilyMarketListingProvider._is_non_asking_amount(text, match):
+                    prices.add(amount.quantize(Decimal("0.01")))
         if not prices:
             return None, "new_vehicle" if new_vehicle_price_found else "missing"
         if len(prices) > 1:

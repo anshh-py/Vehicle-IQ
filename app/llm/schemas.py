@@ -11,6 +11,12 @@ class LLMReportNarrative(BaseModel):
     buyer_recommendations: str = Field(min_length=1)
     price_estimate_explanation: str = Field(min_length=1)
     missing_information_and_limitations: str = Field(min_length=1)
+    vehicle_identity_and_lookup_summary: str = Field(
+        default="Vehicle lookup and OCR evidence were not supplied.", min_length=1
+    )
+    market_valuation_explanation: str = Field(
+        default="Market valuation evidence was not supplied.", min_length=1
+    )
 
     @field_validator(
         "vehicle_overview",
@@ -20,6 +26,8 @@ class LLMReportNarrative(BaseModel):
         "buyer_recommendations",
         "price_estimate_explanation",
         "missing_information_and_limitations",
+        "vehicle_identity_and_lookup_summary",
+        "market_valuation_explanation",
         mode="before",
     )
     @classmethod

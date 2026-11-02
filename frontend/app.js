@@ -708,6 +708,8 @@
       buyer_recommendations: 'Buyer recommendations',
       price_estimate_explanation: 'Price estimate',
       missing_information_and_limitations: 'Limitations',
+      vehicle_identity_and_lookup_summary: 'Vehicle identity and lookup evidence',
+      market_valuation_explanation: 'Market research',
     };
     Object.entries(labels).forEach(([key, label]) => {
       if (!narrative[key]) return;

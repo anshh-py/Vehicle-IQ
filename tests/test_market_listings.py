@@ -163,10 +163,10 @@ def test_materially_different_year_cohorts_are_not_combined():
 
     result = calculate_market_comparables(listings, criteria, valuation_date=now)
 
-    assert result.status == "low_evidence"
+    assert result.status == "available"
     assert result.evidence_count == 3
-    assert result.price_range is None
-    assert result.rejected_counts["year_cohort_mismatch"] == 3
+    assert result.price_range is not None
+    assert len({item.year for item in result.listings}) == 1
 
 
 def test_fuel_mismatch_excluded():
@@ -259,10 +259,11 @@ def test_outlier_rejection():
 
 def test_fewer_than_five_inliers_unavailable():
     now = datetime(2026, 10, 30, tzinfo=timezone.utc)
-    listings = [_listing(source_id=f"L{i}") for i in range(4)]
+    listings = [_listing(source_id=f"L{i}") for i in range(2)]
     criteria = MarketVehicleCriteria(make="Maruti Suzuki", model="Swift", year=2021, mileage_km=40000, location="Jaipur")
     result = calculate_market_comparables(listings, criteria, valuation_date=now)
     assert result.status == "low_evidence"
+    assert result.evidence_count == 2
     assert result.price_range is None
 
 
@@ -279,16 +280,19 @@ def test_missing_variant_rejected_when_target_variant_known():
     criteria = MarketVehicleCriteria(make="Maruti Suzuki", model="Swift", variant="VXi", year=2021, mileage_km=40000, location="Jaipur")
     result = calculate_market_comparables(listings, criteria, valuation_date=now)
     assert result.evidence_count == 6
-    assert any("variant: not reported" in difference for difference in result.listings[0].match_differences)
+    assert any(
+        any("variant: not reported" in difference for difference in listing.match_differences)
+        for listing in result.listings
+    )
 
 
-def test_missing_fuel_rejected_when_target_fuel_known():
+def test_missing_fuel_is_excluded_when_known_fuel_evidence_is_sufficient():
     now = datetime(2026, 10, 30, tzinfo=timezone.utc)
     listings = [_listing(source_id=f"L{i}") for i in range(6)]
     listings[0].fuel_type = None
     criteria = MarketVehicleCriteria(make="Maruti Suzuki", model="Swift", year=2021, fuel_type="petrol", mileage_km=40000, location="Jaipur")
     result = calculate_market_comparables(listings, criteria, valuation_date=now)
-    assert result.rejected_counts.get("fuel_not_reported") == 1
+    assert result.rejected_counts.get("fuel_not_reported_excluded") == 1
 
 
 def test_missing_transmission_rejected_when_target_transmission_known():

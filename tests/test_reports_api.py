@@ -632,6 +632,13 @@ def test_tavily_market_response_contains_only_search_evidence_and_no_api_key(
     assert market["market_research_results"][0]["source_url"] == (
         "https://cars24.com/city/0"
     )
+    discovered = market["market_research_results"][0]
+    assert discovered["title"].startswith("Example Motors City")
+    assert discovered["make"] == "Example Motors"
+    assert discovered["model"] == "City"
+    assert discovered["currency"] == "INR"
+    assert discovered["retrieved_at"]
+    assert discovered["relevance_score"] is not None
     assert market["market_asking_price_range"] is not None
     assert all(
         item["source_url"].startswith("https://cars24.com/")
@@ -652,6 +659,28 @@ def test_tavily_market_response_contains_only_search_evidence_and_no_api_key(
     assert snapshot_record.market_research_rejection_counts == {"missing_price": 1}
     assert '"event":"market_report_snapshot_results"' in caplog.text
     assert '"report_serialized_priced_listing_count":5' in caplog.text
+
+
+def test_market_search_prefers_manufacturing_year_to_registration_year(report_api):
+    _client, engine, assessment_id = report_api
+    with Session(engine) as session:
+        assessment = session.get(VehicleAssessment, UUID(assessment_id))
+        assessment.vehicle_details = {
+            "make": "Hyundai",
+            "model": "Creta",
+            "manufacturing_year": 2020,
+            "registration_year": 2021,
+        }
+        session.commit()
+
+    from app.api.v1.reports import _market_inputs
+
+    with Session(engine) as session:
+        assessment = session.get(VehicleAssessment, UUID(assessment_id))
+        criteria, _asking, _prediction = _market_inputs(assessment, [])
+
+    assert criteria is not None
+    assert criteria.year == 2020
 
 
 def test_raw_content_prices_without_year_or_variant_reach_saved_report(report_api):
@@ -714,8 +743,9 @@ def test_raw_content_prices_without_year_or_variant_reach_saved_report(report_ap
     assert market["status"] == "unavailable"
     assert market["market_asking_price_range"] is None
     assert market["relevant_result_count"] == 5
-    assert market["priced_comparable_count"] == 5
+    assert market["priced_comparable_count"] == 0
     assert len(market["market_research_results"]) == 5
+    assert market["priced_comparables"] == []
     assert [
         item["asking_price_inr"] for item in market["market_research_results"]
     ] == [f"{200000 + index * 10000:.2f}" for index in range(5)]
@@ -837,11 +867,11 @@ def test_market_report_preserves_context_with_zero_or_limited_priced_results(
     assert market["search_location"] == "Jaipur, Rajasthan"
     assert market["geographic_scope"] == ["Jaipur, Rajasthan and nearby regions"]
     assert market["relevant_result_count"] == priced_count
-    assert market["priced_comparable_count"] == priced_count
-    assert len(market["priced_comparables"]) == priced_count
+    assert market["priced_comparable_count"] == 0
+    assert market["priced_comparables"] == []
     assert len(market["market_research_results"]) == priced_count
     assert all(
-        set(item) == {"source_url", "asking_price_inr", "variant", "year"}
+        {"source_url", "asking_price_inr", "variant", "year"}.issubset(item)
         for item in market["market_research_results"]
     )
     assert market["market_asking_price_range"] is None

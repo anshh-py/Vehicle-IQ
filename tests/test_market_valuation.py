@@ -76,7 +76,7 @@ def test_filters_duplicates_malformed_stale_and_irrelevant_listings():
 
 def test_empty_or_insufficient_evidence_never_returns_a_price_range():
     empty = calculate_market_comparables([], CRITERIA, valuation_date=NOW)
-    four = calculate_market_comparables(
+    two = calculate_market_comparables(
         [listing(index, 800_000 + index * 1000) for index in range(MIN_COMPARABLE_COUNT - 1)],
         CRITERIA,
         valuation_date=NOW,
@@ -84,9 +84,9 @@ def test_empty_or_insufficient_evidence_never_returns_a_price_range():
 
     assert empty.status == "unavailable"
     assert empty.price_range is None
-    assert four.status == "low_evidence"
-    assert four.evidence_count == 4
-    assert four.price_range is None
+    assert two.status == "low_evidence"
+    assert two.evidence_count == MIN_COMPARABLE_COUNT - 1
+    assert two.price_range is None
 
 
 def test_robust_range_removes_outlier_and_uses_advertised_price_iqr():

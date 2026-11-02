@@ -27,6 +27,21 @@ Vehicle Details, Challan, and FASTag candidate providers remain disabled unless
 their respective `*_LOOKUP_ENABLED` setting is explicitly enabled. Do not enable
 them until authorized use and provider compatibility are confirmed.
 
+## Optional market research and AI narrative
+
+- Tavily market discovery is disabled unless `TAVILY_API_KEY` is configured.
+  It is bounded to two searches per report refresh. Search discoveries are not
+  verified active listings or completed sales. A range is only emitted from at
+  least three year-compatible comparable advertisements; otherwise the report
+  lists available evidence and explains the shortage.
+- Groq narrative generation is disabled by default. To enable the existing
+  integration, set `LLM_ENABLED=true` and configure `LLM_API_KEY` in the backend
+  secret manager. `LLM_BASE_URL`, `LLM_MODEL`, and `LLM_TIMEOUT_SECONDS` have
+  code defaults shown in `.env.example`. If the client is disabled, times out,
+  or returns invalid structured output, the persisted structured report remains
+  available without an AI narrative. Provider quotas and access terms depend on
+  the account; no availability or free-tier quota is assumed here.
+
 ## Database migrations
 
 The checked-in migration chain is linear:

@@ -15,6 +15,8 @@ def test_valid_structured_llm_output():
         "buyer_recommendations": "E",
         "price_estimate_explanation": "F",
         "missing_information_and_limitations": "G",
+        "vehicle_identity_and_lookup_summary": "Identity evidence is partial.",
+        "market_valuation_explanation": "No range is available.",
     }
 
     class FakeClient:
@@ -48,12 +50,16 @@ def test_provider_failure_returns_none():
     assert generate_llm_narrative({"assessment": {}}, client=FakeClient()) is None
 
 
-def test_prompt_includes_user_provided_and_unavailable_market_data():
+def test_prompt_includes_all_report_evidence_and_marks_market_as_unverified():
     report_data = {
         "assessment": {"vehicle_details": {"engine_cc": 1197}},
         "stages": {"damage_detection": {"status": "unavailable"}},
         "pricing": {"result": {"amount": "100", "provenance": {"engine_cc": "user_input"}}},
         "market_valuation": {"status": "unavailable"},
+        "registration_ocr_assessment": {"status": "needs_review"},
+        "registration_lookup_results": [{"status": "partial", "registration_number": "SECRET-PLATE"}],
+        "challan_lookup": {"status": "not_run"},
+        "fastag_lookup": {"status": "not_run"},
     }
     system_prompt, user_prompt = build_llm_prompt(report_data)
     assert "user_input" in user_prompt
@@ -61,9 +67,43 @@ def test_prompt_includes_user_provided_and_unavailable_market_data():
     assert "damage_inspection" in user_prompt
     assert "Do not invent" in system_prompt
     assert "never say the vehicle is damage-free" in system_prompt
-    assert "Do not summarize or infer market research" in system_prompt
-    assert "market_valuation" not in user_prompt
+    assert "market_valuation" in user_prompt
+    assert "registration_ocr_assessment" in user_prompt
+    assert "challan" in user_prompt
+    assert "fastag" in user_prompt
+    assert "SECRET-PLATE" not in user_prompt
+    assert "completed sales" in system_prompt
     assert "market_evidence_available" not in user_prompt
+
+
+def test_market_narrative_is_grounded_in_report_values_and_legacy_output_is_compatible():
+    payload = {
+        "vehicle_overview": "A", "overall_condition_summary": "B",
+        "detected_damage_explanation": "C", "potential_inspection_risks": "D",
+        "buyer_recommendations": "E", "price_estimate_explanation": "F",
+        "missing_information_and_limitations": "G",
+    }
+
+    class FakeClient:
+        enabled = True
+
+        def complete_json(self, _system_prompt, _user_prompt, timeout_seconds=None):
+            # Old seven-key model response remains valid; deterministic post-processing
+            # supplies the additive market section.
+            return json.dumps(payload)
+
+    narrative = generate_llm_narrative(
+        {"market_valuation": {
+            "status": "available", "evidence_count": 3, "minimum_evidence_count": 3,
+            "market_asking_price_range": {
+                "lower_inr": "100000", "median_inr": "120000", "upper_inr": "140000"
+            },
+        }},
+        client=FakeClient(),
+    )
+    assert "3 comparable advertisements" in narrative.market_valuation_explanation
+    assert "₹100000" in narrative.market_valuation_explanation
+    assert "not completed-sale values" in narrative.market_valuation_explanation
 
 
 def test_no_client_returns_none(monkeypatch):

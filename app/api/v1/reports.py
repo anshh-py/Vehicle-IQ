@@ -225,7 +225,7 @@ def _market_inputs(
             make=make,
             model=model,
             variant=source.get("variant"),
-            year=source.get("registration_year", source.get("year")),
+            year=source.get("manufacturing_year") or source.get("registration_year", source.get("year")),
             fuel_type=source.get("fuel_type"),
             transmission=source.get("transmission", source.get("transmission_type")),
             mileage_km=source.get("odometer_km", source.get("mileage_km")),
@@ -421,39 +421,57 @@ def _market_section(
             and not isinstance(count, bool)
             and count > 0
         }
-        market_research_results = [
-            {
+        market_research_results = []
+        for item in raw_research_results:
+            if not (
+                isinstance(item, dict)
+                and item.get("priced_used_listing") is True
+                and _valid_market_price(item.get("asking_price_inr"))
+                and _valid_market_source_url(item.get("source_url"))
+            ):
+                continue
+            research_item = {
+                "title": item.get("title")[:500] if isinstance(item.get("title"), str) else None,
                 "source_url": item["source_url"],
+                "source_name": item.get("source_name") if isinstance(item.get("source_name"), str) else None,
+                "make": item.get("make") if isinstance(item.get("make"), str) else None,
+                "model": item.get("model") if isinstance(item.get("model"), str) else None,
+                "variant": item.get("variant") if isinstance(item.get("variant"), str) else None,
+                "year": item.get("year") if isinstance(item.get("year"), int) and not isinstance(item.get("year"), bool) else None,
+                "fuel_type": item.get("fuel_type") if isinstance(item.get("fuel_type"), str) else None,
+                "transmission": item.get("transmission") if isinstance(item.get("transmission"), str) else None,
+                "mileage_km": item.get("mileage_km") if isinstance(item.get("mileage_km"), int) and not isinstance(item.get("mileage_km"), bool) else None,
+                "location": item.get("location") if isinstance(item.get("location"), str) else None,
+                "currency": "INR" if item.get("currency") == "INR" else None,
                 "asking_price_inr": format(Decimal(str(item["asking_price_inr"])), "f"),
-                "variant": (
-                    item["variant"].strip()
-                    if isinstance(item.get("variant"), str) and item["variant"].strip()
-                    else None
-                ),
-                "year": (
-                    item["year"]
-                    if isinstance(item.get("year"), int)
-                    and not isinstance(item.get("year"), bool)
-                    else None
-                ),
+                "retrieved_at": item.get("retrieved_at") if isinstance(item.get("retrieved_at"), str) else None,
+                "relevance_score": item.get("relevance_score") if isinstance(item.get("relevance_score"), int) and not isinstance(item.get("relevance_score"), bool) else None,
             }
-            for item in raw_research_results
-            if isinstance(item, dict)
-            and item.get("priced_used_listing") is True
-            and _valid_market_price(item.get("asking_price_inr"))
-            and _valid_market_source_url(item.get("source_url"))
-        ]
+            market_research_results.append(research_item)
         if not market_research_results:
             market_research_results = [
                 {
+                    "title": listing.title,
                     "source_url": str(listing.source_url),
+                    "source_name": listing.source_name,
+                    "make": listing.make,
+                    "model": listing.model,
                     "variant": listing.variant,
                     "year": listing.year,
+                    "fuel_type": listing.fuel_type,
+                    "transmission": listing.transmission,
+                    "mileage_km": listing.mileage_km,
+                    "location": listing.location,
+                    "currency": "INR",
                     "asking_price_inr": format(listing.advertised_price_inr, "f"),
+                    "retrieved_at": listing.retrieved_at.isoformat(),
+                    "relevance_score": listing.relevance_score,
                 }
                 for listing in result.listings
             ]
-        priced_comparables = market_research_results
+        # Comparable evidence is the validated, year-compatible set used by the
+        # robust price calculation. Broader discovery records remain separate.
+        priced_comparables = [listing.model_dump(mode="json") for listing in result.listings]
         sources = sorted({listing.source_name for listing in result.listings})
         raw_search_scopes = getattr(provider, "search_scopes", [])
         if not isinstance(raw_search_scopes, list):
@@ -510,7 +528,7 @@ def _market_section(
                 unavailable_reason = "The provider returned no valid comparable listings."
         elif result.status == "low_evidence":
             unavailable_reason = (
-                f"Only {result.evidence_count} same-fuel, year-compatible comparable "
+                f"Only {result.evidence_count} year-compatible comparable "
                 "listings were found; "
                 f"at least {result.minimum_evidence_count} are required."
             )
@@ -525,9 +543,15 @@ def _market_section(
             "geographic_scope": search_scopes,
             "relevant_result_count": len(market_research_results),
             "priced_comparable_count": len(priced_comparables),
-            "exact_vehicle_match_count": 0,
-            "different_variant_count": 0,
-            "different_year_count": 0,
+            "exact_vehicle_match_count": exact_count,
+            "different_variant_count": sum(
+                any(diff.startswith("variant:") for diff in listing.match_differences)
+                for listing in result.listings
+            ),
+            "different_year_count": sum(
+                any(diff.startswith("year:") for diff in listing.match_differences)
+                for listing in result.listings
+            ),
             "general_market_information_count": 0,
             "priced_comparables": priced_comparables,
             "market_research_results": market_research_results,
@@ -1036,7 +1060,7 @@ def _buyer_recommendation(
         market_valuation.get("status") == "available"
         and isinstance(market_valuation.get("market_asking_price_range"), dict)
         and market_valuation.get("evidence_count", 0)
-        >= market_valuation.get("minimum_evidence_count", 5)
+        >= market_valuation.get("minimum_evidence_count", MIN_COMPARABLE_COUNT)
     )
 
     if damage_findings:

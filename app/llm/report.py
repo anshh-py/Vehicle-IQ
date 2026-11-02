@@ -33,25 +33,46 @@ def build_llm_prompt(report_data: dict[str, Any]) -> tuple[str, str]:
         if field in vehicle_fields and vehicle_fields.get(field) not in (None, ""):
             provenance[field] = "vehicle_api (VehicleX registration lookup; API-reported, not independently verified)"
     buyer_recommendation = _safe(report_data.get("buyer_recommendation") or {})
-    if isinstance(buyer_recommendation, dict):
-        buyer_recommendation.pop("market_evidence_available", None)
-        limitations = buyer_recommendation.get("limitations")
-        if isinstance(limitations, list):
-            buyer_recommendation["limitations"] = [
-                item
-                for item in limitations
-                if not isinstance(item, str) or "market" not in item.casefold()
-            ]
+    market = report_data.get("market_valuation")
+    if isinstance(market, dict):
+        market = {
+            key: _safe(market.get(key))
+            for key in (
+                "status", "unavailable_reason", "evidence_count",
+                "minimum_evidence_count", "market_asking_price_range",
+                "market_research_results", "limitations", "sources",
+            )
+            if key in market
+        }
+        if isinstance(market.get("market_research_results"), list):
+            market["market_research_results"] = market["market_research_results"][:5]
+    else:
+        market = {"status": "unavailable", "evidence_count": 0}
+
+    registration_results = _safe(report_data.get("registration_lookup_results") or [])
+    if isinstance(registration_results, list):
+        for lookup in registration_results:
+            if isinstance(lookup, dict):
+                lookup.pop("registration_number", None)
+    registration_ocr = _safe(report_data.get("registration_ocr_assessment") or {})
+    vehicle_services = {
+        "challan": _safe(report_data.get("challan_lookup") or {"status": "not_run"}),
+        "fastag": _safe(report_data.get("fastag_lookup") or {"status": "not_run"}),
+    }
     evidence = {
         "assessment": assessment,
         "ocr_results": _safe(report_data.get("ocr_results") or []),
         "vehicle_details_lookup": vehicle_lookup,
+        "registration_lookup_results": registration_results,
+        "registration_ocr_assessment": registration_ocr,
+        "vehicle_services": vehicle_services,
         "vehicle_field_provenance": provenance,
         "damage_inspection": _safe(damage_inspection or {"status": "unavailable"}),
         "damage_findings": _safe(report_data.get("damage_findings") or []),
         "price_estimates": _safe(report_data.get("price_estimates") or []),
         "pricing_workflow": _safe(report_data.get("pricing") or (report_data.get("stages", {}).get("pricing") if isinstance(report_data.get("stages"), dict) else {})),
         "buyer_recommendation": buyer_recommendation,
+        "market_valuation": market,
         "limitations": _safe(report_data.get("limitations") or []),
     }
     system_prompt = (
@@ -68,7 +89,10 @@ def build_llm_prompt(report_data: dict[str, Any]) -> tuple[str, str]:
         "When status is unavailable or failed, state that no conclusion about damage can be drawn. "
         "Never omit a stored damage detection. "
         "Never claim that no damage findings exist when detections are present. "
-        "Do not summarize or infer market research, used-car prices, or market-value conclusions. "
+        "Summarize supplied market evidence only when present. Search results are discovered advertisements, not verified active listings or completed sales. "
+        "Never invent a listing, price, source, market range, or missing vehicle field. Do not calculate or alter market statistics; repeat only the supplied deterministic range and evidence count. "
+        "When market valuation is unavailable or evidence is below the stated minimum, say that no market range is available. Keep the market asking-price evidence separate from the XGBoost estimate. "
+        "Describe OCR registration candidates as unverified text and vehicle API values as provider-reported, not independently verified. "
         "If evidence is insufficient, say so. "
         "Clearly identify user-provided specifications as unverified. "
         "Do not present this as a professional mechanical inspection. "
@@ -79,7 +103,9 @@ def build_llm_prompt(report_data: dict[str, Any]) -> tuple[str, str]:
         + json.dumps(evidence, sort_keys=True, default=str)
         + "\nReturn JSON with keys: vehicle_overview, overall_condition_summary, "
         "detected_damage_explanation, potential_inspection_risks, buyer_recommendations, "
-        "price_estimate_explanation, missing_information_and_limitations."
+        "price_estimate_explanation, missing_information_and_limitations, "
+        "vehicle_identity_and_lookup_summary, market_valuation_explanation. "
+        "Keep the market explanation concise and only use the supplied market_valuation fields."
     )
     return system_prompt, user_prompt
 
@@ -143,6 +169,32 @@ def damage_condition_summary(status: str) -> str:
     )
 
 
+def _grounded_market_explanation(market: Any) -> str:
+    if not isinstance(market, dict):
+        return "No market research result was supplied, so no market price range is available."
+    status = market.get("status")
+    count = market.get("evidence_count", 0)
+    minimum = market.get("minimum_evidence_count", 3)
+    price_range = market.get("market_asking_price_range")
+    if status == "available" and isinstance(price_range, dict):
+        return (
+            f"An observed asking-price range was calculated from {count} comparable advertisements. "
+            f"The reported interquartile range is ₹{price_range.get('lower_inr')} to "
+            f"₹{price_range.get('upper_inr')}, with a median advertised price of "
+            f"₹{price_range.get('median_inr')}. These are asking prices, not completed-sale values, "
+            "and are reported separately from the ML estimate."
+        )
+    if count and isinstance(count, int):
+        return (
+            f"Only {count} year-compatible comparable advertisement(s) were available; "
+            f"at least {minimum} are required for a market asking-price range. No range is reported."
+        )
+    reason = market.get("unavailable_reason")
+    if isinstance(reason, str) and reason.strip():
+        return f"Market valuation is unavailable. {reason.strip()} No market price was inferred."
+    return "Market valuation is unavailable; no comparable-market price range was inferred."
+
+
 def generate_llm_narrative(
     report_data: dict[str, Any],
     *,
@@ -181,4 +233,7 @@ def generate_llm_narrative(
         damage_findings if isinstance(damage_findings, list) else [],
     )
     narrative.overall_condition_summary = damage_condition_summary(damage_status)
+    narrative.market_valuation_explanation = _grounded_market_explanation(
+        report_data.get("market_valuation")
+    )
     return narrative

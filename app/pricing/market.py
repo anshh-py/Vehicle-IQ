@@ -10,7 +10,7 @@ from pydantic import BaseModel, ConfigDict, Field, HttpUrl, field_validator
 
 
 MAX_LISTING_AGE = timedelta(days=30)
-MIN_COMPARABLE_COUNT = 5
+MIN_COMPARABLE_COUNT = 3
 YEAR_TOLERANCE = 3
 MILEAGE_TOLERANCE_FRACTION = Decimal("0.15")
 MILEAGE_TOLERANCE_FLOOR_KM = 5_000
@@ -50,6 +50,7 @@ class MarketListing(BaseModel):
         "exact_match", "close_match", "approximate_match", "exact", "approximate"
     ] = "exact_match"
     match_differences: list[str] = Field(default_factory=list)
+    relevance_score: int = Field(default=0, ge=0, le=100)
     fuel_type: str | None = None
     transmission: str | None = None
     mileage_km: int | None = Field(default=None, ge=0, le=2_000_000)
@@ -126,6 +127,19 @@ def _key(value: str | None) -> str | None:
     if value is None:
         return None
     return " ".join(value.casefold().split()) or None
+
+
+def _location_tokens(value: str | None) -> set[str]:
+    if not value:
+        return set()
+    import re
+
+    return {token.casefold() for token in re.findall(r"[a-z]+", value)}
+
+
+def _locations_overlap(left: str | None, right: str | None) -> bool:
+    """Allow an exact city or a shared stated region/state token."""
+    return bool(_location_tokens(left) & _location_tokens(right))
 
 
 def _listing_url_key(url: HttpUrl) -> str:
@@ -221,24 +235,79 @@ def _classify(
     if criteria.location is not None:
         if listing.location is None:
             differences.append("location: not reported")
-        elif _key(listing.location) != _key(criteria.location):
+        elif not _locations_overlap(listing.location, criteria.location):
             differences.append(f"location: {listing.location} vs {criteria.location}")
 
+    score = _relevance_score(listing, criteria)
+    known_vehicle_mismatch = False
+    if criteria.fuel_type and listing.fuel_type and _key(listing.fuel_type) != _key(criteria.fuel_type):
+        known_vehicle_mismatch = True
+    if criteria.transmission and listing.transmission and _key(listing.transmission) != _key(criteria.transmission):
+        known_vehicle_mismatch = True
+    if criteria.variant and listing.variant:
+        from difflib import SequenceMatcher
+
+        if SequenceMatcher(None, _key(criteria.variant) or "", _key(listing.variant) or "").ratio() < 0.65:
+            known_vehicle_mismatch = True
+    if criteria.mileage_km is not None and listing.mileage_km is not None:
+        mileage_tolerance = max(
+            Decimal(MILEAGE_TOLERANCE_FLOOR_KM),
+            Decimal(criteria.mileage_km) * MILEAGE_TOLERANCE_FRACTION,
+        )
+        if abs(listing.mileage_km - criteria.mileage_km) > mileage_tolerance:
+            known_vehicle_mismatch = True
+    if criteria.location and listing.location and not _locations_overlap(listing.location, criteria.location):
+        known_vehicle_mismatch = True
     if not differences:
         return "exact_match", differences
-    close_differences = [
-        item
-        for item in differences
-        if not item.startswith("year:") or item == "year: target not specified"
-    ]
     if (
-        len(close_differences) == 0
-        and (criteria.year is None or abs(listing.year - criteria.year) <= YEAR_TOLERANCE)
-        and criteria.fuel_type is not None
-        and _key(listing.fuel_type) == _key(criteria.fuel_type)
+        score >= 75
+        and not known_vehicle_mismatch
     ):
         return "close_match", differences
     return "approximate_match", differences
+
+
+def _relevance_score(listing: MarketListing, criteria: MarketVehicleCriteria) -> int:
+    """Deterministic comparison score; unknown optional fields reduce evidence quality, not eligibility."""
+    from difflib import SequenceMatcher
+
+    score = 30  # exact make/model are required by the caller
+    if criteria.variant:
+        target, actual = _key(criteria.variant), _key(listing.variant)
+        if target and actual:
+            ratio = SequenceMatcher(None, target, actual).ratio()
+            score += 20 if ratio >= 0.95 else 14 if ratio >= 0.65 else 5
+        else:
+            score += 8
+    else:
+        score += 12
+    if criteria.year is not None:
+        delta = abs(listing.year - criteria.year)
+        score += max(0, 15 - 5 * delta)
+    else:
+        score += 8
+    if criteria.fuel_type:
+        score += 15 if _key(listing.fuel_type) == _key(criteria.fuel_type) else 5 if listing.fuel_type is None else 0
+    else:
+        score += 8 if listing.fuel_type else 4
+    if criteria.transmission:
+        score += 10 if _key(listing.transmission) == _key(criteria.transmission) else 5 if listing.transmission is None else 1
+    else:
+        score += 6 if listing.transmission else 3
+    if criteria.mileage_km is not None:
+        if listing.mileage_km is None:
+            score += 2
+        else:
+            allowed = max(MILEAGE_TOLERANCE_FLOOR_KM, int(criteria.mileage_km * MILEAGE_TOLERANCE_FRACTION))
+            score += 5 if abs(listing.mileage_km - criteria.mileage_km) <= allowed else 1
+    else:
+        score += 3
+    if criteria.location:
+        score += 5 if _locations_overlap(listing.location, criteria.location) else 3 if listing.location is None else 1
+    else:
+        score += 3
+    return min(100, max(0, score))
 
 
 def calculate_market_comparables(
@@ -247,7 +316,7 @@ def calculate_market_comparables(
     *,
     valuation_date: datetime | None = None,
 ) -> MarketComparableResult:
-    """Prefer exact, then close, then approximate same-fuel evidence for the range."""
+    """Prefer high-relevance, year-compatible evidence; use unknown fuel only to fill an evidence shortage."""
     now = valuation_date or datetime.now(timezone.utc)
     if now.tzinfo is None or now.utcoffset() is None:
         raise ValueError("valuation_date must include a timezone")
@@ -288,9 +357,6 @@ def calculate_market_comparables(
         if match_type == "year_mismatch":
             reject("year_mismatch")
             continue
-        if listing.fuel_type is None:
-            reject("fuel_not_reported")
-            continue
         identity = (listing.source_name.casefold(), listing.listing_id.casefold()) if listing.listing_id else None
         url_key = _listing_url_key(listing.source_url)
         if (identity and identity in seen_ids) or url_key in seen_urls:
@@ -304,21 +370,42 @@ def calculate_market_comparables(
                 update={
                     "match_type": match_type,
                     "match_differences": differences,
+                    "relevance_score": _relevance_score(listing, criteria),
                 }
             )
         )
 
     if candidates:
-        target_fuel = _key(criteria.fuel_type) or Counter(
-            _key(item.fuel_type) for item in candidates if item.fuel_type
-        ).most_common(1)[0][0]
-        same_fuel = []
-        for item in candidates:
-            if _key(item.fuel_type) != target_fuel:
-                reject("fuel_mismatch")
+        target_fuel = _key(criteria.fuel_type)
+        if target_fuel is None:
+            reported_fuels = Counter(
+                _key(item.fuel_type) for item in candidates if item.fuel_type
+            )
+            target_fuel = reported_fuels.most_common(1)[0][0] if reported_fuels else None
+        if target_fuel is not None:
+            same_fuel = []
+            unknown_fuel = []
+            for item in candidates:
+                if item.fuel_type is None:
+                    unknown_fuel.append(item)
+                elif _key(item.fuel_type) != target_fuel:
+                    reject("fuel_mismatch")
+                else:
+                    same_fuel.append(item)
+            if len(same_fuel) < MIN_COMPARABLE_COUNT:
+                candidates = same_fuel + unknown_fuel
             else:
-                same_fuel.append(item)
-        candidates = same_fuel
+                candidates = same_fuel
+                if unknown_fuel:
+                    rejected["fuel_not_reported_excluded"] = len(unknown_fuel)
+
+    candidates.sort(
+        key=lambda item: (
+            item.relevance_score,
+            -abs(item.year - criteria.year) if criteria.year is not None else 0,
+        ),
+        reverse=True,
+    )
 
     exact = _coherent_year_cohort(
         [item for item in candidates if item.match_type == "exact_match"],
