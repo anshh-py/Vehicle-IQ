@@ -34,7 +34,11 @@ app.add_middleware(RequestObservabilityMiddleware)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5500", "http://127.0.0.1:5500"],
+    allow_origins=[
+        "http://localhost:5500",
+        "http://127.0.0.1:5500",
+        "https://vehicle-iq-frontend.vercel.app",
+    ],
     allow_methods=["*"],
     allow_headers=["*"],
 )
