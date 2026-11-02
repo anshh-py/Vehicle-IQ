@@ -1,8 +1,10 @@
 from collections.abc import Generator
+import json
 
 import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine, event
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session
 from sqlalchemy.pool import StaticPool
 
@@ -184,3 +186,54 @@ def test_assessment_routes_appear_in_openapi_docs(client):
 
     assert set(paths["/api/v1/assessments"]) == {"get", "post"}
     assert set(paths["/api/v1/assessments/{assessment_id}"]) == {"get", "patch"}
+
+
+@pytest.mark.parametrize(
+    ("method", "path", "operation", "expected_detail"),
+    [
+        ("get", "/api/v1/assessments?limit=1", "list_assessments", "Unable to list assessments."),
+        ("post", "/api/v1/assessments", "create_assessment", "Unable to create assessment."),
+    ],
+)
+def test_assessment_database_errors_are_logged_safely_and_keep_generic_responses(
+    client, caplog, method, path, operation, expected_detail
+):
+    class DriverFailure(Exception):
+        sqlstate = "08006"
+
+    class FailingSession:
+        def add(self, _item):
+            pass
+
+        def scalar(self, _statement):
+            raise OperationalError("statement", {}, DriverFailure("private connection detail"))
+
+        def commit(self):
+            raise OperationalError("statement", {}, DriverFailure("private connection detail"))
+
+        def rollback(self):
+            pass
+
+    def override_get_db():
+        yield FailingSession()
+
+    app.dependency_overrides[get_db] = override_get_db
+    caplog.set_level("ERROR", logger="app.assessments")
+    try:
+        response = client.request(method, path, json={} if method == "post" else None)
+    finally:
+        app.dependency_overrides.pop(get_db, None)
+
+    assert response.status_code == 500
+    assert response.json() == {"detail": expected_detail}
+
+    record = next(record for record in caplog.records if record.name == "app.assessments")
+    event = json.loads(record.getMessage())
+    assert event == {
+        "event": "assessment_database_error",
+        "operation": operation,
+        "request_id": response.headers["x-request-id"],
+        "exception_class": "OperationalError",
+        "sqlstate": "08006",
+    }
+    assert "private connection detail" not in caplog.text

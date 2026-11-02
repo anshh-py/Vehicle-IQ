@@ -1,3 +1,5 @@
+import json
+import logging
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
@@ -5,6 +7,7 @@ from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session
 
+from app.core.observability import request_id_context
 from app.db.models import VehicleAssessment
 from app.db.session import get_db
 from app.schemas.assessments import (
@@ -18,10 +21,36 @@ from app.schemas.assessments import (
 
 
 router = APIRouter(prefix="/api/v1/assessments", tags=["assessments"])
+logger = logging.getLogger("app.assessments")
 
 
 def _database_error(detail: str) -> HTTPException:
     return HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=detail)
+
+
+def _log_database_error(operation: str, exc: SQLAlchemyError) -> None:
+    """Log diagnostic metadata only; driver messages can contain sensitive details."""
+    original = getattr(exc, "orig", None)
+    diagnostic = getattr(original, "diag", None)
+    sqlstate = (
+        getattr(original, "sqlstate", None)
+        or getattr(original, "pgcode", None)
+        or getattr(diagnostic, "sqlstate", None)
+    )
+    if not isinstance(sqlstate, str) or len(sqlstate) != 5 or not sqlstate.isascii() or not sqlstate.isalnum():
+        sqlstate = None
+    logger.error(
+        json.dumps(
+            {
+                "event": "assessment_database_error",
+                "operation": operation,
+                "request_id": request_id_context.get(),
+                "exception_class": type(exc).__name__,
+                "sqlstate": sqlstate,
+            },
+            separators=(",", ":"),
+        )
+    )
 
 
 def _vehicle_details_without_asking_price(details: dict | None) -> dict | None:
@@ -51,8 +80,9 @@ def create_assessment(payload: AssessmentCreate, db: Session = Depends(get_db)) 
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail="Assessment contains invalid data.",
         ) from None
-    except SQLAlchemyError:
+    except SQLAlchemyError as exc:
         db.rollback()
+        _log_database_error("create_assessment", exc)
         raise _database_error("Unable to create assessment.") from None
     return AssessmentResponse.model_validate(assessment)
 
@@ -71,7 +101,8 @@ def list_assessments(
             .limit(limit)
             .offset(offset)
         ).all()
-    except SQLAlchemyError:
+    except SQLAlchemyError as exc:
+        _log_database_error("list_assessments", exc)
         raise _database_error("Unable to list assessments.") from None
     return AssessmentListResponse(items=items, total=total, limit=limit, offset=offset)
 
