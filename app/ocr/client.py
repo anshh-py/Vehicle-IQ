@@ -40,12 +40,54 @@ logger = logging.getLogger(__name__)
 class OCRRecognition:
     text: str
     confidence: float | None = None
+    provider: str | None = None
 
 
 class OCRClient(Protocol):
     provider_name: str
 
     def recognize(self, content: bytes, filename: str, content_type: str) -> OCRRecognition: ...
+
+
+class HybridOCRClient:
+    """Attempt local PaddleOCR once, then the Gradio Space for supported OCR failures."""
+
+    provider_name = "hybrid"
+    _fallback_errors = (
+        OCRServiceUnavailable,
+        OCRInferenceFailed,
+        OCRInvalidResponse,
+        OCRUnreadableText,
+    )
+
+    def __init__(self, primary: OCRClient, fallback: OCRClient):
+        self.primary = primary
+        self.fallback = fallback
+        self.last_attempted_provider = primary.provider_name
+
+    def recognize(self, content: bytes, filename: str, content_type: str) -> OCRRecognition:
+        self.last_attempted_provider = self.primary.provider_name
+        try:
+            result = self.primary.recognize(content, filename, content_type)
+            return OCRRecognition(result.text, result.confidence, self.primary.provider_name)
+        except self._fallback_errors as primary_error:
+            logger.warning(
+                "OCR primary provider failed (provider=%s, exception_class=%s).",
+                self.primary.provider_name,
+                type(primary_error).__name__,
+            )
+            self.last_attempted_provider = self.fallback.provider_name
+            logger.info("OCR fallback attempt (provider=%s).", self.fallback.provider_name)
+            try:
+                result = self.fallback.recognize(content, filename, content_type)
+                return OCRRecognition(result.text, result.confidence, self.fallback.provider_name)
+            except self._fallback_errors as fallback_error:
+                logger.warning(
+                    "OCR fallback provider failed (provider=%s, exception_class=%s).",
+                    self.fallback.provider_name,
+                    type(fallback_error).__name__,
+                )
+                raise fallback_error from primary_error
 
 
 @dataclass

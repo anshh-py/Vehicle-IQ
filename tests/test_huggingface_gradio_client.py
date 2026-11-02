@@ -6,6 +6,7 @@ import pytest
 
 from app.ocr.client import (
     BaiduUnlimitedOCRClient,
+    HybridOCRClient,
     HuggingFaceGradioOCRClient,
     OCRInferenceFailed,
     OCRInvalidResponse,
@@ -83,6 +84,82 @@ def test_gradio_space_environment_settings_are_canonical(monkeypatch):
     assert config.ocr_service_provider == "huggingface_gradio"
     assert config.ocr_gradio_space_url == BASE_URL
     assert config.ocr_timeout_seconds == 600
+
+
+@pytest.mark.parametrize(
+    "primary_error",
+    [OCRServiceUnavailable("offline"), OCRInferenceFailed("inference failed"),
+     OCRInvalidResponse("bad response"), OCRUnreadableText("no text")],
+)
+def test_hybrid_falls_back_once_for_supported_primary_errors(primary_error):
+    class StubOCR:
+        def __init__(self, provider_name, result=None, error=None):
+            self.provider_name = provider_name
+            self.result = result
+            self.error = error
+            self.calls = []
+
+        def recognize(self, content, filename, content_type):
+            self.calls.append((content, filename, content_type))
+            if self.error:
+                raise self.error
+            return self.result
+
+    primary = StubOCR("paddleocr_local", error=primary_error)
+    fallback = StubOCR("huggingface_gradio", OCRRecognition("RJ45CA1879", 0.98))
+    client = HybridOCRClient(primary, fallback)
+    content = b"same-preprocessed-image"
+
+    result = client.recognize(content, "image.png", "image/png")
+
+    assert result == OCRRecognition("RJ45CA1879", 0.98, "huggingface_gradio")
+    assert len(primary.calls) == len(fallback.calls) == 1
+    assert primary.calls[0] == fallback.calls[0] == (content, "image.png", "image/png")
+
+
+def test_hybrid_does_not_call_fallback_when_primary_succeeds():
+    class StubOCR:
+        def __init__(self, provider_name, result=None, error=None):
+            self.provider_name = provider_name
+            self.result = result
+            self.error = error
+            self.calls = 0
+
+        def recognize(self, *_args):
+            self.calls += 1
+            if self.error:
+                raise self.error
+            return self.result
+
+    primary = StubOCR("paddleocr_local", OCRRecognition("RJ45CA1879", 0.97))
+    fallback = StubOCR("huggingface_gradio", error=AssertionError("fallback must not run"))
+
+    result = HybridOCRClient(primary, fallback).recognize(b"image", "image.png", "image/png")
+
+    assert result == OCRRecognition("RJ45CA1879", 0.97, "paddleocr_local")
+    assert primary.calls == 1
+    assert fallback.calls == 0
+
+
+def test_hybrid_does_not_catch_unrelated_programming_errors():
+    class StubOCR:
+        provider_name = "paddleocr_local"
+
+        def recognize(self, *_args):
+            raise RuntimeError("programming error")
+
+    class Fallback:
+        provider_name = "huggingface_gradio"
+        calls = 0
+
+        def recognize(self, *_args):
+            self.calls += 1
+            return OCRRecognition("text")
+
+    fallback = Fallback()
+    with pytest.raises(RuntimeError, match="programming error"):
+        HybridOCRClient(StubOCR(), fallback).recognize(b"image", "image.png", "image/png")
+    assert fallback.calls == 0
 
 
 @pytest.mark.parametrize("upload_payload", [[], [""], [None], {"path": "/tmp/image.png"}, ["a", "b"]])
@@ -333,3 +410,22 @@ def test_provider_selection_defaults_and_keeps_local_baidu_provider(monkeypatch)
     assert isinstance(paddle_client, PaddleOCRLocalClient)
     assert paddle_client.detection_model_dir.name == "detector"
     assert paddle_client.recognition_model_dir.name == "recognizer"
+
+    monkeypatch.setattr(
+        ocr_api,
+        "settings",
+        SimpleNamespace(
+            ocr_service_provider="hybrid",
+            ocr_service_url=None,
+            ocr_gradio_space_url=BASE_URL,
+            ocr_gradio_mode="gundam",
+            ocr_timeout_seconds=600,
+            ocr_paddle_detection_model_dir=".local-storage/detector",
+            ocr_paddle_recognition_model_dir=".local-storage/recognizer",
+        ),
+    )
+    hybrid_client = ocr_api.get_ocr_client()
+    assert isinstance(hybrid_client, HybridOCRClient)
+    assert isinstance(hybrid_client.primary, PaddleOCRLocalClient)
+    assert isinstance(hybrid_client.fallback, HuggingFaceGradioOCRClient)
+    assert hybrid_client.fallback.timeout.read == 600

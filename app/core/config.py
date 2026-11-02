@@ -30,7 +30,9 @@ class Settings(BaseSettings):
     tavily_timeout_seconds: float = Field(default=15.0, gt=0, le=60)
     tavily_result_limit: int = Field(default=20, ge=1, le=50)
     ocr_service_url: str | None = None
-    ocr_service_provider: Literal["baidu_unlimited_ocr", "huggingface_gradio", "paddleocr_local"] = "huggingface_gradio"
+    ocr_service_provider: Literal[
+        "baidu_unlimited_ocr", "huggingface_gradio", "paddleocr_local", "hybrid"
+    ] = "huggingface_gradio"
     ocr_gradio_space_url: str = "https://baidu-unlimited-ocr.hf.space"
     ocr_gradio_mode: Literal["gundam", "base"] = "gundam"
     ocr_timeout_seconds: int = Field(default=600, gt=0, le=900)

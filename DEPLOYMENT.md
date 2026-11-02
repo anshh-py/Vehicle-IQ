@@ -86,7 +86,7 @@ The repository root `.python-version` pins the Render runtime to Python 3.13.16.
 Configure the Render service with the repository root as its root directory and
 these commands:
 
-- Build: `pip install -r requirements.txt`
+- Build: `pip install -r requirements.txt && python scripts/provision_paddleocr_models.py`
 - Start: `uvicorn app.main:app --host 0.0.0.0 --port $PORT`
 
 Render supplies `PORT`; do not hardcode the local development port in its start
@@ -95,6 +95,14 @@ The tracked `models/vehicle_iq_price_model.joblib` is loaded lazily through
 `PRICE_MODEL_PATH`, which defaults to that repository-relative artifact. An
 optional override can point to another mounted artifact. The estimate remains
 research-only and is not a verified market valuation.
+
+The build step provisions PaddleX's official `PP-OCRv5_mobile_det` and
+`en_PP-OCRv5_mobile_rec` inference models into the same ignored
+`.local-storage/paddleocr-smoke-bos/paddlex/official_models/` directories used
+by the application. It validates required inference files and fails the build
+if either model is missing or invalid. Valid local model directories are reused
+on repeated script runs; model binaries are not committed. Render builds need
+network access to PaddleX's official model sources.
 
 The in-process rate limiter is per worker and can be bypassed across multiple
 workers. Public deployments should also apply rate limiting at a trusted reverse

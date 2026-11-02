@@ -19,6 +19,7 @@ from app.db.models import OCRResult, UploadedImage, VehicleAssessment
 from app.db.session import get_db
 from app.main import app
 from app.ocr.client import (
+    HybridOCRClient,
     HuggingFaceGradioOCRClient,
     OCRInferenceFailed,
     OCRInvalidResponse,
@@ -228,6 +229,94 @@ def test_public_provider_name_is_returned_and_persisted(ocr_api):
         record = session.scalar(select(OCRResult))
         assert record is not None
         assert record.provider == "huggingface_gradio"
+
+
+def test_hybrid_paddle_success_never_calls_fallback_and_persists_once(ocr_api):
+    client, assessment_id, image_id, _storage, engine, _fake = ocr_api
+    primary = FakeOCRClient(OCRRecognition("RJ45CA1879", 0.97))
+    primary.provider_name = "paddleocr_local"
+    fallback = FakeOCRClient(error=AssertionError("fallback must not run"))
+    fallback.provider_name = "huggingface_gradio"
+    app.dependency_overrides[get_ocr_client] = lambda: HybridOCRClient(primary, fallback)
+
+    response = client.post(f"/api/v1/assessments/{assessment_id}/images/{image_id}/ocr")
+
+    assert response.status_code == 200
+    assert response.json()["provider"] == "paddleocr_local"
+    assert primary.calls and len(primary.calls) == 1
+    assert fallback.calls == []
+    assert count_ocr_results(engine) == 1
+    with Session(engine) as session:
+        record = session.scalar(select(OCRResult))
+        assert record.status == "completed"
+        assert record.provider == "paddleocr_local"
+
+
+@pytest.mark.parametrize(
+    "primary_error",
+    [
+        OCRServiceUnavailable("offline"),
+        OCRInferenceFailed("model inference failed"),
+        OCRUnreadableText("no readable text"),
+        OCRInvalidResponse("invalid local output"),
+    ],
+)
+def test_hybrid_fallback_success_persists_exactly_one_success(ocr_api, monkeypatch, primary_error):
+    client, assessment_id, image_id, _storage, engine, _fake = ocr_api
+    primary = FakeOCRClient(error=primary_error)
+    primary.provider_name = "paddleocr_local"
+    fallback = FakeOCRClient(OCRRecognition("RJ45CA1879", 0.98))
+    fallback.provider_name = "huggingface_gradio"
+    app.dependency_overrides[get_ocr_client] = lambda: HybridOCRClient(primary, fallback)
+
+    import app.api.v1.ocr as ocr_route
+
+    prepared = []
+
+    def preprocess_once(content):
+        prepared.append(content)
+        return b"single prepared buffer"
+
+    monkeypatch.setattr(ocr_route, "preprocess_ocr_image", preprocess_once)
+    response = client.post(f"/api/v1/assessments/{assessment_id}/images/{image_id}/ocr")
+
+    assert response.status_code == 200
+    assert response.json()["provider"] == "huggingface_gradio"
+    assert response.json()["text"] == "RJ45CA1879"
+    assert len(prepared) == 1
+    assert primary.calls[0][0] == fallback.calls[0][0] == b"single prepared buffer"
+    assert len(primary.calls) == len(fallback.calls) == 1
+    assert count_ocr_results(engine) == 1
+    with Session(engine) as session:
+        record = session.scalar(select(OCRResult))
+        assert record.status == "completed"
+        assert record.provider == "huggingface_gradio"
+        assert record.raw_text == "RJ45CA1879"
+
+
+def test_hybrid_both_providers_fail_with_fallback_quota_exhaustion(ocr_api, caplog):
+    client, assessment_id, image_id, _storage, engine, _fake = ocr_api
+    primary = FakeOCRClient(error=OCRInferenceFailed("local inference failed"))
+    primary.provider_name = "paddleocr_local"
+    fallback = FakeOCRClient(error=OCRServiceUnavailable("ZeroGPU quota exhausted"))
+    fallback.provider_name = "huggingface_gradio"
+    app.dependency_overrides[get_ocr_client] = lambda: HybridOCRClient(primary, fallback)
+
+    response = client.post(f"/api/v1/assessments/{assessment_id}/images/{image_id}/ocr")
+
+    assert response.status_code == 503
+    assert response.json()["detail"] == "OCR service is unavailable."
+    assert len(primary.calls) == len(fallback.calls) == 1
+    assert count_ocr_results(engine) == 1
+    with Session(engine) as session:
+        record = session.scalar(select(OCRResult))
+        assert record.status == "unavailable"
+        assert record.provider == "huggingface_gradio"
+        assert record.raw_text is None
+    assert "provider=paddleocr_local" in caplog.text
+    assert "exception_class=OCRInferenceFailed" in caplog.text
+    assert "provider=huggingface_gradio" in caplog.text
+    assert "exception_class=OCRServiceUnavailable" in caplog.text
 
 
 def test_public_no_text_output_is_persisted_as_unreadable_not_completed(ocr_api):

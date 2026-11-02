@@ -12,6 +12,7 @@ from app.db.session import get_db
 from app.images.validation import InvalidImageError, inspect_image
 from app.ocr.client import (
     BaiduUnlimitedOCRClient,
+    HybridOCRClient,
     HuggingFaceGradioOCRClient,
     OCRClient,
     OCRInferenceFailed,
@@ -70,6 +71,18 @@ def get_ocr_client() -> OCRClient | None:
             mode=settings.ocr_gradio_mode,
             read_timeout_seconds=settings.ocr_timeout_seconds,
         )
+    if settings.ocr_service_provider == "hybrid":
+        return HybridOCRClient(
+            PaddleOCRLocalClient(
+                settings.ocr_paddle_detection_model_dir,
+                settings.ocr_paddle_recognition_model_dir,
+            ),
+            HuggingFaceGradioOCRClient(
+                settings.ocr_gradio_space_url,
+                mode=settings.ocr_gradio_mode,
+                read_timeout_seconds=settings.ocr_timeout_seconds,
+            ),
+        )
     if not settings.ocr_service_url:
         return None
     return BaiduUnlimitedOCRClient(settings.ocr_service_url)
@@ -107,6 +120,9 @@ def recognize_assessment_image(
         _persist_ocr_attempt_status(db, assessment_id, image_id, None, "unavailable", "provider_unconfigured")
         raise HTTPException(status_code=503, detail="OCR service is not configured.")
 
+    def attempt_provider_name() -> str | None:
+        return getattr(client, "last_attempted_provider", None) or client.provider_name
+
     try:
         content = read_image_content(image)
     except ImageContentUnavailable:
@@ -118,7 +134,7 @@ def recognize_assessment_image(
         inspect_image(content)
     except InvalidImageError:
         _persist_ocr_attempt_status(
-            db, assessment_id, image_id, client.provider_name, "failed", "invalid_stored_image"
+            db, assessment_id, image_id, attempt_provider_name(), "failed", "invalid_stored_image"
         )
         raise HTTPException(status_code=422, detail="Stored image is corrupt or unsupported.") from None
 
@@ -131,12 +147,12 @@ def recognize_assessment_image(
         result = client.recognize(ocr_content, filename, "image/png")
     except ValueError:
         _persist_ocr_attempt_status(
-            db, assessment_id, image_id, client.provider_name, "failed", "image_preprocessing_failed"
+            db, assessment_id, image_id, attempt_provider_name(), "failed", "image_preprocessing_failed"
         )
         raise HTTPException(status_code=422, detail="Stored image could not be prepared for OCR.") from None
     except OCRServiceUnavailable as exc:
         _persist_ocr_attempt_status(
-            db, assessment_id, image_id, client.provider_name, "unavailable", "provider_unavailable"
+            db, assessment_id, image_id, attempt_provider_name(), "unavailable", "provider_unavailable"
         )
         if isinstance(client, PaddleOCRLocalClient):
             logger.warning("Local PaddleOCR unavailable: %s", exc)
@@ -144,28 +160,29 @@ def recognize_assessment_image(
         raise HTTPException(status_code=503, detail="OCR service is unavailable.") from None
     except OCRInvalidResponse:
         _persist_ocr_attempt_status(
-            db, assessment_id, image_id, client.provider_name, "failed", "invalid_provider_response"
+            db, assessment_id, image_id, attempt_provider_name(), "failed", "invalid_provider_response"
         )
         raise HTTPException(status_code=502, detail="OCR service returned an invalid response.") from None
     except OCRUnreadableText:
         _persist_ocr_attempt_status(
-            db, assessment_id, image_id, client.provider_name, "unreadable", "no_readable_text"
+            db, assessment_id, image_id, attempt_provider_name(), "unreadable", "no_readable_text"
         )
         raise HTTPException(status_code=422, detail="No readable text was found in the image.") from None
     except OCRInferenceFailed as exc:
         _persist_ocr_attempt_status(
-            db, assessment_id, image_id, client.provider_name, "failed", "inference_failed"
+            db, assessment_id, image_id, attempt_provider_name(), "failed", "inference_failed"
         )
         detail = str(exc).strip() or "OCR inference failed. The OCR service returned no error details."
         logger.warning("OCR inference failed: %s", detail)
         raise HTTPException(status_code=502, detail=detail) from None
 
+    result_provider = result.provider or client.provider_name
     ocr_result = OCRResult(
         assessment_id=assessment_id,
         image_id=image_id,
         result_type="image_ocr",
         status="completed",
-        provider=client.provider_name,
+        provider=result_provider,
         raw_text=result.text,
         result_data={"confidence": result.confidence} if result.confidence is not None else None,
     )
@@ -177,7 +194,7 @@ def recognize_assessment_image(
             id=ocr_result.id,
             assessment_id=ocr_result.assessment_id,
             image_id=image_id,
-            provider=client.provider_name,
+            provider=result_provider,
             result_type=ocr_result.result_type,
             status=ocr_result.status,
             text=result.text,
