@@ -103,10 +103,47 @@ class PaddleOCRLocalClient:
     _model_cache: ClassVar[dict[tuple[str, str], _PaddleModelEntry]] = {}
     _model_cache_lock: ClassVar[threading.Lock] = threading.Lock()
     _model_files = ("inference.yml", "inference.pdiparams")
+    _alternative_model_files = ("inference.json", "inference.pdmodel")
 
     def __init__(self, detection_model_dir: Path | str, recognition_model_dir: Path | str):
         self.detection_model_dir = Path(detection_model_dir).expanduser().resolve()
         self.recognition_model_dir = Path(recognition_model_dir).expanduser().resolve()
+
+    @classmethod
+    def model_dir_status(cls, model_dir: Path | str) -> dict[str, bool]:
+        directory = Path(model_dir).expanduser()
+        status = {
+            "directory_exists": directory.is_dir(),
+            **{filename: (directory / filename).is_file() for filename in cls._model_files},
+            "inference_config_exists": any(
+                (directory / filename).is_file() for filename in cls._alternative_model_files
+            ),
+        }
+        status["ready"] = all(status.values())
+        return status
+
+    @classmethod
+    def log_model_asset_status(
+        cls,
+        detection_model_dir: Path | str,
+        recognition_model_dir: Path | str,
+    ) -> None:
+        for model_name, model_dir in (
+            ("PP-OCRv5_mobile_det", Path(detection_model_dir).expanduser().resolve()),
+            ("en_PP-OCRv5_mobile_rec", Path(recognition_model_dir).expanduser().resolve()),
+        ):
+            status = cls.model_dir_status(model_dir)
+            logger.info(
+                "PaddleOCR model asset status (model=%s, directory=%s, directory_exists=%s, "
+                "inference_yml=%s, inference_pdiparams=%s, inference_json_or_pdmodel=%s, ready=%s).",
+                model_name,
+                model_dir,
+                status["directory_exists"],
+                status["inference.yml"],
+                status["inference.pdiparams"],
+                status["inference_config_exists"],
+                status["ready"],
+            )
 
     def recognize(self, content: bytes, filename: str, content_type: str) -> OCRRecognition:
         if content_type not in {"image/jpeg", "image/png", "image/webp"}:
@@ -175,6 +212,10 @@ class PaddleOCRLocalClient:
             try:
                 model = self._create_model()
             except Exception as exc:
+                logger.error(
+                    "Local PaddleOCR model initialization failed (exception_class=%s).",
+                    type(exc).__name__,
+                )
                 raise OCRServiceUnavailable(
                     f"Local PaddleOCR model initialization failed ({type(exc).__name__})."
                 ) from None
@@ -184,12 +225,13 @@ class PaddleOCRLocalClient:
 
     @classmethod
     def _validate_model_dir(cls, model_dir: Path) -> None:
-        if not model_dir.is_dir() or any(not (model_dir / name).is_file() for name in cls._model_files):
+        status = cls.model_dir_status(model_dir)
+        if not status["directory_exists"] or not status["inference.yml"] or not status["inference.pdiparams"]:
             raise OCRServiceUnavailable(
                 "Local PaddleOCR model files are missing. Configure "
                 "OCR_PADDLE_DETECTION_MODEL_DIR and OCR_PADDLE_RECOGNITION_MODEL_DIR."
             )
-        if not any((model_dir / name).is_file() for name in ("inference.json", "inference.pdmodel")):
+        if not status["inference_config_exists"]:
             raise OCRServiceUnavailable(
                 "Local PaddleOCR model files are incomplete. Configure valid local inference model directories."
             )

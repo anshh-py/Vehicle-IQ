@@ -20,6 +20,7 @@ from app.core.config import settings, validate_production_settings
 from app.core.observability import RequestObservabilityMiddleware
 from app.core.security import ApiSecurityMiddleware
 from app.db.session import get_db
+from app.ocr.client import PaddleOCRLocalClient
 
 validate_production_settings(settings)
 logger = logging.getLogger(__name__)
@@ -29,6 +30,18 @@ app = FastAPI(
     description="AI-powered used-car assessment for Indian vehicles.",
     version="0.1.0",
 )
+
+
+@app.on_event("startup")
+def log_local_ocr_model_assets() -> None:
+    """Report local model files without initializing Paddle or downloading weights."""
+    if settings.ocr_service_provider in {"paddleocr_local", "hybrid"}:
+        PaddleOCRLocalClient.log_model_asset_status(
+            settings.ocr_paddle_detection_model_dir,
+            settings.ocr_paddle_recognition_model_dir,
+        )
+
+
 app.add_middleware(ApiSecurityMiddleware)
 app.add_middleware(RequestObservabilityMiddleware)
 
