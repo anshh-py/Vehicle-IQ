@@ -2,8 +2,10 @@ from collections.abc import Generator
 from datetime import date
 from decimal import Decimal
 from io import BytesIO
+import json
 from uuid import UUID
 
+import httpx
 from fastapi.testclient import TestClient
 from PIL import Image
 import pytest
@@ -21,7 +23,7 @@ from app.db.session import get_db
 from app.damage.inference import DamageDetection, DamageInferenceResult
 from app.damage.worker import DamageWorkerUnavailable
 from app.main import app
-from app.ocr.client import OCRRecognition, OCRServiceUnavailable
+from app.ocr.client import HuggingFaceGradioOCRClient, OCRRecognition, OCRServiceUnavailable
 from app.pricing.provider import get_price_provider
 from app.schemas.pricing import PricePrediction
 from app.schemas.vehicle_lookup import VehicleRegistrationDetails
@@ -245,6 +247,66 @@ def _create_workflow_assessment_with_images(
         assert uploaded.status_code == 201
         image_ids.append(uploaded.json()["id"])
     return assessment_id, image_ids
+
+
+def test_workflow_runs_gradio_ocr_from_uploaded_image_storage(workflow_client, monkeypatch):
+    client = workflow_client
+    monkeypatch.setattr("app.api.v1.workflow.settings.vehicle_lookup_enabled", False)
+    assessment_id, image_ids = _create_workflow_assessment_with_images(client)
+    seen_paths = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen_paths.append(request.url.path)
+        if request.url.path == "/gradio_api/upload":
+            body = request.read()
+            assert request.method == "POST"
+            assert b'name="files"' in body
+            assert b"image/png" in body
+            assert b"\x89PNG\r\n\x1a\n" in body
+            return httpx.Response(200, json=["/tmp/gradio/workflow-image.png"])
+        if request.url.path == "/gradio_api/call/v2/run_ocr":
+            assert request.method == "POST"
+            payload = json.loads(request.read())
+            assert payload == {
+                "image_path": {
+                    "path": "/tmp/gradio/workflow-image.png",
+                    "meta": {"_type": "gradio.FileData"},
+                },
+                "mode": "gundam",
+                "prompt": "",
+            }
+            return httpx.Response(200, json={"event_id": "workflow-event"})
+        if request.url.path == "/gradio_api/call/run_ocr/workflow-event":
+            return httpx.Response(
+                200,
+                text='event: complete\ndata: [{"text":"RJ45CA1879","done":true}]\n\n',
+                headers={"content-type": "text/event-stream"},
+            )
+        raise AssertionError(f"Unexpected Gradio request: {request.method} {request.url.path}")
+
+    app.dependency_overrides[get_ocr_client] = lambda: HuggingFaceGradioOCRClient(
+        "https://baidu-unlimited-ocr.hf.space",
+        transport=httpx.MockTransport(handler),
+    )
+
+    response = client.post(
+        f"/api/v1/assessments/{assessment_id}/workflow",
+        json={"image_ids": image_ids},
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["stages"]["ocr"]["status"] == "available"
+    assert body["stages"]["ocr"]["result"][0]["provider"] == "huggingface_gradio"
+    assert body["stages"]["ocr"]["result"][0]["text"] == "RJ45CA1879"
+    report = body["stages"]["report"]["result"]["report_data"]
+    assert report["stages"]["ocr"]["status"] == "available"
+    assert report["ocr_results"][0]["status"] == "completed"
+    assert seen_paths == [
+        "/gradio_api/upload",
+        "/gradio_api/call/v2/run_ocr",
+        "/gradio_api/call/run_ocr/workflow-event",
+    ]
 
 
 def test_manual_registration_skips_ocr_and_looks_up_normalized_input(
@@ -713,6 +775,10 @@ def test_workflow_endpoint_preserves_successful_stages_when_one_ocr_fails(workfl
     assert body["stages"]["damage_detection"]["status"] == "completed_with_findings"
     assert body["stages"]["pricing"]["status"] == "available"
     assert body["stages"]["report"]["status"] == "available"
+    report_data = body["stages"]["report"]["result"]["report_data"]
+    assert report_data["stages"]["ocr"]["status"] == "partial"
+    assert report_data["stages"]["ocr"]["result_count"] == 1
+    assert {item["status"] for item in report_data["ocr_results"]} == {"completed", "unavailable"}
 
 
 def test_workflow_endpoint_marks_unconfigured_providers_unavailable(workflow_client):

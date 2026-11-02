@@ -247,7 +247,7 @@ class HuggingFaceGradioOCRClient:
     """HTTP adapter for the public Baidu Gradio Space's queued OCR API."""
 
     provider_name = "huggingface_gradio"
-    PROMPT = "document parsing."
+    PROMPT = ""
 
     def __init__(
         self,

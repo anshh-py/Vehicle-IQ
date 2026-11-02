@@ -43,7 +43,7 @@ def test_public_space_upload_queue_and_sse_result_flow():
                     "meta": {"_type": "gradio.FileData"},
                 },
                 "mode": "gundam",
-                "prompt": HuggingFaceGradioOCRClient.PROMPT,
+                "prompt": "",
             }
             return httpx.Response(200, json={"event_id": "event-123"})
         if request.url.path == "/gradio_api/call/run_ocr/event-123":
@@ -58,6 +58,31 @@ def test_public_space_upload_queue_and_sse_result_flow():
     assert client.provider_name == "huggingface_gradio"
     assert len(seen) == 3
     assert all(request.url.host == "baidu-unlimited-ocr.hf.space" for request in seen)
+
+
+def test_gradio_space_environment_settings_are_canonical(monkeypatch):
+    from app.core.config import Settings
+
+    monkeypatch.delenv("OCR_SERVICE_PROVIDER", raising=False)
+    monkeypatch.delenv("OCR_GRADIO_SPACE_URL", raising=False)
+    monkeypatch.delenv("OCR_TIMEOUT_SECONDS", raising=False)
+    defaults = Settings(
+        _env_file=None,
+        database_url="postgresql+psycopg://user:pass@localhost/vehicle_iq",
+    )
+    assert defaults.ocr_service_provider == "huggingface_gradio"
+    assert defaults.ocr_gradio_space_url == BASE_URL
+
+    monkeypatch.setenv("OCR_SERVICE_PROVIDER", "huggingface_gradio")
+    monkeypatch.setenv("OCR_GRADIO_SPACE_URL", BASE_URL)
+    config = Settings(
+        _env_file=None,
+        database_url="postgresql+psycopg://user:pass@localhost/vehicle_iq",
+    )
+
+    assert config.ocr_service_provider == "huggingface_gradio"
+    assert config.ocr_gradio_space_url == BASE_URL
+    assert config.ocr_timeout_seconds == 600
 
 
 @pytest.mark.parametrize("upload_payload", [[], [""], [None], {"path": "/tmp/image.png"}, ["a", "b"]])
@@ -110,6 +135,19 @@ def test_public_space_maps_network_failure_without_transport_details():
     with pytest.raises(OCRServiceUnavailable) as error:
         client.recognize(b"image", "image.png", "image/png")
     assert "private network detail" not in str(error.value)
+
+
+def test_public_space_read_timeout_is_mapped_to_unavailable():
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/gradio_api/upload":
+            return httpx.Response(200, json=["/tmp/image.png"])
+        if request.url.path == "/gradio_api/call/v2/run_ocr":
+            return httpx.Response(200, json={"event_id": "queued-job"})
+        raise httpx.ReadTimeout("space worker is still queued", request=request)
+
+    client = HuggingFaceGradioOCRClient(BASE_URL, transport=httpx.MockTransport(handler))
+    with pytest.raises(OCRServiceUnavailable, match="timed out"):
+        client.recognize(b"image", "image.png", "image/png")
 
 
 @pytest.mark.parametrize(
@@ -259,12 +297,14 @@ def test_provider_selection_defaults_and_keeps_local_baidu_provider(monkeypatch)
             ocr_service_url=None,
             ocr_gradio_space_url=BASE_URL,
             ocr_gradio_mode="base",
+            ocr_timeout_seconds=600,
         ),
     )
     public_client = ocr_api.get_ocr_client()
     assert isinstance(public_client, HuggingFaceGradioOCRClient)
     assert public_client.base_url == f"{BASE_URL}/"
     assert public_client.mode == "base"
+    assert public_client.timeout.read == 600
 
     monkeypatch.setattr(
         ocr_api,

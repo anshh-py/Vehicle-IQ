@@ -29,6 +29,35 @@ router = APIRouter(prefix="/api/v1/assessments", tags=["assessment OCR"])
 logger = logging.getLogger(__name__)
 
 
+def _persist_ocr_attempt_status(
+    db: Session,
+    assessment_id: UUID,
+    image_id: UUID,
+    provider: str | None,
+    status: str,
+    error_code: str,
+) -> None:
+    """Store per-image OCR attempt state using the existing OCRResult table."""
+    try:
+        db.add(
+            OCRResult(
+                assessment_id=assessment_id,
+                image_id=image_id,
+                result_type="image_ocr",
+                status=status,
+                provider=provider,
+                result_data={"error_code": error_code},
+            )
+        )
+        db.commit()
+    except SQLAlchemyError as exc:
+        db.rollback()
+        logger.warning(
+            "OCR attempt status could not be persisted (exception_class=%s).",
+            type(exc).__name__,
+        )
+
+
 def get_ocr_client() -> OCRClient | None:
     if settings.ocr_service_provider == "paddleocr_local":
         return PaddleOCRLocalClient(
@@ -39,6 +68,7 @@ def get_ocr_client() -> OCRClient | None:
         return HuggingFaceGradioOCRClient(
             settings.ocr_gradio_space_url,
             mode=settings.ocr_gradio_mode,
+            read_timeout_seconds=settings.ocr_timeout_seconds,
         )
     if not settings.ocr_service_url:
         return None
@@ -74,6 +104,7 @@ def recognize_assessment_image(
     if image is None:
         raise HTTPException(status_code=404, detail="Image not found for assessment.")
     if client is None:
+        _persist_ocr_attempt_status(db, assessment_id, image_id, None, "unavailable", "provider_unconfigured")
         raise HTTPException(status_code=503, detail="OCR service is not configured.")
 
     try:
@@ -86,6 +117,9 @@ def recognize_assessment_image(
     try:
         inspect_image(content)
     except InvalidImageError:
+        _persist_ocr_attempt_status(
+            db, assessment_id, image_id, client.provider_name, "failed", "invalid_stored_image"
+        )
         raise HTTPException(status_code=422, detail="Stored image is corrupt or unsupported.") from None
 
     try:
@@ -96,17 +130,32 @@ def recognize_assessment_image(
             filename = f"{original_name or 'image'}.png"
         result = client.recognize(ocr_content, filename, "image/png")
     except ValueError:
+        _persist_ocr_attempt_status(
+            db, assessment_id, image_id, client.provider_name, "failed", "image_preprocessing_failed"
+        )
         raise HTTPException(status_code=422, detail="Stored image could not be prepared for OCR.") from None
     except OCRServiceUnavailable as exc:
+        _persist_ocr_attempt_status(
+            db, assessment_id, image_id, client.provider_name, "unavailable", "provider_unavailable"
+        )
         if isinstance(client, PaddleOCRLocalClient):
             logger.warning("Local PaddleOCR unavailable: %s", exc)
             raise HTTPException(status_code=503, detail=str(exc)) from None
         raise HTTPException(status_code=503, detail="OCR service is unavailable.") from None
     except OCRInvalidResponse:
+        _persist_ocr_attempt_status(
+            db, assessment_id, image_id, client.provider_name, "failed", "invalid_provider_response"
+        )
         raise HTTPException(status_code=502, detail="OCR service returned an invalid response.") from None
     except OCRUnreadableText:
+        _persist_ocr_attempt_status(
+            db, assessment_id, image_id, client.provider_name, "unreadable", "no_readable_text"
+        )
         raise HTTPException(status_code=422, detail="No readable text was found in the image.") from None
     except OCRInferenceFailed as exc:
+        _persist_ocr_attempt_status(
+            db, assessment_id, image_id, client.provider_name, "failed", "inference_failed"
+        )
         detail = str(exc).strip() or "OCR inference failed. The OCR service returned no error details."
         logger.warning("OCR inference failed: %s", detail)
         raise HTTPException(status_code=502, detail=detail) from None

@@ -652,14 +652,27 @@ def _build_report_data(
     vehicle_lookup_workflow_state: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     image_ids = {image.id for image in images}
+    latest_ocr_by_image: dict[UUID, OCRResult] = {}
+    for result in sorted(
+        (item for item in ocr_results if item.result_type == "image_ocr"),
+        key=lambda item: (item.created_at or datetime.min.replace(tzinfo=timezone.utc), str(item.id)),
+    ):
+        if result.image_id is not None and result.image_id in image_ids:
+            latest_ocr_by_image[result.image_id] = result
     completed_ocr_image_ids = {
-        result.image_id
-        for result in ocr_results
-        if result.result_type == "image_ocr"
-        and result.status == "completed"
-        and result.image_id is not None
-        and result.image_id in image_ids
+        image_id for image_id, result in latest_ocr_by_image.items() if result.status == "completed"
     }
+    latest_ocr_statuses = {result.status for result in latest_ocr_by_image.values()}
+
+    def no_success_ocr_status() -> str:
+        if "failed" in latest_ocr_statuses:
+            return "failed"
+        if latest_ocr_statuses and latest_ocr_statuses <= {"unavailable"}:
+            return "unavailable"
+        if latest_ocr_statuses:
+            return "unavailable"
+        return "pending" if image_ids else "unavailable"
+
     if image_ids:
         completed_ocr_count = len(completed_ocr_image_ids)
         if completed_ocr_count == len(image_ids):
@@ -667,13 +680,11 @@ def _build_report_data(
         elif completed_ocr_count:
             ocr_status = "partial"
         else:
-            ocr_status = "pending"
+            ocr_status = no_success_ocr_status()
     elif any(result.result_type == "image_ocr" and result.status == "completed" for result in ocr_results):
         ocr_status = "available"
-    elif any(result.result_type == "image_ocr" for result in ocr_results):
-        ocr_status = "pending"
     else:
-        ocr_status = "unavailable"
+        ocr_status = no_success_ocr_status()
 
     findings_by_image: dict[UUID, int] = {}
     for finding in damage_findings:
@@ -740,14 +751,15 @@ def _build_report_data(
         damage_status = "unavailable"
 
     report_ocr_results = []
-    seen_ocr_image_ids = set()
-    for result in sorted(ocr_results, key=lambda item: (item.created_at or datetime.min.replace(tzinfo=timezone.utc), str(item.id))):
-        if result.result_type != "image_ocr":
-            continue
-        if result.image_id is not None and result.image_id in image_ids:
-            if result.image_id in seen_ocr_image_ids:
-                continue
-            seen_ocr_image_ids.add(result.image_id)
+    selected_ocr_results = list(latest_ocr_by_image.values())
+    selected_ocr_results.extend(
+        result for result in ocr_results
+        if result.result_type == "image_ocr" and result.image_id is None
+    )
+    for result in sorted(
+        selected_ocr_results,
+        key=lambda item: (item.created_at or datetime.min.replace(tzinfo=timezone.utc), str(item.id)),
+    ):
         report_ocr_results.append({
             "id": str(result.id),
             "image_id": str(result.image_id) if result.image_id else None,
@@ -874,7 +886,7 @@ def _build_report_data(
         "stages": {
             "ocr": {
                 "status": ocr_status,
-                "result_count": sum(result.result_type == "image_ocr" for result in ocr_results),
+                "result_count": sum(result.status == "completed" for result in latest_ocr_by_image.values()),
                 "completed_image_count": len(completed_ocr_image_ids),
             },
             "damage_detection": {

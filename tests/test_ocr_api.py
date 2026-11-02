@@ -230,7 +230,7 @@ def test_public_provider_name_is_returned_and_persisted(ocr_api):
         assert record.provider == "huggingface_gradio"
 
 
-def test_public_no_text_output_does_not_complete_or_persist_ocr(ocr_api):
+def test_public_no_text_output_is_persisted_as_unreadable_not_completed(ocr_api):
     client, assessment_id, image_id, _storage, engine, _fake = ocr_api
     output = json.dumps(
         [
@@ -264,19 +264,29 @@ def test_public_no_text_output_does_not_complete_or_persist_ocr(ocr_api):
 
     assert response.status_code == 422
     assert response.json()["detail"] == "No readable text was found in the image."
-    assert count_ocr_results(engine) == 0
+    with Session(engine) as session:
+        record = session.scalar(select(OCRResult))
+        assert record is not None
+        assert record.status == "unreadable"
+        assert record.raw_text is None
+
+    report_response = client.post(f"/api/v1/assessments/{assessment_id}/report")
+    assert report_response.status_code == 200
+    report = report_response.json()["report_data"]
+    assert report["stages"]["ocr"]["status"] == "unavailable"
+    assert report["ocr_results"][0]["status"] == "unreadable"
 
 
 @pytest.mark.parametrize(
-    ("error", "status_code", "detail"),
+    ("error", "status_code", "detail", "expected_status"),
     [
-        (OCRServiceUnavailable(), 503, "OCR service is unavailable."),
-        (OCRInvalidResponse(), 502, "OCR service returned an invalid response."),
-        (OCRInferenceFailed(), 502, "OCR inference failed. The OCR service returned no error details."),
-        (OCRUnreadableText(), 422, "No readable text was found in the image."),
+        (OCRServiceUnavailable(), 503, "OCR service is unavailable.", "unavailable"),
+        (OCRInvalidResponse(), 502, "OCR service returned an invalid response.", "failed"),
+        (OCRInferenceFailed(), 502, "OCR inference failed. The OCR service returned no error details.", "failed"),
+        (OCRUnreadableText(), 422, "No readable text was found in the image.", "unreadable"),
     ],
 )
-def test_ocr_service_failures_are_safe_and_not_persisted(ocr_api, error, status_code, detail):
+def test_ocr_service_failures_are_safe_and_persist_noncompleted_status(ocr_api, error, status_code, detail, expected_status):
     client, assessment_id, image_id, _storage, engine, fake = ocr_api
     fake.error = error
 
@@ -284,7 +294,11 @@ def test_ocr_service_failures_are_safe_and_not_persisted(ocr_api, error, status_
 
     assert response.status_code == status_code
     assert response.json()["detail"] == detail
-    assert count_ocr_results(engine) == 0
+    with Session(engine) as session:
+        record = session.scalar(select(OCRResult))
+        assert record is not None
+        assert record.status == expected_status
+        assert record.raw_text is None
 
 
 def test_ocr_inference_failure_detail_is_logged_and_returned_safely(ocr_api, caplog):
@@ -296,7 +310,8 @@ def test_ocr_inference_failure_detail_is_logged_and_returned_safely(ocr_api, cap
     assert response.status_code == 502
     assert response.json()["detail"] == str(fake.error)
     assert "CUDA worker is unavailable" in caplog.text
-    assert count_ocr_results(engine) == 0
+    with Session(engine) as session:
+        assert session.scalar(select(OCRResult)).status == "failed"
 
 
 def test_ocr_returns_404_for_missing_assessment_or_unrelated_image(ocr_api):
@@ -335,6 +350,8 @@ def test_ocr_returns_safe_unavailable_error_when_service_url_is_not_configured(o
     assert response.status_code == 503
     assert response.json()["detail"] == "OCR service is not configured."
     assert fake.calls == []
+    with Session(_engine) as session:
+        assert session.scalar(select(OCRResult)).status == "unavailable"
 
 
 def test_ocr_rejects_corrupt_stored_image_before_calling_service(ocr_api):
@@ -350,4 +367,5 @@ def test_ocr_rejects_corrupt_stored_image_before_calling_service(ocr_api):
     assert response.status_code == 422
     assert response.json()["detail"] == "Stored image is corrupt or unsupported."
     assert fake.calls == []
-    assert count_ocr_results(engine) == 0
+    with Session(engine) as session:
+        assert session.scalar(select(OCRResult)).status == "failed"
