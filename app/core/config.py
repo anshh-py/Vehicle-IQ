@@ -71,9 +71,7 @@ class Settings(BaseSettings):
     market_listings_source_path: Path | None = None
     market_listings_source_format: str | None = None
     llm_enabled: bool = False
-    price_model_path: Path = Path(
-        r"C:\Users\ansha\vehicle-iq-model-research\artifacts\vehicle_iq_price_model.joblib"
-    )
+    price_model_path: Path = PROJECT_ROOT / "models" / "vehicle_iq_price_model.joblib"
 
     model_config = SettingsConfigDict(
         env_file=PROJECT_ROOT / ".env",

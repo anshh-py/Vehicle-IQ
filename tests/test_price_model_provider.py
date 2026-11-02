@@ -2,7 +2,7 @@ from datetime import date
 from math import log1p
 import pytest
 
-from app.core.config import settings
+from app.core.config import PROJECT_ROOT, Settings, settings
 from app.pricing.provider import PipelinePriceProvider, PriceProviderError
 from app.schemas.pricing import VehiclePriceInput
 
@@ -103,12 +103,27 @@ def test_brand_normalization_matches_training_vocabulary():
     assert _normalize_brand("Toyota") == "Toyota"
 
 
+def test_default_model_path_is_repository_artifact(monkeypatch):
+    monkeypatch.delenv("PRICE_MODEL_PATH", raising=False)
+    config = Settings(_env_file=None, database_url="postgresql+psycopg://user:pass@localhost/db")
+
+    assert config.price_model_path == PROJECT_ROOT / "models" / "vehicle_iq_price_model.joblib"
+
+
+def test_relative_model_path_override_resolves_from_repository(monkeypatch):
+    monkeypatch.setenv("PRICE_MODEL_PATH", "models/custom-price-model.joblib")
+    config = Settings(_env_file=None, database_url="postgresql+psycopg://user:pass@localhost/db")
+
+    assert config.price_model_path == PROJECT_ROOT / "models" / "custom-price-model.joblib"
+
+
 def test_real_model_produces_genuine_estimate(vehicle):
     """End-to-end inference against the trained artifact, not a mock.
 
     Verifies the configured artifact loads and returns a finite, positive
     INR estimate. This does not claim the estimate is market-accurate.
     """
+    assert settings.price_model_path.is_file()
     provider = PipelinePriceProvider(settings.price_model_path)
     prediction = provider.predict(vehicle)
 

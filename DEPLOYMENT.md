@@ -75,6 +75,22 @@ After configuration and the migration release step, start the ASGI app with:
   unavailable, but does not verify schema/migration currency.
 - `/api/v1/*` requires the configured bearer token in production.
 
+### Render native Python service
+
+The repository root `.python-version` pins the Render runtime to Python 3.13.16.
+Configure the Render service with the repository root as its root directory and
+these commands:
+
+- Build: `pip install -r requirements.txt`
+- Start: `uvicorn app.main:app --host 0.0.0.0 --port $PORT`
+
+Render supplies `PORT`; do not hardcode the local development port in its start
+command. Set the production variables listed above in the Render environment.
+The tracked `models/vehicle_iq_price_model.joblib` is loaded lazily through
+`PRICE_MODEL_PATH`, which defaults to that repository-relative artifact. An
+optional override can point to another mounted artifact. The estimate remains
+research-only and is not a verified market valuation.
+
 The in-process rate limiter is per worker and can be bypassed across multiple
 workers. Public deployments should also apply rate limiting at a trusted reverse
 proxy/API gateway. TLS termination, persistent-volume behavior, secret-manager
