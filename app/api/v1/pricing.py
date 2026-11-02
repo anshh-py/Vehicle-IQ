@@ -138,7 +138,8 @@ def _latest_saved_vehicle_lookup(
         if not isinstance(row.result_data, dict):
             continue
         try:
-            return VehicleRegistrationDetails.model_validate(row.result_data)
+            details = {key: value for key, value in row.result_data.items() if key != "source"}
+            return VehicleRegistrationDetails.model_validate(details)
         except ValidationError:
             continue
     return None
