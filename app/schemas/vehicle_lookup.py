@@ -1,7 +1,20 @@
 from datetime import date, datetime
+from typing import Literal
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, computed_field
+
+
+class ManualRegistrationRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    registration_number: str = Field(min_length=1, max_length=32)
+
+
+class ManualRegistrationResponse(BaseModel):
+    assessment_id: UUID
+    registration_number: str
+    source: Literal["manual"] = "manual"
 
 
 class VehicleRegistrationDetails(BaseModel):

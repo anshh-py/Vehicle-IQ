@@ -440,6 +440,123 @@ def test_invalid_manual_registration_returns_validation_error_without_ocr_fallba
     assert lookup.calls == 0
 
 
+def test_manual_registration_fallback_continues_after_unreadable_ocr_and_persists_one_report(
+    workflow_client, monkeypatch
+):
+    client = workflow_client
+    monkeypatch.setattr("app.api.v1.workflow.settings.vehicle_lookup_enabled", True)
+    assessment_id, image_ids = _create_workflow_assessment_with_images(client)
+
+    class NoPlateOCR:
+        provider_name = "mock_ocr"
+
+        def recognize(self, *_args):
+            return OCRRecognition("No readable plate text")
+
+    class CountingLookup(FakeVehicleDetails):
+        def __init__(self):
+            self.calls = []
+
+        def lookup(self, registration_number):
+            self.calls.append(registration_number)
+            return super().lookup(registration_number)
+
+    lookup = CountingLookup()
+    app.dependency_overrides[get_ocr_client] = lambda: NoPlateOCR()
+    app.dependency_overrides[get_vehicle_registration_provider] = lambda: lookup
+
+    first = client.post(
+        f"/api/v1/assessments/{assessment_id}/workflow",
+        json={"image_ids": image_ids},
+    )
+    assert first.status_code == 200
+    assert first.json()["stages"]["ocr"]["status"] == "available"
+    assert first.json()["stages"]["vehicle_details_lookup"]["errors"][0]["code"] in {
+        "registration_not_found",
+        "registration_needs_review",
+    }
+
+    saved = client.post(
+        f"/api/v1/assessments/{assessment_id}/registration-number",
+        json={"registration_number": " rj45 ca1879 "},
+    )
+    assert saved.status_code == 200
+    assert saved.json()["source"] == "manual"
+
+    continued = client.post(
+        f"/api/v1/assessments/{assessment_id}/workflow",
+        json={"image_ids": image_ids},
+    )
+    assert continued.status_code == 200
+    stages = continued.json()["stages"]
+    assert stages["ocr"]["status"] == "skipped"
+    assert stages["vehicle_details_lookup"]["status"] == "available"
+    assert stages["report"]["status"] == "available"
+    assert lookup.calls == ["RJ45CA1879"]
+    original_report_id = stages["report"]["result"]["id"]
+
+    assert client.post(
+        f"/api/v1/assessments/{assessment_id}/registration-number",
+        json={"registration_number": "RJ45CA1879"},
+    ).status_code == 200
+    repeated = client.post(
+        f"/api/v1/assessments/{assessment_id}/workflow",
+        json={"image_ids": image_ids},
+    )
+    assert repeated.status_code == 200
+    assert lookup.calls == ["RJ45CA1879"]
+    assert repeated.json()["stages"]["report"]["result"]["id"] == original_report_id
+
+    report = client.get(f"/api/v1/assessments/{assessment_id}/report").json()["report_data"]
+    assert report["assessment"]["registration_number"] == "RJ45CA1879"
+    assert report["assessment"]["registration_number_source"] == "manual"
+    assert len(report["ocr_results"]) == 1
+    assert len(report["registration_lookup_results"]) == 1
+    assert report["registration_lookup_results"][0]["source"] == "manual"
+
+
+def test_manual_registration_lookup_failure_still_generates_report(
+    workflow_client, monkeypatch
+):
+    client = workflow_client
+    monkeypatch.setattr("app.api.v1.workflow.settings.vehicle_lookup_enabled", True)
+    assessment_id, image_ids = _create_workflow_assessment_with_images(client)
+
+    class NoPlateOCR:
+        provider_name = "mock_ocr"
+
+        def recognize(self, *_args):
+            return OCRRecognition("No plate")
+
+    class FailedLookup:
+        provider_name = "failed_lookup"
+
+        def lookup(self, _registration_number):
+            raise VehicleLookupUnavailable("mock provider outage")
+
+    app.dependency_overrides[get_ocr_client] = lambda: NoPlateOCR()
+    app.dependency_overrides[get_vehicle_registration_provider] = lambda: FailedLookup()
+    first = client.post(
+        f"/api/v1/assessments/{assessment_id}/workflow", json={"image_ids": image_ids}
+    )
+    assert first.status_code == 200
+    assert client.post(
+        f"/api/v1/assessments/{assessment_id}/registration-number",
+        json={"registration_number": "RJ45CA1879"},
+    ).status_code == 200
+
+    continued = client.post(
+        f"/api/v1/assessments/{assessment_id}/workflow", json={"image_ids": image_ids}
+    )
+    assert continued.status_code == 200
+    stages = continued.json()["stages"]
+    assert stages["vehicle_details_lookup"]["status"] == "unavailable"
+    assert stages["report"]["status"] == "available"
+    report = client.get(f"/api/v1/assessments/{assessment_id}/report").json()["report_data"]
+    assert report["assessment"]["registration_number_source"] == "manual"
+    assert report["vehicle_details_lookup"]["error_code"] == "provider_unavailable"
+
+
 def test_low_confidence_registration_requires_manual_correction_before_lookup(
     workflow_client, monkeypatch
 ):

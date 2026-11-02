@@ -164,6 +164,7 @@ def _vehicle_details_lookup(results: list[OCRResult]) -> dict[str, Any]:
         "status": result_status,
         "result_count": len(matches),
         "provider": latest.provider,
+        "source": source.get("source") or ("ocr" if latest.image_id is not None else None),
         "details": details or None,
         "field_provenance": {
             key: "vehicle_api"
@@ -785,12 +786,13 @@ def _build_report_data(
     )
     assessment_details = dict(stored_vehicle_details)
     assessment_details.pop("asking_price_inr", None)
+    registration_number_source = assessment_details.pop("registration_number_source", None) or vehicle_lookup.get("source")
     assessment_details.update(lookup_details)
     assessment_details.pop("asking_price_inr", None)
     vehicle_details_provenance = {
         key: "user_input"
         for key, value in stored_vehicle_details.items()
-        if value is not None and key != "asking_price_inr"
+        if value is not None and key not in {"asking_price_inr", "registration_number_source"}
     }
     vehicle_details_provenance.update(
         vehicle_lookup.get("field_provenance", {})
@@ -857,6 +859,7 @@ def _build_report_data(
             "status": assessment.status,
             "vin": assessment.vin,
             "registration_number": assessment.registration_number or lookup_details.get("registration_number"),
+            "registration_number_source": registration_number_source,
             "vehicle_details": assessment_details,
             "vehicle_details_provenance": vehicle_details_provenance,
             "asking_price_inr": (
@@ -934,6 +937,7 @@ def _build_report_data(
                 "image_id": str(result.image_id) if result.image_id else None,
                 "status": result.status,
                 "provider": result.provider,
+                "source": (result.result_data or {}).get("source"),
                 "details": {
                     key: value
                     for key, value in (result.result_data or {}).items()

@@ -8,8 +8,13 @@ from sqlalchemy.orm import Session
 
 from app.db.models import OCRResult, UploadedImage, VehicleAssessment
 from app.db.session import get_db
-from app.ocr.registration import normalize_registration_candidate
-from app.schemas.vehicle_lookup import VehicleRegistrationDetails, VehicleRegistrationLookupResponse
+from app.ocr.registration import build_registration_ocr_assessment, normalize_registration_candidate
+from app.schemas.vehicle_lookup import (
+    ManualRegistrationRequest,
+    ManualRegistrationResponse,
+    VehicleRegistrationDetails,
+    VehicleRegistrationLookupResponse,
+)
 from app.schemas.vehicle_services import (
     ChallanDetails,
     ChallanServiceResult,
@@ -56,6 +61,74 @@ def normalize_manual_registration(text: str | None) -> str:
     return normalized
 
 
+@router.post(
+    "/{assessment_id}/registration-number",
+    response_model=ManualRegistrationResponse,
+    responses={404: {"description": "Assessment not found."}, 409: {"description": "A valid OCR registration is already available."}},
+)
+def save_manual_registration(
+    assessment_id: UUID,
+    payload: ManualRegistrationRequest,
+    db: Session = Depends(get_db),
+) -> ManualRegistrationResponse:
+    registration_number = normalize_manual_registration(payload.registration_number)
+    try:
+        assessment = db.scalars(
+            select(VehicleAssessment)
+            .where(VehicleAssessment.id == assessment_id)
+            .with_for_update()
+        ).one_or_none()
+        if assessment is None:
+            raise HTTPException(status_code=404, detail="Assessment not found.")
+        ocr_rows = list(db.scalars(
+            select(OCRResult).where(
+                OCRResult.assessment_id == assessment_id,
+                OCRResult.result_type == "image_ocr",
+            )
+        ).all())
+    except HTTPException:
+        db.rollback()
+        raise
+    except SQLAlchemyError:
+        db.rollback()
+        raise HTTPException(status_code=500, detail="Unable to save registration number.") from None
+
+    ocr_assessment = build_registration_ocr_assessment([
+        {
+            "image_id": str(row.image_id) if row.image_id else None,
+            "text": row.raw_text,
+            "confidence": (row.result_data or {}).get("confidence"),
+            "status": row.status,
+        }
+        for row in ocr_rows
+    ])
+    if ocr_assessment["status"] == "candidate":
+        db.rollback()
+        raise HTTPException(
+            status_code=409,
+            detail="A valid registration number was already extracted from the photos.",
+        )
+
+    existing = normalize_manual_registration(assessment.registration_number) if assessment.registration_number else None
+    if existing is not None and existing != registration_number:
+        db.rollback()
+        raise HTTPException(status_code=409, detail="A registration number is already saved for this assessment.")
+
+    details = dict(assessment.vehicle_details or {})
+    details["registration_number_source"] = "manual"
+    assessment.registration_number = registration_number
+    assessment.vehicle_details = details
+    try:
+        db.commit()
+    except SQLAlchemyError:
+        db.rollback()
+        raise HTTPException(status_code=500, detail="Unable to save registration number.") from None
+    return ManualRegistrationResponse(
+        assessment_id=assessment_id,
+        registration_number=registration_number,
+    )
+
+
 def lookup_registration_from_manual(
     assessment_id: UUID,
     registration_number: str,
@@ -98,7 +171,7 @@ def lookup_registration_from_manual(
         status="completed",
         provider=provider.provider_name,
         raw_text=registration_number,
-        result_data=details.model_dump(mode="json"),
+        result_data={**details.model_dump(mode="json"), "source": "manual"},
     )
     try:
         db.add(record)
@@ -181,7 +254,7 @@ def lookup_registration_from_ocr(
         status="completed",
         provider=provider.provider_name,
         raw_text=registration_number,
-        result_data=details.model_dump(mode="json"),
+        result_data={**details.model_dump(mode="json"), "source": "ocr"},
     )
     try:
         db.add(record)
