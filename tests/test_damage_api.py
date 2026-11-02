@@ -17,7 +17,6 @@ from app.db.models import DamageFinding, EvidenceRecord, UploadedImage, VehicleA
 from app.db.session import get_db
 from app.main import app
 from app.api.v1.damage import get_damage_provider
-from app.storage.images import LocalImageStorage, get_image_storage
 
 
 def png_bytes() -> bytes:
@@ -61,13 +60,12 @@ class SequenceDamageProvider(FakeDamageProvider):
 
 
 class DamageAPIFixture:
-    def __init__(self, client, engine, assessment_id, image_id, provider, storage, content):
+    def __init__(self, client, engine, assessment_id, image_id, provider, content):
         self.client = client
         self.engine = engine
         self.assessment_id = assessment_id
         self.image_id = image_id
         self.provider = provider
-        self.storage = storage
         self.content = content
 
 
@@ -84,18 +82,17 @@ def damage_api(tmp_path, *, content=None, provider=None) -> Generator[DamageAPIF
         dbapi_connection.execute("PRAGMA foreign_keys=ON")
 
     Base.metadata.create_all(engine)
-    storage = LocalImageStorage(tmp_path / "damage-images")
     content = png_bytes() if content is None else content
-    image_key = storage.save(content, "png")
     with Session(engine) as session:
         assessment = VehicleAssessment()
         session.add(assessment)
         session.flush()
         image = UploadedImage(
             assessment_id=assessment.id,
-            storage_provider="local",
+            storage_provider="postgresql",
             storage_bucket="vehicle-images",
-            object_key=image_key,
+            object_key=uuid4().hex,
+            content=content,
             original_filename="vehicle.png",
             content_type="image/png",
             byte_size=len(content),
@@ -112,11 +109,10 @@ def damage_api(tmp_path, *, content=None, provider=None) -> Generator[DamageAPIF
             yield session
 
     app.dependency_overrides[get_db] = override_get_db
-    app.dependency_overrides[get_image_storage] = lambda: storage
     app.dependency_overrides[get_damage_provider] = lambda: fake
     try:
         with TestClient(app) as client:
-            yield DamageAPIFixture(client, engine, assessment_id, image_id, fake, storage, content)
+            yield DamageAPIFixture(client, engine, assessment_id, image_id, fake, content)
     finally:
         app.dependency_overrides.clear()
         engine.dispose()
@@ -134,13 +130,13 @@ def count_findings(engine) -> int:
 
 
 def add_stored_image(api, content: bytes) -> str:
-    object_key = api.storage.save(content, "png")
     with Session(api.engine) as session:
         image = UploadedImage(
             assessment_id=UUID(api.assessment_id),
-            storage_provider="local",
+            storage_provider="postgresql",
             storage_bucket="vehicle-images",
-            object_key=object_key,
+            object_key=uuid4().hex,
+            content=content,
             original_filename="additional-vehicle.png",
             content_type="image/png",
             byte_size=len(content),
@@ -480,7 +476,7 @@ def png_plate_bytes():
     return output.getvalue()
 
 
-def test_ineligible_plate_image_is_not_evaluated_and_provider_not_called(tmp_path):
+def test_ineligible_plate_image_is_not_evaluated_and_provider_not_called():
     engine = create_engine(
         "sqlite+pysqlite:///:memory:",
         connect_args={"check_same_thread": False},
@@ -492,18 +488,17 @@ def test_ineligible_plate_image_is_not_evaluated_and_provider_not_called(tmp_pat
         dbapi_connection.execute("PRAGMA foreign_keys=ON")
 
     Base.metadata.create_all(engine)
-    storage = LocalImageStorage(tmp_path / "damage-images")
     content = png_plate_bytes()
-    image_key = storage.save(content, "png")
     with Session(engine) as session:
         assessment = VehicleAssessment()
         session.add(assessment)
         session.flush()
         image = UploadedImage(
             assessment_id=assessment.id,
-            storage_provider="local",
+            storage_provider="postgresql",
             storage_bucket="vehicle-images",
-            object_key=image_key,
+            object_key=uuid4().hex,
+            content=content,
             original_filename="plate.png",
             content_type="image/png",
             byte_size=len(content),
@@ -520,7 +515,6 @@ def test_ineligible_plate_image_is_not_evaluated_and_provider_not_called(tmp_pat
             yield session
 
     app.dependency_overrides[get_db] = override_get_db
-    app.dependency_overrides[get_image_storage] = lambda: storage
     app.dependency_overrides[get_damage_provider] = lambda: fake
     try:
         with TestClient(app) as client:

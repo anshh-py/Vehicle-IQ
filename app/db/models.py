@@ -12,6 +12,7 @@ from sqlalchemy import (
     ForeignKey,
     Index,
     JSON,
+    LargeBinary,
     Numeric,
     String,
     Text,
@@ -79,9 +80,12 @@ class UploadedImage(Base):
     assessment_id: Mapped[UUID] = mapped_column(
         Uuid(as_uuid=True), ForeignKey("vehicle_assessments.id"), nullable=False, index=True
     )
-    storage_provider: Mapped[str] = mapped_column(String(32), nullable=False, default="s3", server_default="s3")
+    storage_provider: Mapped[str] = mapped_column(
+        String(32), nullable=False, default="postgresql", server_default="postgresql"
+    )
     storage_bucket: Mapped[str] = mapped_column(String(255), nullable=False)
     object_key: Mapped[str] = mapped_column(String(1024), nullable=False)
+    content: Mapped[bytes | None] = mapped_column(LargeBinary, deferred=True)
     original_filename: Mapped[str | None] = mapped_column(String(255))
     content_type: Mapped[str | None] = mapped_column(String(127))
     byte_size: Mapped[int | None] = mapped_column()

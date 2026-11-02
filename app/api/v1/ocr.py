@@ -22,7 +22,7 @@ from app.ocr.client import (
 )
 from app.ocr.preprocessing import preprocess_ocr_image
 from app.schemas.ocr import OCRRecognitionResponse
-from app.storage.images import ImageStorage, ImageStorageError, get_image_storage
+from app.storage.images import ImageContentUnavailable, read_image_content
 
 
 router = APIRouter(prefix="/api/v1/assessments", tags=["assessment OCR"])
@@ -54,7 +54,6 @@ def recognize_assessment_image(
     assessment_id: UUID,
     image_id: UUID,
     db: Session = Depends(get_db),
-    storage: ImageStorage = Depends(get_image_storage),
     client: OCRClient | None = Depends(get_ocr_client),
 ) -> OCRRecognitionResponse:
     try:
@@ -78,9 +77,11 @@ def recognize_assessment_image(
         raise HTTPException(status_code=503, detail="OCR service is not configured.")
 
     try:
-        content = storage.read(image.object_key)
-    except ImageStorageError:
+        content = read_image_content(image)
+    except ImageContentUnavailable:
         raise HTTPException(status_code=500, detail="Stored image is unavailable.") from None
+    except SQLAlchemyError:
+        raise HTTPException(status_code=500, detail="Unable to retrieve assessment image.") from None
 
     try:
         inspect_image(content)

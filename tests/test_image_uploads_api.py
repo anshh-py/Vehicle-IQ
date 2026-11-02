@@ -1,5 +1,6 @@
 from collections.abc import Generator
 from io import BytesIO
+from uuid import UUID, uuid4
 
 import pytest
 from fastapi.testclient import TestClient
@@ -14,7 +15,6 @@ from app.db.base import Base
 from app.db.models import UploadedImage, VehicleAssessment
 from app.db.session import get_db
 from app.main import app
-from app.storage.images import ImageStorageError, LocalImageStorage, get_image_storage
 
 
 def image_bytes(image_format: str) -> bytes:
@@ -24,7 +24,7 @@ def image_bytes(image_format: str) -> bytes:
 
 
 @pytest.fixture
-def upload_api(tmp_path) -> Generator[tuple[TestClient, str, LocalImageStorage, object], None, None]:
+def upload_api() -> Generator[tuple[TestClient, str, object], None, None]:
     engine = create_engine(
         "sqlite+pysqlite:///:memory:",
         connect_args={"check_same_thread": False},
@@ -42,33 +42,30 @@ def upload_api(tmp_path) -> Generator[tuple[TestClient, str, LocalImageStorage, 
         session.commit()
         assessment_id = str(assessment.id)
 
-    storage = LocalImageStorage(tmp_path / "image-storage")
-
     def override_get_db():
         with Session(engine) as session:
             yield session
 
     app.dependency_overrides[get_db] = override_get_db
-    app.dependency_overrides[get_image_storage] = lambda: storage
     app.dependency_overrides[get_image_upload_limit] = lambda: 10 * 1024 * 1024
     try:
         with TestClient(app) as client:
-            yield client, assessment_id, storage, engine
+            yield client, assessment_id, engine
     finally:
         app.dependency_overrides.clear()
         engine.dispose()
 
 
 @pytest.mark.parametrize(
-    ("image_format", "content_type", "extension"),
+    ("image_format", "content_type"),
     [
-        ("JPEG", "image/jpeg", ".jpg"),
-        ("PNG", "image/png", ".png"),
-        ("WEBP", "image/webp", ".webp"),
+        ("JPEG", "image/jpeg"),
+        ("PNG", "image/png"),
+        ("WEBP", "image/webp"),
     ],
 )
-def test_uploads_valid_supported_image_and_lists_metadata(upload_api, image_format, content_type, extension):
-    client, assessment_id, storage, _engine = upload_api
+def test_uploads_valid_supported_image_and_lists_metadata(upload_api, image_format, content_type):
+    client, assessment_id, engine = upload_api
     content = image_bytes(image_format)
 
     response = client.post(
@@ -84,26 +81,39 @@ def test_uploads_valid_supported_image_and_lists_metadata(upload_api, image_form
     assert metadata["original_filename"] == "user-name.txt"
     assert "object_key" not in metadata
     assert "storage_bucket" not in metadata
+    with Session(engine) as session:
+        image = session.scalar(select(UploadedImage))
+        assert image is not None
+        assert image.storage_provider == "postgresql"
+        assert image.content == content
 
-    stored_files = list(storage.root.iterdir())
-    assert len(stored_files) == 1
-    assert stored_files[0].suffix == extension
-    assert stored_files[0].read_bytes() == content
+    statements: list[str] = []
 
-    listed = client.get(f"/api/v1/assessments/{assessment_id}/images")
+    def collect_sql(_connection, _cursor, statement, _parameters, _context, _executemany):
+        statements.append(statement)
+
+    event.listen(engine, "before_cursor_execute", collect_sql)
+    try:
+        listed = client.get(f"/api/v1/assessments/{assessment_id}/images")
+    finally:
+        event.remove(engine, "before_cursor_execute", collect_sql)
     assert listed.status_code == 200
     assert listed.json() == [metadata]
+    list_query = next(sql for sql in statements if "FROM uploaded_images" in sql)
+    assert "uploaded_images.content," not in list_query
 
-    content = client.get(f"/api/v1/assessments/{assessment_id}/images/{metadata['id']}/content")
-    assert content.status_code == 200
-    assert content.content == image_bytes(image_format)
-    assert content.headers["content-type"].startswith(content_type)
-    assert content.headers["cache-control"] == "private, no-store"
-    assert content.headers["x-content-type-options"] == "nosniff"
+    downloaded = client.get(
+        f"/api/v1/assessments/{assessment_id}/images/{metadata['id']}/content"
+    )
+    assert downloaded.status_code == 200
+    assert downloaded.content == content
+    assert downloaded.headers["content-type"].startswith(content_type)
+    assert downloaded.headers["cache-control"] == "private, no-store"
+    assert downloaded.headers["x-content-type-options"] == "nosniff"
 
 
 def test_image_content_requires_matching_assessment(upload_api):
-    client, assessment_id, _storage, _engine = upload_api
+    client, assessment_id, _engine = upload_api
     upload = client.post(
         f"/api/v1/assessments/{assessment_id}/images",
         files={"file": ("photo.png", image_bytes("PNG"), "image/png")},
@@ -120,7 +130,7 @@ def test_image_content_requires_matching_assessment(upload_api):
 
 
 def test_rejects_invalid_content_even_when_headers_claim_png(upload_api):
-    client, assessment_id, storage, _engine = upload_api
+    client, assessment_id, engine = upload_api
 
     response = client.post(
         f"/api/v1/assessments/{assessment_id}/images",
@@ -128,11 +138,12 @@ def test_rejects_invalid_content_even_when_headers_claim_png(upload_api):
     )
 
     assert response.status_code == 422
-    assert not storage.root.exists()
+    with Session(engine) as session:
+        assert session.scalar(select(UploadedImage)) is None
 
 
 def test_rejects_upload_over_configured_limit(upload_api):
-    client, assessment_id, storage, _engine = upload_api
+    client, assessment_id, engine = upload_api
     app.dependency_overrides[get_image_upload_limit] = lambda: 32
 
     response = client.post(
@@ -141,11 +152,12 @@ def test_rejects_upload_over_configured_limit(upload_api):
     )
 
     assert response.status_code == 413
-    assert not storage.root.exists()
+    with Session(engine) as session:
+        assert session.scalar(select(UploadedImage)) is None
 
 
-def test_missing_assessment_does_not_store_file(upload_api):
-    client, _assessment_id, storage, _engine = upload_api
+def test_missing_assessment_does_not_store_image(upload_api):
+    client, _assessment_id, engine = upload_api
     missing_id = "00000000-0000-0000-0000-000000000001"
 
     response = client.post(
@@ -154,19 +166,20 @@ def test_missing_assessment_does_not_store_file(upload_api):
     )
 
     assert response.status_code == 404
-    assert not storage.root.exists()
+    with Session(engine) as session:
+        assert session.scalar(select(UploadedImage)) is None
 
 
 def test_listing_images_for_missing_assessment_returns_404(upload_api):
-    client, _assessment_id, _storage, _engine = upload_api
+    client, _assessment_id, _engine = upload_api
 
     response = client.get("/api/v1/assessments/00000000-0000-0000-0000-000000000001/images")
 
     assert response.status_code == 404
 
 
-def test_database_failure_removes_stored_file_and_hides_details(upload_api, monkeypatch):
-    client, assessment_id, storage, engine = upload_api
+def test_database_failure_rolls_back_image_bytes_and_hides_details(upload_api, monkeypatch):
+    client, assessment_id, engine = upload_api
 
     def fail_commit(_session):
         raise SQLAlchemyError("database private details")
@@ -180,39 +193,29 @@ def test_database_failure_removes_stored_file_and_hides_details(upload_api, monk
     assert response.status_code == 500
     assert response.json()["detail"] == "Unable to save uploaded image."
     assert "database private details" not in response.text
-    assert list(storage.root.iterdir()) == []
     with Session(engine) as session:
         assert session.scalar(select(UploadedImage)) is None
 
 
-def test_storage_failure_returns_safe_error_without_database_record(upload_api):
-    client, assessment_id, _storage, engine = upload_api
-
-    class BrokenStorage:
-        def save(self, _content: bytes, _extension: str) -> str:
-            raise ImageStorageError("private filesystem details")
-
-        def delete(self, _key: str) -> None:
-            pass
-
-    app.dependency_overrides[get_image_storage] = BrokenStorage
-    response = client.post(
-        f"/api/v1/assessments/{assessment_id}/images",
-        files={"file": ("photo.png", image_bytes("PNG"), "image/png")},
-    )
-
-    assert response.status_code == 500
-    assert response.json()["detail"] == "Unable to save uploaded image."
-    assert "private filesystem details" not in response.text
+def test_legacy_metadata_without_database_bytes_is_not_treated_as_migrated(upload_api):
+    client, assessment_id, engine = upload_api
     with Session(engine) as session:
-        assert session.scalar(select(UploadedImage)) is None
+        image = UploadedImage(
+            assessment_id=UUID(assessment_id),
+            storage_provider="local",
+            storage_bucket="vehicle-images",
+            object_key="legacy-file.png",
+            original_filename="legacy.png",
+            content_type="image/png",
+            byte_size=10,
+        )
+        session.add(image)
+        session.commit()
+        image_id = str(image.id)
 
-
-def test_local_storage_generates_unique_keys_and_rejects_traversal(tmp_path):
-    storage = LocalImageStorage(tmp_path / "storage")
-    first_key = storage.save(b"first", "png")
-    second_key = storage.save(b"second", "png")
-
-    assert first_key != second_key
-    with pytest.raises(ImageStorageError):
-        storage.delete("../../outside.png")
+    listed = client.get(f"/api/v1/assessments/{assessment_id}/images")
+    assert listed.status_code == 200
+    assert listed.json()[0]["id"] == image_id
+    response = client.get(f"/api/v1/assessments/{assessment_id}/images/{image_id}/content")
+    assert response.status_code == 404
+    assert response.json() == {"detail": "Image content not found."}

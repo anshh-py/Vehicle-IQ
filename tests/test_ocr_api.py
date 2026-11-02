@@ -28,7 +28,6 @@ from app.ocr.client import (
     PaddleOCRLocalClient,
 )
 from app.ocr.preprocessing import preprocess_ocr_image
-from app.storage.images import LocalImageStorage, get_image_storage
 
 
 def valid_png() -> bytes:
@@ -53,7 +52,7 @@ class FakeOCRClient:
 
 
 @pytest.fixture
-def ocr_api(tmp_path) -> Generator[tuple[TestClient, str, str, LocalImageStorage, object, FakeOCRClient], None, None]:
+def ocr_api() -> Generator[tuple[TestClient, str, str, None, object, FakeOCRClient], None, None]:
     engine = create_engine(
         "sqlite+pysqlite:///:memory:",
         connect_args={"check_same_thread": False},
@@ -65,18 +64,17 @@ def ocr_api(tmp_path) -> Generator[tuple[TestClient, str, str, LocalImageStorage
         dbapi_connection.execute("PRAGMA foreign_keys=ON")
 
     Base.metadata.create_all(engine)
-    storage = LocalImageStorage(tmp_path / "ocr-images")
     content = valid_png()
-    image_key = storage.save(content, "png")
     with Session(engine) as session:
         assessment = VehicleAssessment()
         session.add(assessment)
         session.flush()
         image = UploadedImage(
             assessment_id=assessment.id,
-            storage_provider="local",
+            storage_provider="postgresql",
             storage_bucket="vehicle-images",
-            object_key=image_key,
+            object_key="ocr-image",
+            content=content,
             original_filename="vehicle.png",
             content_type="image/png",
             byte_size=len(content),
@@ -93,11 +91,10 @@ def ocr_api(tmp_path) -> Generator[tuple[TestClient, str, str, LocalImageStorage
             yield session
 
     app.dependency_overrides[get_db] = override_get_db
-    app.dependency_overrides[get_image_storage] = lambda: storage
     app.dependency_overrides[get_ocr_client] = lambda: fake
     try:
         with TestClient(app) as client:
-            yield client, assessment_id, image_id, storage, engine, fake
+            yield client, assessment_id, image_id, None, engine, fake
     finally:
         app.dependency_overrides.clear()
         engine.dispose()
@@ -341,12 +338,12 @@ def test_ocr_returns_safe_unavailable_error_when_service_url_is_not_configured(o
 
 
 def test_ocr_rejects_corrupt_stored_image_before_calling_service(ocr_api):
-    client, assessment_id, image_id, storage, engine, fake = ocr_api
+    client, assessment_id, image_id, _storage, engine, fake = ocr_api
     with Session(engine) as session:
         image = session.get(UploadedImage, UUID(image_id))
         assert image is not None
-        storage_path = storage.root / image.object_key
-        storage_path.write_bytes(b"corrupt image bytes")
+        image.content = b"corrupt image bytes"
+        session.commit()
 
     response = client.post(f"/api/v1/assessments/{assessment_id}/images/{image_id}/ocr")
 

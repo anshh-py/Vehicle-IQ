@@ -38,7 +38,7 @@ from app.schemas.damage import (
     DamageFindingResponse,
     ImageDamageResponse,
 )
-from app.storage.images import ImageStorage, ImageStorageError, get_image_storage
+from app.storage.images import ImageContentUnavailable, read_image_content
 
 
 router = APIRouter(prefix="/api/v1/assessments", tags=["assessment damage detection"])
@@ -293,7 +293,6 @@ def inspect_assessment_image_damage(
     assessment_id: UUID,
     image_id: UUID,
     db: Session = Depends(get_db),
-    storage: ImageStorage = Depends(get_image_storage),
     provider: DamageProvider = Depends(get_damage_provider),
 ) -> ImageDamageResponse:
     try:
@@ -308,15 +307,14 @@ def inspect_assessment_image_damage(
         )
         if image is None:
             raise HTTPException(status_code=404, detail="Image not found for assessment.")
-        object_key = image.object_key
     except HTTPException:
         raise
     except SQLAlchemyError:
         raise HTTPException(status_code=500, detail="Unable to retrieve assessment image.") from None
 
     try:
-        content = storage.read(object_key)
-    except ImageStorageError:
+        content = read_image_content(image)
+    except ImageContentUnavailable:
         reason = "Stored image is unavailable."
         _record_inspection_outcome(
             db, assessment_id, image_id, "unavailable", reason=reason
@@ -330,6 +328,8 @@ def inspect_assessment_image_damage(
             findings=[],
             reason=reason,
         )
+    except SQLAlchemyError:
+        raise HTTPException(status_code=500, detail="Unable to retrieve assessment image.") from None
 
     try:
         extension, _content_type = inspect_image(content)
@@ -528,7 +528,6 @@ def inspect_assessment_damage(
     assessment_id: UUID,
     payload: AssessmentDamageRequest,
     db: Session = Depends(get_db),
-    storage: ImageStorage = Depends(get_image_storage),
     provider: DamageProvider = Depends(get_damage_provider),
 ) -> AssessmentDamageResponse:
     """Run the existing per-image detector for up to ten selected assessment images."""
@@ -545,7 +544,6 @@ def inspect_assessment_damage(
                 assessment_id=assessment_id,
                 image_id=image_id,
                 db=db,
-                storage=storage,
                 provider=provider,
             )
             results.append(

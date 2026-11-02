@@ -1,9 +1,8 @@
 from __future__ import annotations
 
 import hashlib
-import logging
 from typing import Annotated
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from fastapi import APIRouter, Depends, File, HTTPException, Response, UploadFile, status
 from sqlalchemy import select
@@ -15,10 +14,8 @@ from app.db.models import UploadedImage, VehicleAssessment
 from app.db.session import get_db
 from app.images.validation import InvalidImageError, inspect_image
 from app.schemas.images import UploadedImageResponse
-from app.storage.images import ImageStorage, ImageStorageError, get_image_storage
+from app.storage.images import ImageContentUnavailable, read_image_content
 
-
-logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/v1/assessments/{assessment_id}/images", tags=["assessment images"])
 
@@ -36,19 +33,11 @@ def _safe_original_filename(filename: str | None, extension: str) -> str:
     return (safe_name or f"upload.{extension}")[:255]
 
 
-def _cleanup_file(storage: ImageStorage, key: str) -> None:
-    try:
-        storage.delete(key)
-    except Exception:
-        logger.exception("Failed to clean up image after database failure.")
-
-
 @router.post("", response_model=UploadedImageResponse, status_code=status.HTTP_201_CREATED)
 def upload_assessment_image(
     assessment_id: UUID,
     file: Annotated[UploadFile, File(...)],
     db: Session = Depends(get_db),
-    storage: ImageStorage = Depends(get_image_storage),
     max_bytes: int = Depends(get_image_upload_limit),
 ) -> UploadedImageResponse:
     try:
@@ -82,15 +71,14 @@ def upload_assessment_image(
         ) from None
     filename = _safe_original_filename(file.filename, extension)
     digest = hashlib.sha256(content).hexdigest()
-    key: str | None = None
 
     try:
-        key = storage.save(content, extension)
         image = UploadedImage(
             assessment_id=assessment.id,
-            storage_provider="local",
+            storage_provider="postgresql",
             storage_bucket="vehicle-images",
-            object_key=key,
+            object_key=uuid4().hex,
+            content=content,
             original_filename=filename,
             content_type=content_type,
             byte_size=len(content),
@@ -104,13 +92,6 @@ def upload_assessment_image(
         db.commit()
     except SQLAlchemyError:
         db.rollback()
-        if key is not None:
-            _cleanup_file(storage, key)
-        raise HTTPException(status_code=500, detail="Unable to save uploaded image.") from None
-    except Exception:
-        db.rollback()
-        if key is not None:
-            _cleanup_file(storage, key)
         raise HTTPException(status_code=500, detail="Unable to save uploaded image.") from None
     return response
 
@@ -138,7 +119,6 @@ def get_assessment_image_content(
     assessment_id: UUID,
     image_id: UUID,
     db: Session = Depends(get_db),
-    storage: ImageStorage = Depends(get_image_storage),
     max_bytes: int = Depends(get_image_upload_limit),
 ) -> Response:
     """Serve one previously validated image for its owning assessment only."""
@@ -159,9 +139,11 @@ def get_assessment_image_content(
     if image.content_type not in {"image/jpeg", "image/png", "image/webp"}:
         raise HTTPException(status_code=404, detail="Image content not found.")
     try:
-        content = storage.read(image.object_key)
-    except ImageStorageError:
+        content = read_image_content(image)
+    except ImageContentUnavailable:
         raise HTTPException(status_code=404, detail="Image content not found.") from None
+    except SQLAlchemyError:
+        raise HTTPException(status_code=500, detail="Unable to retrieve image content.") from None
     if len(content) > max_bytes or (image.byte_size is not None and len(content) != image.byte_size):
         raise HTTPException(status_code=404, detail="Image content not found.")
 

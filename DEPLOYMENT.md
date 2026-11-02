@@ -12,13 +12,10 @@ does not need committed credentials.
 - `API_ACCESS_TOKEN` — a random bearer token at least 32 characters long. The
   current API uses one shared token; it does not implement user accounts or
   per-assessment ownership.
-- `IMAGE_STORAGE_DIR` — an explicitly configured absolute path backed by durable
-  storage. Startup checks that it was configured, but cannot determine whether
-  the hosting platform actually mounts persistent storage there.
 
-Production startup fails if the token is too short or missing, the database URL
-does not use `postgresql+psycopg`, or the image storage path is not explicitly
-set. `DATABASE_URL` is required in every environment by application settings.
+Production startup fails if the token is too short or missing, or the database
+URL does not use `postgresql+psycopg`. `DATABASE_URL` is required in every
+environment by application settings.
 
 Optional capacity settings:
 
@@ -34,8 +31,16 @@ them until authorized use and provider compatibility are confirmed.
 
 The checked-in migration chain is linear:
 
-1. `20261027_0001` creates the seven core assessment tables.
+1. `20261027_0001` creates the core assessment tables.
 2. `20261028_0002` allows a damage finding's component to be null.
+3. `20261029_0003` adds vehicle specifications.
+4. `20261030_0004` adds vehicle specification identity.
+5. `20261101_0005` adds market listings.
+6. `20261103_0006` adds nullable PostgreSQL image bytes and changes the default
+   storage provider for new records. Existing image metadata and filesystem
+   object references are retained; their bytes are not backfilled. Such legacy
+   images remain unavailable through image-content and processing APIs until
+   their bytes are restored separately.
 
 For a newly provisioned PostgreSQL database, configure `DATABASE_URL`, then run
 the migration as a controlled release step from the repository root:
@@ -51,16 +56,16 @@ part of deployment/release verification.
 
 ## Image persistence and hosting
 
-Image bytes are stored by the local filesystem adapter under
-`IMAGE_STORAGE_DIR`; PostgreSQL stores metadata and object keys only. The local
-default `.local-storage/vehicle-images` is git-ignored and suitable for local
-development. It is not guaranteed to survive container replacement, host
-recreation, or deployment to an ephemeral filesystem.
+New image bytes and their metadata are stored together in PostgreSQL
+(`BYTEA`). Image metadata listing defers the byte column, while the content,
+OCR, and damage-processing paths load bytes only when required. This avoids
+dependence on ephemeral backend filesystems and Render persistent disks.
 
-Before deployment, provision a persistent mounted volume and point
-`IMAGE_STORAGE_DIR` at its absolute mount path. This adapter is local-disk based;
-multiple replicas require a shared filesystem or a future object-storage
-adapter. No platform-specific volume configuration is included in this repo.
+The migration intentionally does not populate bytes for existing records that
+only reference local files or external objects. Those metadata rows are
+preserved, and their images are unavailable if their original content cannot
+be restored. PostgreSQL storage increases database usage by up to the configured
+10 MiB per uploaded image; monitor database capacity accordingly.
 
 ## Start and health checks
 

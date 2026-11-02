@@ -1,7 +1,7 @@
 from pathlib import Path
 
 import pytest
-from sqlalchemy import create_engine, event, inspect
+from sqlalchemy import LargeBinary, create_engine, event, inspect
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -105,9 +105,11 @@ def test_migration_metadata_matches_models():
 
     assert set(Base.metadata.tables) == expected_tables
     assert inspect(AssessmentReport).relationships.assessment.uselist is False
+    assert isinstance(UploadedImage.__table__.c.content.type, LargeBinary)
+    assert inspect(UploadedImage).attrs.content.deferred
 
 
-def test_production_configuration_requires_secret_and_explicit_storage_path():
+def test_production_configuration_requires_secret():
     private_marker = "do-not-display-this-token"
     config = Settings(
         _env_file=None,
@@ -120,30 +122,27 @@ def test_production_configuration_requires_secret_and_explicit_storage_path():
         validate_production_settings(config)
 
     assert "API_ACCESS_TOKEN" in str(error.value)
-    assert "IMAGE_STORAGE_DIR" in str(error.value)
     assert private_marker not in str(error.value)
     assert "password" not in str(error.value)
 
 
-def test_production_configuration_accepts_postgres_secret_and_explicit_storage(tmp_path):
+def test_production_configuration_accepts_postgres_secret():
     config = Settings(
         _env_file=None,
         app_env="production",
         database_url="postgresql+psycopg://user:password@localhost/vehicle_iq",
         api_access_token=SecretStr("a" * 40),
-        image_storage_dir=tmp_path / "mounted-images",
     )
 
     validate_production_settings(config)
 
 
-def test_production_configuration_rejects_non_postgres_database(tmp_path):
+def test_production_configuration_rejects_non_postgres_database():
     config = Settings(
         _env_file=None,
         app_env="production",
         database_url="sqlite+pysqlite:///tmp/vehicle_iq.db",
         api_access_token=SecretStr("a" * 40),
-        image_storage_dir=tmp_path / "mounted-images",
     )
 
     with pytest.raises(RuntimeError, match="DATABASE_URL"):

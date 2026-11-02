@@ -38,7 +38,6 @@ from app.schemas.workflow import (
     WorkflowStageError,
     WorkflowStageResult,
 )
-from app.storage.images import ImageStorage, get_image_storage
 from app.ocr.registration import build_registration_ocr_assessment, normalize_registration_candidate
 
 
@@ -383,7 +382,6 @@ def run_assessment_workflow(
     assessment_id: UUID,
     payload: AssessmentWorkflowRequest,
     db: Session = Depends(get_db),
-    storage: ImageStorage = Depends(get_image_storage),
     ocr_client=Depends(get_ocr_client),
     damage_provider=Depends(get_damage_provider),
     vehicle_lookup_provider=Depends(get_vehicle_registration_provider),
@@ -490,7 +488,6 @@ def run_assessment_workflow(
                     assessment_id=assessment_id,
                     image_id=image_id,
                     db=db,
-                    storage=storage,
                     client=ocr_client,
                 )
                 ocr_results.append(result.model_dump(mode="json"))
@@ -531,7 +528,6 @@ def run_assessment_workflow(
             assessment_id=assessment_id,
             payload=AssessmentDamageRequest(image_ids=payload.image_ids),
             db=db,
-            storage=storage,
             provider=damage_provider,
         )
         damage_errors = [

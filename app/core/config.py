@@ -15,7 +15,6 @@ class Settings(BaseSettings):
     api_access_token: SecretStr | None = None
     api_rate_limit_per_minute: int = Field(default=600, gt=0, le=10000)
     database_url: str
-    image_storage_dir: Path = PROJECT_ROOT / ".local-storage" / "vehicle-images"
     max_image_upload_bytes: int = Field(default=10 * 1024 * 1024, gt=0, le=100 * 1024 * 1024)
     max_external_response_bytes: int = Field(default=2 * 1024 * 1024, gt=0, le=10 * 1024 * 1024)
     buyer_price_near_threshold_percent: int = Field(
@@ -79,13 +78,6 @@ class Settings(BaseSettings):
         extra="ignore",
     )
 
-    @field_validator("image_storage_dir")
-    @classmethod
-    def resolve_image_storage_dir(cls, value: Path) -> Path:
-        if not value.is_absolute():
-            value = PROJECT_ROOT / value
-        return value.resolve()
-
     @field_validator("ocr_paddle_detection_model_dir", "ocr_paddle_recognition_model_dir")
     @classmethod
     def resolve_ocr_model_dir(cls, value: Path) -> Path:
@@ -120,9 +112,6 @@ def validate_production_settings(config: Settings = settings) -> None:
             missing_or_invalid.append("DATABASE_URL (must use postgresql+psycopg)")
     except (TypeError, ValueError):
         missing_or_invalid.append("DATABASE_URL (invalid SQLAlchemy URL)")
-
-    if "image_storage_dir" not in config.model_fields_set:
-        missing_or_invalid.append("IMAGE_STORAGE_DIR (must point to a persistent mounted volume)")
 
     if missing_or_invalid:
         required = ", ".join(missing_or_invalid)

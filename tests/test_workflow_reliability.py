@@ -26,7 +26,6 @@ from app.ocr.client import OCRRecognition, OCRServiceUnavailable
 from app.pricing.provider import get_price_provider
 from app.schemas.pricing import PricePrediction
 from app.schemas.vehicle_lookup import VehicleRegistrationDetails
-from app.storage.images import LocalImageStorage, get_image_storage
 from app.vehicle_lookup.provider import VehicleLookupUnavailable
 
 
@@ -128,14 +127,11 @@ def workflow_client(tmp_path):
         dbapi_connection.execute("PRAGMA foreign_keys=ON")
 
     Base.metadata.create_all(engine)
-    storage = LocalImageStorage(tmp_path / "workflow-images")
-
     def override_get_db():
         with Session(engine) as session:
             yield session
 
     app.dependency_overrides[get_db] = override_get_db
-    app.dependency_overrides[get_image_storage] = lambda: storage
     app.dependency_overrides[get_ocr_client] = lambda: FakeOCR()
     app.dependency_overrides[get_vehicle_registration_provider] = lambda: FakeVehicleDetails()
     app.dependency_overrides[get_challan_provider] = lambda: FakeChallan()
