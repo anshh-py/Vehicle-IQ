@@ -127,7 +127,7 @@ Required for production startup:
 | `OCR_GRADIO_SPACE_URL` | HTTPS Space base URL when using `huggingface_gradio`; public service availability is not guaranteed. |
 | `OCR_SERVICE_URL` | Required HTTPS endpoint when `OCR_SERVICE_PROVIDER=baidu_unlimited_ocr`. |
 | `OCR_TIMEOUT_SECONDS` | Bounded remote OCR request timeout (default 180 seconds). |
-| `DAMAGE_INFERENCE_ENABLED=false` | Required for this Render Free deployment; produces explicit unavailable damage status without constructing or starting the YOLO worker. |
+| `DAMAGE_INFERENCE_ENABLED=false` | Set false on Render Free or any deployment without the isolated CPU runtime and checkpoint. Disabled scans report `unavailable` with `inference_disabled`; no worker process is started. In development, omission defaults to enabled. |
 
 For `baidu_unlimited_ocr`, set `OCR_SERVICE_URL` to its authorized HTTPS service
 instead of the Gradio URL. Never configure an unencrypted production endpoint.
@@ -147,8 +147,11 @@ Optional capacity/model settings:
   explicitly configured. `TAVILY_API_KEY` is optional for market discovery;
   no key means market valuation remains unavailable. Keep vehicle details,
   Challan, and FASTag flags false unless their use is authorized and verified.
-- `DAMAGE_INFERENCE_PYTHON` and `DAMAGE_CHECKPOINT_PATH` are local inference
-  settings. They are not used when `DAMAGE_INFERENCE_ENABLED=false`.
+- `DAMAGE_INFERENCE_PYTHON` and `DAMAGE_CHECKPOINT_PATH` configure local
+  inference. The default executable path is platform-specific (`Scripts/python.exe`
+  on Windows, `bin/python` elsewhere). They are not used when inference is
+  disabled. An enabled deployment must provide the isolated runtime, runner, and
+  checkpoint; model presence on the developer laptop does not imply Render access.
 
 ## 4. Vercel static frontend
 

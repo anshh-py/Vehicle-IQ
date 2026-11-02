@@ -259,6 +259,7 @@ def test_provider_selection_defaults_and_keeps_local_baidu_provider(monkeypatch)
             ocr_service_url=None,
             ocr_gradio_space_url=BASE_URL,
             ocr_gradio_mode="base",
+            ocr_timeout_seconds=180,
         ),
     )
     public_client = ocr_api.get_ocr_client()
@@ -274,6 +275,7 @@ def test_provider_selection_defaults_and_keeps_local_baidu_provider(monkeypatch)
             ocr_service_url="http://local-ocr:7860",
             ocr_gradio_space_url=BASE_URL,
             ocr_gradio_mode="gundam",
+            ocr_timeout_seconds=180,
         ),
     )
     local_client = ocr_api.get_ocr_client()

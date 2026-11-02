@@ -11,7 +11,15 @@ from sqlalchemy.orm import Session
 from sqlalchemy.pool import StaticPool
 
 from app.damage.inference import DamageDetection, DamageInferenceResult
-from app.damage.worker import MODEL_NAME, DamageWorkerUnavailable
+from app.damage.worker import (
+    MODEL_NAME,
+    DamageCheckpointUnavailable,
+    DamageInferenceDisabled,
+    DamageRuntimeUnavailable,
+    DamageWorkerInferenceFailed,
+    DamageWorkerTimeout,
+    DamageWorkerUnavailable,
+)
 from app.db.base import Base
 from app.db.models import DamageFinding, EvidenceRecord, UploadedImage, VehicleAssessment
 from app.db.session import get_db
@@ -20,9 +28,9 @@ from app.api.v1.damage import get_damage_provider
 from app.storage.images import LocalImageStorage, get_image_storage
 
 
-def png_bytes() -> bytes:
+def png_bytes(size=(32, 20)) -> bytes:
     output = BytesIO()
-    Image.new("RGB", (32, 20), color=(200, 200, 200)).save(output, format="PNG")
+    Image.new("RGB", size, color=(200, 200, 200)).save(output, format="PNG")
     return output.getvalue()
 
 
@@ -290,6 +298,93 @@ def test_damage_endpoint_persists_unavailable_model_outcome(tmp_path):
             assert marker.evidence_data["status"] == "unavailable"
 
 
+@pytest.mark.parametrize(
+    ("error", "expected_status", "expected_code"),
+    [
+        (DamageCheckpointUnavailable("missing"), "unavailable", "checkpoint_unavailable"),
+        (DamageRuntimeUnavailable("missing"), "unavailable", "runtime_unavailable"),
+        (DamageWorkerTimeout("private-upstream-path"), "unavailable", "inference_timeout"),
+        (DamageWorkerInferenceFailed("private-upstream-path"), "failed", "inference_failed"),
+    ],
+)
+def test_damage_failure_categories_are_safe_and_specific(
+    tmp_path, error, expected_status, expected_code
+):
+    with damage_api(tmp_path, provider=FakeDamageProvider(error=error)) as api:
+        response = api.client.post(
+            f"/api/v1/assessments/{api.assessment_id}/images/{api.image_id}/damage"
+        )
+
+        assert response.status_code == 200
+        assert response.json()["status"] == expected_status
+        assert response.json()["reason_code"] == expected_code
+        assert "private-upstream-path" not in response.text
+
+
+def test_damage_disabled_by_configuration_is_explicit_and_does_not_call_worker(
+    tmp_path, monkeypatch
+):
+    with damage_api(tmp_path) as api:
+        monkeypatch.setattr("app.api.v1.damage.settings.damage_inference_enabled", False)
+        app.dependency_overrides.pop(get_damage_provider, None)
+
+        response = api.client.post(
+            f"/api/v1/assessments/{api.assessment_id}/images/{api.image_id}/damage"
+        )
+
+        assert response.status_code == 200
+        body = response.json()
+        assert body["status"] == "unavailable"
+        assert body["reason_code"] == "inference_disabled"
+        assert "disabled" in body["reason"].lower()
+        assert api.provider.calls == []
+
+
+def test_production_damage_provider_defaults_disabled(monkeypatch):
+    from app.api.v1.damage import get_damage_provider
+    from app.damage.worker import DamageInferenceDisabled
+
+    monkeypatch.setattr("app.api.v1.damage.settings.app_env", "production")
+    monkeypatch.setattr("app.api.v1.damage.settings.damage_inference_enabled", None)
+    provider = get_damage_provider()
+
+    with pytest.raises(DamageInferenceDisabled):
+        provider.detect(b"image", "png")
+
+
+def test_unknown_uploaded_image_is_not_submitted_without_type_evidence(damage_api_fixture):
+    api = damage_api_fixture
+    with Session(api.engine) as session:
+        image = session.get(UploadedImage, UUID(api.image_id))
+        image.original_filename = "upload.png"
+        session.commit()
+
+    response = api.client.post(
+        f"/api/v1/assessments/{api.assessment_id}/damage",
+        json={"image_ids": [api.image_id]},
+    )
+
+    result = response.json()["results"][0]
+    assert result["status"] == "unavailable"
+    assert result["reason_code"] == "eligibility_not_submitted_insufficient_classification_evidence"
+    assert api.provider.calls == []
+
+
+def test_batch_damage_accepts_explicit_vehicle_image_type(damage_api_fixture):
+    api = damage_api_fixture
+    image_id = add_stored_image(api, png_bytes(size=(640, 480)))
+
+    response = api.client.post(
+        f"/api/v1/assessments/{api.assessment_id}/damage",
+        json={"image_ids": [image_id], "image_types": {image_id: "vehicle_exterior"}},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["results"][0]["status"] == "completed_with_findings"
+    assert response.json()["results"][0]["image_type"] == "vehicle_exterior"
+    assert len(api.provider.calls) == 1
+
+
 def test_damage_endpoint_persists_unexpected_inference_exception_as_failed(tmp_path):
     with damage_api(
         tmp_path,
@@ -409,6 +504,8 @@ def test_batch_damage_empty_detection_is_success_without_fabricated_findings(
         assert marker.evidence_data == {
             "status": "completed_no_findings",
             "detection_count": 0,
+            "inference_time_seconds": 0.2,
+            "image_type": "vehicle_exterior",
         }
 
     from app.llm.schemas import LLMReportNarrative

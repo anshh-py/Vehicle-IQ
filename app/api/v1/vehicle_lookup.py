@@ -262,17 +262,27 @@ def _store_service_result(
         data["details"] = result.details.model_dump(mode="json")
     if result.error_code is not None:
         data["error_code"] = result.error_code
-    db.add(
-        OCRResult(
+    existing = db.scalar(
+        select(OCRResult)
+        .where(
+            OCRResult.assessment_id == assessment_id,
+            OCRResult.result_type == result_type,
+            OCRResult.raw_text == registration_number,
+        )
+        .order_by(OCRResult.created_at.desc(), OCRResult.id.desc())
+    )
+    if existing is None:
+        existing = OCRResult(
             assessment_id=assessment_id,
             image_id=image_id,
             result_type=result_type,
-            status="completed" if result.status in {"available", "partial"} else result.status,
-            provider=result.provider,
             raw_text=registration_number,
-            result_data=data,
         )
-    )
+        db.add(existing)
+    existing.image_id = image_id
+    existing.status = "completed" if result.status in {"available", "partial"} else result.status
+    existing.provider = result.provider
+    existing.result_data = data
 
 
 @router.post(

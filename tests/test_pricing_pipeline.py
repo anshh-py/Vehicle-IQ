@@ -165,9 +165,15 @@ class TestComposePriceInput:
             assessment, None, None
         )
 
-        assert vehicle_input is None
-        assert {"make", "model", "fuel_type", "registration_year", "engine_cc"} <= set(missing)
+        assert vehicle_input is not None
+        assert missing == invalid == []
         assert set(provenance) == {
+            "make",
+            "model",
+            "fuel_type",
+            "registration_year",
+            "engine_cc",
+            "seats",
             "odometer_km",
             "seller_type",
             "transmission",
@@ -239,12 +245,26 @@ class TestComposePriceInput:
         assert features["mileage"] == 19.2
         assert features["max_power"] == 110.0
 
-    def test_manual_workflow_input_rejects_vehicle_specifications(self):
+    def test_manual_workflow_input_accepts_missing_pricing_attributes(self):
+        from app.schemas.workflow import WorkflowVehicleInput
+
+        supplied = WorkflowVehicleInput(
+            make="Example Motors", model="City", fuel_type="petrol",
+            registration_year=2021, engine_cc=1200, seats=5,
+        )
+        assert supplied.engine_cc == 1200
+        assert supplied.registration_year == 2021
+
+    @pytest.mark.parametrize(
+        ("field", "value"),
+        [("registration_year", 1800), ("engine_cc", 0), ("seats", 10), ("make", " ")],
+    )
+    def test_new_manual_pricing_attributes_are_validated(self, field, value):
         from app.schemas.workflow import WorkflowVehicleInput
         from pydantic import ValidationError
 
         with pytest.raises(ValidationError):
-            WorkflowVehicleInput(engine_cc=1200)
+            WorkflowVehicleInput(**{field: value})
 
     @pytest.mark.parametrize(
         ("field", "value"),

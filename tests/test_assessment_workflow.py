@@ -21,6 +21,8 @@ from app.db.session import get_db
 from app.damage.inference import DamageDetection, DamageInferenceResult
 from app.damage.worker import DamageWorkerUnavailable
 from app.main import app
+from app.db.models import OCRResult
+from app.db.session import get_db
 from app.ocr.client import OCRRecognition, OCRServiceUnavailable
 from app.pricing.provider import get_price_provider
 from app.schemas.pricing import PricePrediction
@@ -32,7 +34,7 @@ from app.vehicle_lookup.provider import VehicleLookupUnavailable
 
 def png_bytes() -> bytes:
     output = BytesIO()
-    Image.new("RGB", (32, 24), color=(180, 180, 180)).save(output, format="PNG")
+    Image.new("RGB", (320, 240), color=(180, 180, 180)).save(output, format="PNG")
     return output.getvalue()
 
 
@@ -116,7 +118,7 @@ class FakePrice:
 
 
 @pytest.fixture
-def workflow_client(tmp_path) -> Generator[TestClient, None, None]:
+def workflow_client(tmp_path, monkeypatch) -> Generator[TestClient, None, None]:
     engine = create_engine(
         "sqlite+pysqlite:///:memory:",
         connect_args={"check_same_thread": False},
@@ -142,6 +144,7 @@ def workflow_client(tmp_path) -> Generator[TestClient, None, None]:
     app.dependency_overrides[get_fastag_provider] = lambda: FailedFastag()
     app.dependency_overrides[get_damage_provider] = lambda: FakeDamage()
     app.dependency_overrides[get_price_provider] = lambda: FakePrice()
+    monkeypatch.setattr("app.api.v1.damage.settings.damage_inference_enabled", True)
     try:
         with TestClient(app) as client:
             yield client
@@ -212,11 +215,15 @@ def test_complete_assessment_workflow_preserves_partial_external_results(workflo
     assert generated.status_code == retrieved.status_code == 200
     report = retrieved.json()["report_data"]
     assert report["assessment"]["asking_price_inr"] == "700000.00"
-    assert report["stages"]["ocr"] == {
-        "status": "partial",
-        "result_count": 1,
-        "completed_image_count": 1,
+    assert report["stages"]["ocr"]["status"] == "partial"
+    assert report["stages"]["ocr"]["result_count"] == 1
+    assert report["stages"]["ocr"]["completed_image_count"] == 1
+    image_ocr_states = {
+        item["image_id"]: item["status"]
+        for item in report["stages"]["ocr"]["image_results"]
     }
+    assert image_ocr_states[image_ids[0]] == "completed"
+    assert sum(state == "not_started" for state in image_ocr_states.values()) == 9
     assert report["vehicle_details_lookup"]["status"] == "available"
     assert report["challan_lookup"]["status"] == "available"
     assert report["fastag_lookup"]["status"] == "unavailable"
@@ -229,6 +236,134 @@ def test_complete_assessment_workflow_preserves_partial_external_results(workflo
     assert recommendation["difference_percent_of_ml_estimate"] == "12.00"
     assert recommendation["market_evidence_available"] is False
     assert report["market_valuation"]["status"] == "unavailable"
+
+
+def _submit_complete_workflow(client, assessment_id, image_ids):
+    return client.post(
+        f"/api/v1/assessments/{assessment_id}/workflow",
+        json={
+            "image_ids": image_ids,
+            "vehicle": {
+                "make": "Example Motors", "model": "City", "variant": "ZX",
+                "registration_year": 2021, "odometer_km": 42000, "fuel_type": "petrol",
+                "seller_type": "Individual", "transmission": "manual", "mileage_kmpl": 18,
+                "engine_cc": 1498, "max_power_bhp": 119, "seats": 5,
+            },
+        },
+    )
+
+
+def test_workflow_runs_vehicle_services_only_when_enabled_and_reuses_results(workflow_client, monkeypatch):
+    from app.api.v1.workflow import settings as workflow_settings
+
+    monkeypatch.setattr(workflow_settings, "challan_lookup_enabled", True)
+    monkeypatch.setattr(workflow_settings, "fastag_lookup_enabled", True)
+    assessment = workflow_client.post("/api/v1/assessments", json={}).json()
+    uploaded = workflow_client.post(
+        f"/api/v1/assessments/{assessment['id']}/images",
+        files={"file": ("car.png", png_bytes(), "image/png")},
+    ).json()
+
+    first = _submit_complete_workflow(workflow_client, assessment["id"], [uploaded["id"]])
+    assert first.status_code == 200
+    body = first.json()
+    assert body["stages"]["challan_lookup"]["status"] == "completed", body["stages"]["challan_lookup"]
+    assert body["stages"]["fastag_lookup"]["status"] == "unavailable"
+    assert body["stages"]["market_valuation"]["status"] == "unavailable"
+    report = body["stages"]["report"]["result"]["report_data"]
+    assert report["challan_lookup"]["status"] == "available"
+    assert report["fastag_lookup"]["status"] == "unavailable"
+    assert workflow_client.post(
+        f"/api/v1/assessments/{assessment['id']}/workflow",
+        json={"image_ids": [uploaded["id"]]},
+    ).status_code == 200
+
+
+def test_workflow_marks_disabled_services_and_does_not_call_providers(workflow_client, monkeypatch):
+    from app.api.v1.workflow import settings as workflow_settings
+
+    monkeypatch.setattr(workflow_settings, "challan_lookup_enabled", False)
+    monkeypatch.setattr(workflow_settings, "fastag_lookup_enabled", False)
+    calls = {"challan": 0, "fastag": 0}
+
+    class CountingProvider:
+        provider_name = "must_not_be_called"
+        def __init__(self, key): self.key = key
+        def lookup(self, _registration): calls[self.key] += 1
+
+    from app.api.v1.vehicle_lookup import get_challan_provider, get_fastag_provider
+    app.dependency_overrides[get_challan_provider] = lambda: CountingProvider("challan")
+    app.dependency_overrides[get_fastag_provider] = lambda: CountingProvider("fastag")
+    assessment = workflow_client.post("/api/v1/assessments", json={}).json()
+    uploaded = workflow_client.post(
+        f"/api/v1/assessments/{assessment['id']}/images",
+        files={"file": ("car.png", png_bytes(), "image/png")},
+    ).json()
+    response = _submit_complete_workflow(workflow_client, assessment["id"], [uploaded["id"]])
+    assert response.status_code == 200
+    stages = response.json()["stages"]
+    assert stages["challan_lookup"]["status"] == "disabled"
+    assert stages["fastag_lookup"]["status"] == "disabled"
+    assert calls == {"challan": 0, "fastag": 0}
+
+
+def test_workflow_challan_failure_does_not_discard_fastag_success(workflow_client, monkeypatch):
+    from app.api.v1.workflow import settings as workflow_settings
+    from app.api.v1.vehicle_lookup import get_challan_provider, get_fastag_provider
+
+    monkeypatch.setattr(workflow_settings, "challan_lookup_enabled", True)
+    monkeypatch.setattr(workflow_settings, "fastag_lookup_enabled", True)
+
+    class FailingChallan:
+        provider_name = "mock_challan_failure"
+        def lookup(self, _registration): raise VehicleLookupUnavailable("mock outage")
+
+    class WorkingFastag:
+        provider_name = "mock_fastag_success"
+        def lookup(self, _registration): return FastagDetails(status="active", issuing_bank="Test Bank", issue_date=date(2025, 1, 1), vehicle_class="VC4")
+
+    app.dependency_overrides[get_challan_provider] = lambda: FailingChallan()
+    app.dependency_overrides[get_fastag_provider] = lambda: WorkingFastag()
+    assessment = workflow_client.post("/api/v1/assessments", json={}).json()
+    uploaded = workflow_client.post(
+        f"/api/v1/assessments/{assessment['id']}/images",
+        files={"file": ("car.png", png_bytes(), "image/png")},
+    ).json()
+    response = _submit_complete_workflow(workflow_client, assessment["id"], [uploaded["id"]])
+    assert response.status_code == 200
+    stages = response.json()["stages"]
+    assert stages["challan_lookup"]["status"] == "unavailable"
+    assert stages["fastag_lookup"]["status"] == "completed"
+    report = stages["report"]["result"]["report_data"]
+    assert report["challan_lookup"]["status"] == "unavailable"
+    assert report["fastag_lookup"]["status"] == "available"
+
+
+def test_workflow_without_registration_marks_services_not_run(workflow_client, monkeypatch):
+    from app.api.v1.workflow import settings as workflow_settings
+    from app.api.v1.ocr import get_ocr_client
+
+    monkeypatch.setattr(workflow_settings, "challan_lookup_enabled", True)
+    monkeypatch.setattr(workflow_settings, "fastag_lookup_enabled", True)
+
+    class NoRegistrationOCR:
+        provider_name = "mock_no_registration"
+        def recognize(self, *_args): return OCRRecognition("SCORPIO N", 0.99)
+
+    app.dependency_overrides[get_ocr_client] = lambda: NoRegistrationOCR()
+    assessment = workflow_client.post("/api/v1/assessments", json={}).json()
+    uploaded = workflow_client.post(
+        f"/api/v1/assessments/{assessment['id']}/images",
+        files={"file": ("car.png", png_bytes(), "image/png")},
+    ).json()
+    response = _submit_complete_workflow(workflow_client, assessment["id"], [uploaded["id"]])
+    assert response.status_code == 200
+    stages = response.json()["stages"]
+    assert stages["challan_lookup"]["status"] == "not_run"
+    assert stages["fastag_lookup"]["status"] == "not_run"
+    report_response = workflow_client.get(f"/api/v1/assessments/{assessment['id']}/report")
+    assert report_response.status_code == 200
+    assert report_response.json()["report_data"]["challan_lookup"]["status"] == "not_run"
 
 
 def _create_workflow_assessment_with_images(
@@ -436,7 +571,8 @@ def test_workflow_endpoint_runs_available_stages_and_returns_report(workflow_cli
 
     response = workflow_client.post(
         f"/api/v1/assessments/{assessment_id}/workflow",
-        json={"image_ids": image_ids, "vehicle": _price_vehicle_payload()},
+        json={"image_ids": image_ids, "vehicle": _price_vehicle_payload(),
+              "image_types": {image_id: "vehicle_exterior" for image_id in image_ids}},
     )
 
     assert response.status_code == 200
@@ -455,6 +591,8 @@ def test_workflow_endpoint_runs_available_stages_and_returns_report(workflow_cli
     assert body["stages"]["damage_detection"]["result"]["processed_count"] == 2
     assert body["stages"]["pricing"]["result"]["amount"] == "625000.00"
     assert body["stages"]["report"]["result"]["report_data"]["market_valuation"]["status"] == "unavailable"
+    assert body["stages"]["challan_lookup"]["status"] in {"available", "disabled", "unavailable"}
+    assert body["stages"]["fastag_lookup"]["status"] in {"available", "disabled", "unavailable"}
 
 
 def test_workflow_enabled_lookup_fills_only_returned_pricing_features(workflow_client, monkeypatch):
@@ -575,15 +713,29 @@ def test_workflow_disabled_lookup_is_not_called_and_missing_features_are_reporte
     assert client.get(f"/api/v1/assessments/{assessment_id}/report").json()["report_data"]["stages"]["pricing"]["status"] == "skipped"
 
 
-def test_workflow_rejects_manual_vehicle_specifications(workflow_client):
+def test_workflow_accepts_explicit_vehicle_attributes_for_pricing(workflow_client):
     assessment_id, image_ids = _create_workflow_assessment_with_images(workflow_client)
 
     response = workflow_client.post(
         f"/api/v1/assessments/{assessment_id}/workflow",
-        json={"image_ids": image_ids, "vehicle": {"engine_cc": 1200}},
+        json={
+            "image_ids": image_ids,
+            "vehicle": {
+                "make": "Example Motors", "model": "City", "fuel_type": "petrol",
+                "registration_year": 2021, "odometer_km": 42000,
+                "seller_type": "Individual", "transmission": "manual",
+                "mileage_kmpl": 18, "engine_cc": 1498, "max_power_bhp": 119,
+                "seats": 5,
+            },
+        },
     )
 
-    assert response.status_code == 422
+    assert response.status_code == 200
+    assert response.json()["stages"]["pricing"]["status"] == "available"
+    report = response.json()["stages"]["report"]["result"]["report_data"]
+    estimate = report["price_estimates"][0]
+    assert estimate["vehicle"]["registration_year"] == 2021
+    assert estimate["provenance"]["registration_year"] == "user_input"
 
 
 def test_workflow_manual_vehicle_corrections_are_persisted_and_used(workflow_client, monkeypatch):
@@ -717,6 +869,10 @@ def test_workflow_endpoint_preserves_successful_stages_when_one_ocr_fails(workfl
     assert body["stages"]["damage_detection"]["status"] == "completed_with_findings"
     assert body["stages"]["pricing"]["status"] == "available"
     assert body["stages"]["report"]["status"] == "available"
+    report_ocr = body["stages"]["report"]["result"]["report_data"]["stages"]["ocr"]
+    image_states = {result["image_id"]: result["status"] for result in report_ocr["image_results"]}
+    assert image_states[image_ids[0]] == "unavailable"
+    assert image_states[image_ids[1]] == "completed"
 
 
 def test_workflow_endpoint_marks_unconfigured_providers_unavailable(workflow_client):

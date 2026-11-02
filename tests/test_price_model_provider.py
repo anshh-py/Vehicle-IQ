@@ -103,6 +103,10 @@ def test_brand_normalization_matches_training_vocabulary():
     assert _normalize_brand("Toyota") == "Toyota"
 
 
+@pytest.mark.skipif(
+    not settings.price_model_path.is_file(),
+    reason="requires the configured trained price-model artifact",
+)
 def test_real_model_produces_genuine_estimate(vehicle):
     """End-to-end inference against the trained artifact, not a mock.
 

@@ -15,7 +15,7 @@ from sqlalchemy.pool import StaticPool
 
 from app.api.v1.ocr import get_ocr_client
 from app.db.base import Base
-from app.db.models import OCRResult, UploadedImage, VehicleAssessment
+from app.db.models import EvidenceRecord, OCRResult, UploadedImage, VehicleAssessment
 from app.db.session import get_db
 from app.main import app
 from app.ocr.client import (
@@ -108,6 +108,17 @@ def count_ocr_results(engine) -> int:
         return session.scalar(select(func.count()).select_from(OCRResult)) or 0
 
 
+def latest_ocr_attempt(engine, image_id: str) -> dict:
+    with Session(engine) as session:
+        attempt = session.scalar(
+            select(EvidenceRecord)
+            .where(EvidenceRecord.evidence_type == "ocr_attempt", EvidenceRecord.image_id == UUID(image_id))
+            .order_by(EvidenceRecord.created_at.desc(), EvidenceRecord.id.desc())
+        )
+        assert attempt is not None
+        return dict(attempt.evidence_data)
+
+
 def test_ocr_success_persists_output_and_omits_missing_confidence(ocr_api):
     client, assessment_id, image_id, _storage, engine, fake = ocr_api
     fake.result = OCRRecognition(text="Text read from the image")
@@ -127,6 +138,7 @@ def test_ocr_success_persists_output_and_omits_missing_confidence(ocr_api):
         assert record.raw_text == "Text read from the image"
         assert record.result_type == "image_ocr"
         assert record.status == "completed"
+    assert latest_ocr_attempt(engine, image_id)["status"] == "completed"
 
 
 def test_ocr_preprocessing_orients_scales_and_returns_supported_png():
@@ -268,18 +280,22 @@ def test_public_no_text_output_does_not_complete_or_persist_ocr(ocr_api):
     assert response.status_code == 422
     assert response.json()["detail"] == "No readable text was found in the image."
     assert count_ocr_results(engine) == 0
+    attempt = latest_ocr_attempt(engine, image_id)
+    assert attempt["status"] == "no_text"
+    assert attempt["error_code"] == "no_text_detected"
 
 
 @pytest.mark.parametrize(
     ("error", "status_code", "detail"),
     [
         (OCRServiceUnavailable(), 503, "OCR service is unavailable."),
+        (OCRServiceUnavailable("OCR service timed out"), 503, "OCR service is unavailable."),
         (OCRInvalidResponse(), 502, "OCR service returned an invalid response."),
-        (OCRInferenceFailed(), 502, "OCR inference failed. The OCR service returned no error details."),
+        (OCRInferenceFailed(), 502, "OCR inference failed."),
         (OCRUnreadableText(), 422, "No readable text was found in the image."),
     ],
 )
-def test_ocr_service_failures_are_safe_and_not_persisted(ocr_api, error, status_code, detail):
+def test_ocr_service_failures_are_safe_and_persist_attempt_state(ocr_api, error, status_code, detail):
     client, assessment_id, image_id, _storage, engine, fake = ocr_api
     fake.error = error
 
@@ -288,18 +304,30 @@ def test_ocr_service_failures_are_safe_and_not_persisted(ocr_api, error, status_
     assert response.status_code == status_code
     assert response.json()["detail"] == detail
     assert count_ocr_results(engine) == 0
+    attempt = latest_ocr_attempt(engine, image_id)
+    expected_state = "no_text" if isinstance(error, OCRUnreadableText) else (
+        "unavailable" if isinstance(error, OCRServiceUnavailable) else "failed"
+    )
+    assert attempt["status"] == expected_state
+    if isinstance(error, OCRServiceUnavailable) and (
+        "timeout" in str(error).casefold() or "timed out" in str(error).casefold()
+    ):
+        assert attempt["error_code"] == "provider_timeout"
 
 
 def test_ocr_inference_failure_detail_is_logged_and_returned_safely(ocr_api, caplog):
     client, assessment_id, image_id, _storage, engine, fake = ocr_api
-    fake.error = OCRInferenceFailed("Hugging Face OCR Space inference failed: CUDA worker is unavailable")
+    fake.error = OCRInferenceFailed("Hugging Face OCR Space failed for registration RJ45CA1879: CUDA worker unavailable")
 
     response = client.post(f"/api/v1/assessments/{assessment_id}/images/{image_id}/ocr")
 
     assert response.status_code == 502
-    assert response.json()["detail"] == str(fake.error)
-    assert "CUDA worker is unavailable" in caplog.text
+    assert response.json()["detail"] == "OCR inference failed."
+    assert "RJ45CA1879" not in response.text
+    assert "RJ45CA1879" not in caplog.text
+    assert "inference failed (OCRInferenceFailed)" in caplog.text
     assert count_ocr_results(engine) == 0
+    assert latest_ocr_attempt(engine, image_id)["error_code"] == "inference_failed"
 
 
 def test_ocr_returns_404_for_missing_assessment_or_unrelated_image(ocr_api):
@@ -330,7 +358,7 @@ def test_ocr_returns_404_for_missing_image(ocr_api):
 
 
 def test_ocr_returns_safe_unavailable_error_when_service_url_is_not_configured(ocr_api):
-    client, assessment_id, image_id, _storage, _engine, fake = ocr_api
+    client, assessment_id, image_id, _storage, engine, fake = ocr_api
     app.dependency_overrides[get_ocr_client] = lambda: None
 
     response = client.post(f"/api/v1/assessments/{assessment_id}/images/{image_id}/ocr")
@@ -338,6 +366,9 @@ def test_ocr_returns_safe_unavailable_error_when_service_url_is_not_configured(o
     assert response.status_code == 503
     assert response.json()["detail"] == "OCR service is not configured."
     assert fake.calls == []
+    attempt = latest_ocr_attempt(engine, image_id)
+    assert attempt["status"] == "unavailable"
+    assert attempt["error_code"] == "provider_not_configured"
 
 
 def test_ocr_rejects_corrupt_stored_image_before_calling_service(ocr_api):
@@ -354,3 +385,6 @@ def test_ocr_rejects_corrupt_stored_image_before_calling_service(ocr_api):
     assert response.json()["detail"] == "Stored image is corrupt or unsupported."
     assert fake.calls == []
     assert count_ocr_results(engine) == 0
+    attempt = latest_ocr_attempt(engine, image_id)
+    assert attempt["status"] == "failed"
+    assert attempt["error_code"] == "invalid_image"

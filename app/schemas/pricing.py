@@ -69,11 +69,18 @@ class PricingUserInput(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
+    make: NonEmptyMake | None = None
+    model: NonEmptyModel | None = None
+    variant: NonEmptyVariant | None = None
+    registration_year: int | None = Field(default=None, ge=1886, le=date.today().year)
     odometer_km: int | None = Field(default=None, ge=0, le=2_000_000)
+    fuel_type: FuelType | None = None
     seller_type: SellerType | None = None
     transmission: TransmissionType | None = None
     mileage_kmpl: float | None = Field(default=None, gt=0, le=100)
     max_power_bhp: float | None = Field(default=None, gt=0, le=2_000)
+    engine_cc: int | None = Field(default=None, ge=1, le=10_000)
+    seats: int | None = Field(default=None, ge=1, le=9)
     seller_asking_price: Decimal | None = Field(
         default=None,
         gt=0,

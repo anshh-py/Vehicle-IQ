@@ -29,17 +29,41 @@ class DamageWorkerError(RuntimeError):
 class DamageWorkerUnavailable(DamageWorkerError):
     """The configured isolated runtime or local model is unavailable."""
 
+    reason_code = "inference_unavailable"
+
+
+class DamageRuntimeUnavailable(DamageWorkerUnavailable):
+    reason_code = "runtime_unavailable"
+
+
+class DamageCheckpointUnavailable(DamageWorkerUnavailable):
+    reason_code = "checkpoint_unavailable"
+
+
+class DamageRunnerUnavailable(DamageWorkerUnavailable):
+    reason_code = "runner_unavailable"
+
+
+class DamageInferenceDisabled(DamageWorkerUnavailable):
+    reason_code = "inference_disabled"
+
 
 class DamageWorkerTimeout(DamageWorkerError):
     """The CPU inference process exceeded its configured timeout."""
+
+    reason_code = "inference_timeout"
 
 
 class DamageWorkerInvalidResponse(DamageWorkerError):
     """The worker did not return the documented result payload."""
 
+    reason_code = "invalid_worker_response"
+
 
 class DamageWorkerInferenceFailed(DamageWorkerError):
     """The worker started but could not complete model inference."""
+
+    reason_code = "inference_failed"
 
 
 class DamageProvider(Protocol):
@@ -73,11 +97,11 @@ class IsolatedDamageProvider:
         if extension not in _ALLOWED_EXTENSIONS:
             raise DamageWorkerInvalidResponse("Unsupported image format for damage inference.")
         if not self.python_executable.is_file():
-            raise DamageWorkerUnavailable("Dedicated damage inference environment is unavailable.")
+            raise DamageRuntimeUnavailable("Dedicated damage inference environment is unavailable.")
         if not self.checkpoint_path.is_file():
-            raise DamageWorkerUnavailable("Local damage checkpoint is unavailable.")
+            raise DamageCheckpointUnavailable("Local damage checkpoint is unavailable.")
         if not self.runner_path.is_file():
-            raise DamageWorkerUnavailable("Damage inference runner is unavailable.")
+            raise DamageRunnerUnavailable("Damage inference runner is unavailable.")
 
         try:
             with tempfile.TemporaryDirectory(prefix="vehicle-iq-damage-") as temp_dir:
@@ -106,7 +130,7 @@ class IsolatedDamageProvider:
         except subprocess.TimeoutExpired as exc:
             raise DamageWorkerTimeout("Damage inference exceeded its time limit.") from exc
         except OSError as exc:
-            raise DamageWorkerUnavailable("Unable to start the isolated damage inference process.") from exc
+            raise DamageRuntimeUnavailable("Unable to start the isolated damage inference process.") from exc
 
         payload = self._extract_payload(completed.stdout)
         if payload is None:

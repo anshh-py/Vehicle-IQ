@@ -327,7 +327,7 @@ def test_incomplete_results_are_reported_as_pending_or_unavailable(report_api):
     data = response.json()["report_data"]
     assert response.json()["status"] == "draft"
     assert data["stages"] == {
-        "ocr": {"status": "unavailable", "result_count": 0, "completed_image_count": 0},
+        "ocr": {"status": "unavailable", "result_count": 0, "completed_image_count": 0, "image_results": []},
         "damage_detection": {
             "status": "unavailable",
             "finding_count": 0,

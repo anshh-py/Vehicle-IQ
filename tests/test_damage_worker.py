@@ -5,6 +5,9 @@ import subprocess
 import pytest
 
 from app.damage.worker import (
+    DamageCheckpointUnavailable,
+    DamageRuntimeUnavailable,
+    DamageRunnerUnavailable,
     DamageWorkerInvalidResponse,
     DamageWorkerTimeout,
     IsolatedDamageProvider,
@@ -77,3 +80,27 @@ def test_worker_rejects_malformed_response(tmp_path, monkeypatch):
 
     with pytest.raises(DamageWorkerInvalidResponse):
         provider.detect(b"png image data", "png")
+
+
+def test_worker_reports_missing_runtime_checkpoint_and_runner_separately(tmp_path):
+    missing_runtime = IsolatedDamageProvider(
+        tmp_path / "missing-python", tmp_path / "missing-model", runner_path=tmp_path / "missing-runner"
+    )
+    with pytest.raises(DamageRuntimeUnavailable):
+        missing_runtime.detect(b"image", "png")
+
+    python = tmp_path / "python.exe"
+    python.write_bytes(b"runtime")
+    missing_checkpoint = IsolatedDamageProvider(
+        python, tmp_path / "missing-model", runner_path=tmp_path / "runner.py"
+    )
+    with pytest.raises(DamageCheckpointUnavailable):
+        missing_checkpoint.detect(b"image", "png")
+
+    checkpoint = tmp_path / "model.pt"
+    checkpoint.write_bytes(b"checkpoint")
+    missing_runner = IsolatedDamageProvider(
+        python, checkpoint, runner_path=tmp_path / "missing-runner"
+    )
+    with pytest.raises(DamageRunnerUnavailable):
+        missing_runner.detect(b"image", "png")

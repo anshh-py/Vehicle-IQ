@@ -24,7 +24,7 @@ def test_landing_report_assets_and_hero_image_are_served():
     assert "hero-visual" in page.text
     assert 'id="photo-input" type="file"' in page.text
     assert "report-shell" in page.text
-    assert "/dashboard/assets/vehicle-hero.png" in page.text
+    assert 'href="./assets/vehicle-hero.png"' in page.text
     assert hero.content.startswith(b"\x89PNG\r\n\x1a\n")
     assert len(hero.content) > 100_000
     assert "prefers-reduced-motion" in styles.text
@@ -99,12 +99,19 @@ def test_submission_reuses_existing_upload_workflow_and_pricing_contracts():
     assert "missing_fields" in script
     assert "`/${encodeURIComponent(assessmentId)}/workflow`" in script
     assert "vehicle: pricingVehicle" in script
+    assert "workflowPayload.image_types = selectedImageTypes" in script
+    assert "imageTypes: workflowImageTypes" in script
+    assert "photoTypes = photoTypes.filter" in script
     assert "let skipNextHashChange = '';" in script
     assert "if (location.hash === skipNextHashChange)" in script
     assert "pricing.status === 'available' && reportStage.status === 'available'" in script
     assert "navigate(`/report/${encodeURIComponent(assessmentId)}`)" in script
-    assert 'name="make"' not in initial_form
     for field in (
+        "make",
+        "model",
+        "variant",
+        "fuel_type",
+        "registration_year",
         "registration_number",
         "asking_price",
         "seller_type",
@@ -112,6 +119,8 @@ def test_submission_reuses_existing_upload_workflow_and_pricing_contracts():
         "transmission",
         "mileage_kmpl",
         "max_power_bhp",
+        "engine_cc",
+        "seats",
     ):
         assert f'name="{field}"' in initial_form
 
@@ -144,8 +153,9 @@ def test_pricing_completion_allows_manual_corrections_and_displays_provenance():
     assert "for (const name of missingFields)" in script
     for field in ("odometer_km", "seller_type", "transmission", "mileage_kmpl", "max_power_bhp"):
         assert f"{field}:" in definitions
-    for field in ("make", "model", "registration_year", "fuel_type", "engine_cc", "seats", "owner_count"):
-        assert f"{field}:" not in definitions
+    for field in ("make", "model", "registration_year", "fuel_type", "engine_cc", "seats"):
+        assert f"{field}:" in definitions
+    assert "owner_count:" not in definitions
     assert "const sources = [assessmentDetails, lookup, estimateVehicle, pricingVehicle || {}]" in script
     assert "source.registration_date" in script
     assert "Review or correct pricing details" in page
@@ -155,6 +165,14 @@ def test_pricing_completion_allows_manual_corrections_and_displays_provenance():
     assert "Correct these vehicle details before retrying: ${missingLabels.join(', ')}." in script
     assert "lookupResult.field_provenance" in script
     assert "report.vehicle_details_provenance" in script
+    assert 'name="make"' in page and 'name="model"' in page
+    assert 'name="registration_year"' in page and 'name="fuel_type"' in page
+    assert 'name="engine_cc"' in page and 'name="seats"' in page
+    assert "cleanStatus(report.challan_lookup?.status)" in script
+    assert "cleanStatus(report.fastag_lookup?.status)" in script
+    assert "Market valuation unavailable" in script
+    assert "market.refresh_status === 'refresh_failed'" in script
+    assert "provider_error" in script
 
 
 def test_report_prefill_maps_manufacturing_year_to_registration_year():
@@ -378,7 +396,7 @@ def test_dark_mobile_layout_and_accessible_upload_controls():
     page = (FRONTEND / "index.html").read_text(encoding="utf-8")
     styles = (FRONTEND / "styles.css").read_text(encoding="utf-8")
 
-    assert '<a class="header-action" href="/inspect">' in page
+    assert '<a class="header-action" href="#/inspect">' in page
     assert 'aria-label="Main navigation"' in page
     assert 'aria-labelledby="photos-title"' in page
     assert 'aria-describedby="upload-help"' in page

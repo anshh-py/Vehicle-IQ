@@ -12,13 +12,20 @@ from decimal import Decimal
 from uuid import UUID
 
 from fastapi.testclient import TestClient
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, event
 from sqlalchemy.orm import Session
 from sqlalchemy.pool import StaticPool
 from uuid import UUID
 
 from app.db.base import Base
 from app.db.session import get_db
+from app.api.v1.damage import get_damage_provider
+from app.api.v1.ocr import get_ocr_client
+from app.api.v1.vehicle_lookup import (
+    get_challan_provider,
+    get_fastag_provider,
+    get_vehicle_registration_provider,
+)
 from app.damage.inference import DamageDetection, DamageInferenceResult
 from app.damage.worker import DamageWorkerUnavailable
 from app.main import app
@@ -54,8 +61,34 @@ def png_bytes() -> bytes:
     from PIL import Image
 
     output = BytesIO()
-    Image.new("RGB", (32, 24), color=(180, 180, 180)).save(output, format="PNG")
+    Image.new("RGB", (320, 240), color=(180, 180, 180)).save(output, format="PNG")
     return output.getvalue()
+
+
+def _create_workflow_assessment_with_images(client, image_count=1, registration_number=None):
+    payload = {
+        "vehicle_details": {
+            "make": "Test Make", "model": "Test Model", "variant": "X",
+            "fuel_type": "petrol", "registration_year": 2021,
+            "odometer_km": 50000, "transmission": "manual", "seller_type": "Individual",
+            "seats": 5, "engine_cc": 1500, "max_power_bhp": 100,
+            "mileage_kmpl": 15,
+        }
+    }
+    if registration_number is not None:
+        payload["registration_number"] = registration_number
+    created = client.post("/api/v1/assessments", json=payload)
+    assert created.status_code == 201
+    assessment_id = created.json()["id"]
+    image_ids = []
+    for index in range(image_count):
+        uploaded = client.post(
+            f"/api/v1/assessments/{assessment_id}/images",
+            files={"file": (f"workflow-{index}.png", png_bytes(), "image/png")},
+        )
+        assert uploaded.status_code == 201
+        image_ids.append(uploaded.json()["id"])
+    return UUID(assessment_id), image_ids
 
 
 class FakeOCR:
@@ -115,7 +148,7 @@ class FakePrice:
 
 
 @pytest.fixture
-def workflow_client(tmp_path):
+def workflow_client(tmp_path, monkeypatch):
     """Create a test client with mocked providers."""
     engine = create_engine(
         "sqlite+pysqlite:///:memory:",
@@ -142,6 +175,8 @@ def workflow_client(tmp_path):
     app.dependency_overrides[get_fastag_provider] = lambda: FailedFastag()
     app.dependency_overrides[get_damage_provider] = lambda: FakeDamage()
     app.dependency_overrides[get_price_provider] = lambda: FakePrice()
+    app.state.workflow_test_engine = engine
+    monkeypatch.setattr("app.api.v1.damage.settings.damage_inference_enabled", True)
 
     try:
         with TestClient(app) as client:
@@ -149,6 +184,8 @@ def workflow_client(tmp_path):
     finally:
         app.dependency_overrides.clear()
         engine.dispose()
+        if hasattr(app.state, "workflow_test_engine"):
+            del app.state.workflow_test_engine
 
 
 def test_workflow_duplicate_submission_returns_stored_result(
@@ -161,18 +198,18 @@ def test_workflow_duplicate_submission_returns_stored_result(
     # Run the workflow the first time
     response1 = client.post(
         f"/api/v1/assessments/{assessment_id}/workflow",
-        json={"image_ids": image_ids},
+        json={"image_ids": image_ids, "image_types": {image_id: "vehicle_exterior" for image_id in image_ids}},
     )
     assert response1.status_code == 200
     body1 = response1.json()
-    assert body1["status"] == "completed"
+    assert body1["status"] == "completed", body1["stages"]
     assert body1["stages"]["pricing"]["status"] == "available"
     assert body1["stages"]["report"]["status"] == "available"
 
     # Run the workflow a second time (duplicate submission)
     response2 = client.post(
         f"/api/v1/assessments/{assessment_id}/workflow",
-        json={"image_ids": image_ids},
+        json={"image_ids": image_ids, "image_types": {image_id: "vehicle_exterior" for image_id in image_ids}},
     )
     assert response2.status_code == 200
     body2 = response2.json()
@@ -202,7 +239,7 @@ def test_workflow_failure_preserves_error_state_and_dispatches_correct_status(
     # Run the workflow - pricing should fail
     response = client.post(
         f"/api/v1/assessments/{assessment_id}/workflow",
-        json={"image_ids": image_ids},
+        json={"image_ids": image_ids, "image_types": {image_id: "vehicle_exterior" for image_id in image_ids}},
     )
 
     # The workflow should succeed with a failed pricing stage
@@ -219,10 +256,8 @@ def test_workflow_failure_preserves_error_state_and_dispatches_correct_status(
     assert report_data["stages"]["pricing"]["error_code"] == "price_provider_failed"
 
     # Clean up: remove the failed price estimate
-    with Session(engine) as session:
-        session.query(PriceEstimate).filter(
-            PriceEstimate.assessment_id == assessment_id
-        ).delete()
+    with Session(client.app.state.workflow_test_engine) as session:
+        session.query(PriceEstimate).filter(PriceEstimate.assessment_id == assessment_id).delete()
         session.commit()
 
 
@@ -245,14 +280,14 @@ def test_damage_inference_failure_reports_actual_reason_not_generic_unavailable(
     # Run the workflow
     response = client.post(
         f"/api/v1/assessments/{assessment_id}/workflow",
-        json={"image_ids": image_ids},
+        json={"image_ids": image_ids, "image_types": {image_id: "vehicle_exterior" for image_id in image_ids}},
     )
 
     # The workflow should succeed with a failed damage stage
     assert response.status_code == 200
     body = response.json()
     assert body["status"] == "partial"
-    assert body["stages"]["damage_detection"]["status"] == "failed"
+    assert body["stages"]["damage_detection"]["status"] == "failed", body["stages"]["damage_detection"]
     # The error should be specific, not generic
     assert any("inference" in error["code"] for error in
                body["stages"]["damage_detection"].get("errors", []))
@@ -264,14 +299,12 @@ def test_damage_inference_failure_reports_actual_reason_not_generic_unavailable(
     assert damage_status == "failed"
 
     # Clean up
-    with Session(engine) as session:
-        session.query(PriceEstimate).filter(
-            PriceEstimate.assessment_id == assessment_id
-        ).delete()
+    with Session(client.app.state.workflow_test_engine) as session:
+        session.query(PriceEstimate).filter(PriceEstimate.assessment_id == assessment_id).delete()
         session.commit()
 
 
-def test_ml_estimate_inr_is_consistent_with_stored_price_estimate():
+def test_ml_estimate_inr_is_consistent_with_stored_price_estimate(workflow_client):
     """ML estimate in report should match the stored price estimate amount."""
     from app.db.models import PriceEstimate
 
@@ -279,7 +312,7 @@ def test_ml_estimate_inr_is_consistent_with_stored_price_estimate():
     assessment_id = _create_test_assessment(client)
 
     # Create a price estimate directly in the database
-    with Session(engine) as session:
+    with Session(client.app.state.workflow_test_engine) as session:
         price_estimate = PriceEstimate(
             assessment_id=assessment_id,
             amount=Decimal("167276.00"),
@@ -294,7 +327,7 @@ def test_ml_estimate_inr_is_consistent_with_stored_price_estimate():
         session.commit()
 
     # Generate the report
-    report_response = client.get(f"/api/v1/assessments/{assessment_id}/report")
+    report_response = client.post(f"/api/v1/assessments/{assessment_id}/report")
     assert report_response.status_code == 200
     report_data = report_response.json()["report_data"]
 
@@ -314,10 +347,10 @@ def test_damage_detection_persists_no_findings_as_completed_not_unavailable(
     assessment_id, image_ids = _create_workflow_assessment_with_images(client, image_count=2)
 
     # Create a damage finding directly in the database with no detections
-    with Session(engine) as session:
+    with Session(client.app.state.workflow_test_engine) as session:
         finding = DamageFinding(
             assessment_id=assessment_id,
-            image_id=image_ids[0],
+            image_id=UUID(image_ids[0]),
             damage_type="test",
             confidence=0.0,
             bounding_box={},
@@ -326,7 +359,7 @@ def test_damage_detection_persists_no_findings_as_completed_not_unavailable(
         session.add(finding)
         evidence = EvidenceRecord(
             assessment_id=assessment_id,
-            image_id=image_ids[0],
+            image_id=UUID(image_ids[0]),
             evidence_type="damage_detection",
             source_reference="yolo11m_local",
             evidence_data={"status": "completed", "detection_count": 0},
@@ -335,7 +368,7 @@ def test_damage_detection_persists_no_findings_as_completed_not_unavailable(
         session.commit()
 
     # Generate the report
-    report_response = client.get(f"/api/v1/assessments/{assessment_id}/report")
+    report_response = client.post(f"/api/v1/assessments/{assessment_id}/report")
     assert report_response.status_code == 200
     report_data = report_response.json()["report_data"]
 

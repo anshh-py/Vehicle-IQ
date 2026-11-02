@@ -47,13 +47,24 @@ _DAMAGE_COMPLETION_LIMITATION = (
     "Legacy damage records may have no scan-completion evidence; an empty finding list "
     "for those records cannot distinguish a completed scan from a scan that has not run."
 )
+_DAMAGE_REASON_CODES = {
+    "stored_image_unavailable", "invalid_image", "eligibility_classification_failed",
+    "image_rejected_by_eligibility",
+    "eligibility_not_submitted_insufficient_classification_evidence",
+    "inference_disabled", "runtime_unavailable", "checkpoint_unavailable",
+    "runner_unavailable", "inference_unavailable", "inference_timeout",
+    "invalid_worker_response", "inference_failed", "image_processing_failed",
+}
 _PRICING_PROVENANCE_LABELS = {
     "vehicle_api",
     "model_default",
     "generic_fallback",
     "user_input",
 }
-_USER_PRICING_FIELDS = {"odometer_km", "seller_type"}
+_USER_PRICING_FIELDS = {
+    "make", "model", "variant", "registration_year", "odometer_km", "fuel_type",
+    "seller_type", "transmission", "mileage_kmpl", "engine_cc", "max_power_bhp", "seats",
+}
 
 
 def _iso(value: datetime | None) -> str | None:
@@ -107,7 +118,7 @@ def _latest_vehicle_service(results: list[OCRResult], result_type: str, allowed_
         else None
     )
     state = data.get("state")
-    if state not in {"available", "unavailable", "partial", "failed"}:
+    if state not in {"available", "unavailable", "partial", "failed", "disabled", "not_run"}:
         state = latest.status if latest.status in {"unavailable", "partial", "failed"} else "failed"
     return {
         "status": state,
@@ -650,6 +661,7 @@ def _build_report_data(
     market_valuation: dict[str, Any],
     pricing_workflow_state: dict[str, Any] | None = None,
     vehicle_lookup_workflow_state: dict[str, Any] | None = None,
+    ocr_attempts: list[EvidenceRecord] | None = None,
 ) -> dict[str, Any]:
     image_ids = {image.id for image in images}
     completed_ocr_image_ids = {
@@ -660,18 +672,71 @@ def _build_report_data(
         and result.image_id is not None
         and result.image_id in image_ids
     }
-    if image_ids:
-        completed_ocr_count = len(completed_ocr_image_ids)
-        if completed_ocr_count == len(image_ids):
+    latest_ocr_attempts: dict[UUID, EvidenceRecord] = {}
+    for attempt in ocr_attempts or []:
+        if attempt.image_id is None or attempt.image_id not in image_ids:
+            continue
+        previous = latest_ocr_attempts.get(attempt.image_id)
+        if previous is None or (attempt.created_at, str(attempt.id)) > (
+            previous.created_at,
+            str(previous.id),
+        ):
+            latest_ocr_attempts[attempt.image_id] = attempt
+
+    safe_ocr_messages = {
+        "provider_not_configured": "No OCR provider is configured.",
+        "provider_timeout": "The OCR provider timed out.",
+        "provider_unavailable": "The OCR provider is unavailable.",
+        "stored_image_unavailable": "The stored image could not be read.",
+        "invalid_image": "The stored image is corrupt or unsupported.",
+        "image_preprocessing_failed": "The image could not be prepared for OCR.",
+        "invalid_provider_response": "The OCR provider returned an invalid response.",
+        "no_text_detected": "The OCR provider completed but found no readable text.",
+        "inference_failed": "The OCR provider reported an inference failure.",
+        "unexpected_provider_error": "The OCR attempt failed unexpectedly.",
+        "result_persistence_failed": "The OCR result could not be saved.",
+    }
+    image_ocr_attempts = []
+    for image in sorted(images, key=lambda item: (item.uploaded_at, str(item.id))):
+        attempt = latest_ocr_attempts.get(image.id)
+        stored = attempt.evidence_data if attempt and isinstance(attempt.evidence_data, dict) else {}
+        status_value = stored.get("status")
+        if status_value not in {"not_started", "processing", "completed", "no_text", "failed", "unavailable"}:
+            status_value = "completed" if image.id in completed_ocr_image_ids else "not_started"
+        error_code = stored.get("error_code") if isinstance(stored.get("error_code"), str) else None
+        provider = stored.get("provider")
+        if provider not in {"baidu_unlimited_ocr", "huggingface_gradio", "paddleocr_local"}:
+            provider = None
+        image_ocr_attempts.append({
+            "image_id": str(image.id),
+            "status": status_value,
+            "error_code": error_code if error_code in safe_ocr_messages else None,
+            "message": safe_ocr_messages.get(error_code),
+            "provider": provider,
+            "attempted_at": _iso(attempt.observed_at or attempt.created_at) if attempt else None,
+        })
+
+    attempt_statuses = [item["status"] for item in image_ocr_attempts]
+    completed_ocr_count = sum(value == "completed" for value in attempt_statuses)
+    if attempt_statuses:
+        if all(value == "completed" for value in attempt_statuses):
             ocr_status = "available"
         elif completed_ocr_count:
             ocr_status = "partial"
-        else:
+        elif all(value == "not_started" for value in attempt_statuses):
             ocr_status = "pending"
+        elif any(value == "failed" for value in attempt_statuses):
+            ocr_status = "failed"
+        elif any(value == "processing" for value in attempt_statuses):
+            ocr_status = "processing"
+        elif all(value == "no_text" for value in attempt_statuses):
+            ocr_status = "no_text"
+        elif all(value == "unavailable" for value in attempt_statuses):
+            ocr_status = "unavailable"
+        else:
+            ocr_status = "partial"
     elif any(result.result_type == "image_ocr" and result.status == "completed" for result in ocr_results):
         ocr_status = "available"
-    elif any(result.result_type == "image_ocr" for result in ocr_results):
-        ocr_status = "pending"
     else:
         ocr_status = "unavailable"
 
@@ -724,7 +789,18 @@ def _build_report_data(
                 if isinstance(eligibility.evidence_data.get("reason"), str):
                     data = eligibility.evidence_data
         reason = data.get("reason") if isinstance(data.get("reason"), str) else None
-        return {"image_id": str(image.id), "status": outcome, "reason": reason}
+        raw_reason_code = data.get("reason_code")
+        reason_code = (
+            raw_reason_code
+            if isinstance(raw_reason_code, str) and raw_reason_code in _DAMAGE_REASON_CODES
+            else None
+        )
+        return {
+            "image_id": str(image.id),
+            "status": outcome,
+            "reason": reason,
+            "reason_code": reason_code,
+        }
 
     damage_image_results = [damage_outcome(image) for image in images]
     damage_statuses = [item["status"] for item in damage_image_results]
@@ -812,8 +888,8 @@ def _build_report_data(
             if isinstance(value, str)
             and value in {"vehicle_api", "model_default", "user_input"}
             and (
-                (key in _USER_PRICING_FIELDS and value == "user_input")
-                or (key not in _USER_PRICING_FIELDS and value in {"vehicle_api", "model_default"})
+                value in {"vehicle_api", "model_default"}
+                or (key in _USER_PRICING_FIELDS and value == "user_input")
             )
         }
         estimate_vehicle = {
@@ -875,7 +951,8 @@ def _build_report_data(
             "ocr": {
                 "status": ocr_status,
                 "result_count": sum(result.result_type == "image_ocr" for result in ocr_results),
-                "completed_image_count": len(completed_ocr_image_ids),
+                "completed_image_count": completed_ocr_count,
+                "image_results": image_ocr_attempts,
             },
             "damage_detection": {
                 "status": damage_status,
@@ -1161,6 +1238,16 @@ def _load_stage_records(db: Session, assessment_id: UUID):
             .order_by(EvidenceRecord.created_at, EvidenceRecord.id)
         ).all()
     )
+    ocr_attempts = list(
+        db.scalars(
+            select(EvidenceRecord)
+            .where(
+                EvidenceRecord.assessment_id == assessment_id,
+                EvidenceRecord.evidence_type == "ocr_attempt",
+            )
+            .order_by(EvidenceRecord.created_at, EvidenceRecord.id)
+        ).all()
+    )
     price_estimates = list(
         db.scalars(
             select(PriceEstimate)
@@ -1168,7 +1255,7 @@ def _load_stage_records(db: Session, assessment_id: UUID):
             .order_by(PriceEstimate.created_at, PriceEstimate.id)
         ).all()
     )
-    return images, ocr_results, damage_findings, damage_scans, price_estimates
+    return images, ocr_results, damage_findings, damage_scans, price_estimates, ocr_attempts
 
 
 @router.post(
@@ -1238,7 +1325,7 @@ def _generate_assessment_report_snapshot(
             if assessment is None:
                 raise HTTPException(status_code=404, detail="Assessment not found.")
 
-            images, ocr_results, damage_findings, damage_scans, price_estimates = _load_stage_records(db, assessment_id)
+            images, ocr_results, damage_findings, damage_scans, price_estimates, ocr_attempts = _load_stage_records(db, assessment_id)
             report = db.scalar(
                 select(AssessmentReport)
                 .where(AssessmentReport.assessment_id == assessment_id)
@@ -1254,6 +1341,7 @@ def _generate_assessment_report_snapshot(
                 market_valuation,
                 pricing_workflow_state,
                 vehicle_lookup_workflow_state,
+                ocr_attempts,
             )
             current_hash = report_data_hash(report_data)
             previous_narrative = None

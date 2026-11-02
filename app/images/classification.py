@@ -9,7 +9,8 @@ from typing import Any, Iterable
 
 from PIL import Image, UnidentifiedImageError
 
-CLASSIFIER_VERSION = "1"
+CLASSIFIER_VERSION = "2"
+DECLARED_IMAGE_TYPES = {"vehicle_exterior", "vehicle_closeup", "registration_plate", "document", "vehicle_interior"}
 
 
 @dataclass(frozen=True)
@@ -119,11 +120,13 @@ def classify_image(
     content: bytes,
     ocr_results: Iterable[Any] | None = None,
     original_filename: str | None = None,
+    declared_image_type: str | None = None,
 ) -> ImageEligibilityDecision:
     classified_at = datetime.now(timezone.utc)
     content_hash = _content_sha256(content)
     ocr_signature = _ocr_result_signature(ocr_results)
-    cache_key = hashlib.sha256(f"{content_hash}|{ocr_signature}|{CLASSIFIER_VERSION}".encode("utf-8")).hexdigest()
+    declared = (declared_image_type or "").strip().casefold() or None
+    cache_key = hashlib.sha256(f"{content_hash}|{ocr_signature}|{declared}|{CLASSIFIER_VERSION}".encode("utf-8")).hexdigest()
 
     try:
         width, height = _image_dimensions(content)
@@ -139,6 +142,8 @@ def classify_image(
         )
 
     aspect_ratio = width / height if height else 0.0
+    sufficiently_large = width >= 320 and height >= 240
+    reasonable_aspect = 0.5 <= aspect_ratio <= 2.5
     texts = _ocr_texts(ocr_results)
     combined_text = "\n".join(texts)
     plate_text = _plate_like(combined_text)
@@ -153,7 +158,34 @@ def classify_image(
         "plate_like_ocr": plate_text,
         "document_like_ocr": document_text,
         "filename_hints": sorted(hints),
+        "declared_image_type": declared,
     }
+
+    if declared in {"registration_plate", "document", "vehicle_interior"}:
+        reason = {
+            "registration_plate": "registration_plate_not_eligible_for_damage_inference",
+            "document": "document_not_eligible_for_damage_inference",
+            "vehicle_interior": "interior_not_supported_for_exterior_damage",
+        }[declared]
+        return ImageEligibilityDecision(
+            image_type=declared,
+            classification_method="user_declared_image_type",
+            eligible_for_damage_inference=False,
+            rejection_reason=reason,
+            classified_at=classified_at,
+            signals=signals,
+            cache_key=cache_key,
+        )
+    if declared is not None and declared not in DECLARED_IMAGE_TYPES:
+        return ImageEligibilityDecision(
+            image_type="unknown",
+            classification_method="invalid_declared_image_type",
+            eligible_for_damage_inference=False,
+            rejection_reason="unsupported_declared_image_type",
+            classified_at=classified_at,
+            signals=signals,
+            cache_key=cache_key,
+        )
 
     plate_dimensions = width <= 400 and height <= 200 and 1.8 <= aspect_ratio <= 3.2
     if "plate" in hints or (plate_text and plate_dimensions):
@@ -190,10 +222,22 @@ def classify_image(
             cache_key=cache_key,
         )
 
+    # Exterior/close-up declarations can clarify otherwise unknown imagery,
+    # but only after plate/document/interior evidence has been rejected.
+    if declared in {"vehicle_exterior", "vehicle_closeup"}:
+        eligible = sufficiently_large and reasonable_aspect
+        return ImageEligibilityDecision(
+            image_type=declared,
+            classification_method="user_declared_image_type+dimensions",
+            eligible_for_damage_inference=eligible,
+            rejection_reason=None if eligible else "low_resolution_or_unsupported_image",
+            classified_at=classified_at,
+            signals=signals,
+            cache_key=cache_key,
+        )
+
     closeup_hint = "closeup" in hints
     vehicle_hint = "vehicle" in hints
-    sufficiently_large = width >= 320 and height >= 240
-    reasonable_aspect = 0.5 <= aspect_ratio <= 2.5
 
     if vehicle_hint or closeup_hint:
         if closeup_hint and not vehicle_hint:
@@ -203,6 +247,9 @@ def classify_image(
         else:
             image_type = "vehicle_exterior"
         if image_type == "vehicle_exterior":
+            # Preserve the legacy filename/vehicle-hint path for existing API
+            # callers. New clients can use image_types for a dimension-checked
+            # explicit declaration when the filename provides no evidence.
             eligible = True
         else:
             eligible = sufficiently_large and reasonable_aspect and width >= 320 and height >= 240
@@ -225,18 +272,19 @@ def classify_image(
         signals=signals,
         cache_key=cache_key,
     )
-def classification_cache_key(content: bytes, ocr_results: Iterable[Any] | None = None) -> str:
+def classification_cache_key(content: bytes, ocr_results: Iterable[Any] | None = None, declared_image_type: str | None = None) -> str:
     content_hash = _content_sha256(content)
     ocr_signature = _ocr_result_signature(ocr_results)
-    return hashlib.sha256(f"{content_hash}|{ocr_signature}|{CLASSIFIER_VERSION}".encode("utf-8")).hexdigest()
+    declared = (declared_image_type or "").strip().casefold() or None
+    return hashlib.sha256(f"{content_hash}|{ocr_signature}|{declared}|{CLASSIFIER_VERSION}".encode("utf-8")).hexdigest()
 
 
-def cached_decision(image: Any, content: bytes, ocr_results: Iterable[Any] | None = None) -> ImageEligibilityDecision | None:
+def cached_decision(image: Any, content: bytes, ocr_results: Iterable[Any] | None = None, declared_image_type: str | None = None) -> ImageEligibilityDecision | None:
     metadata = getattr(image, "image_metadata", None) or {}
     cached = metadata.get("damage_eligibility")
     if not isinstance(cached, dict):
         return None
-    expected_key = classification_cache_key(content, ocr_results)
+    expected_key = classification_cache_key(content, ocr_results, declared_image_type)
     if cached.get("cache_key") != expected_key or cached.get("classifier_version") != CLASSIFIER_VERSION:
         return None
     try:

@@ -10,6 +10,7 @@ DamageInspectionStatus = Literal[
     "unavailable",
     "failed",
 ]
+DamageImageType = Literal["vehicle_exterior", "vehicle_closeup", "registration_plate", "document", "vehicle_interior"]
 
 
 class DamageFindingResponse(BaseModel):
@@ -34,17 +35,21 @@ class ImageDamageResponse(BaseModel):
     findings: list[DamageFindingResponse]
     image_type: str | None = None
     reason: str | None = None
+    reason_code: str | None = None
 
 
 class AssessmentDamageRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     image_ids: list[UUID] = Field(min_length=1, max_length=10)
+    image_types: dict[UUID, DamageImageType] = Field(default_factory=dict)
 
     @model_validator(mode="after")
     def image_ids_must_be_unique(self) -> "AssessmentDamageRequest":
         if len(set(self.image_ids)) != len(self.image_ids):
             raise ValueError("image_ids must not contain duplicates")
+        if not set(self.image_types).issubset(set(self.image_ids)):
+            raise ValueError("image_types keys must be selected image_ids")
         return self
 
 
@@ -56,6 +61,7 @@ class AssessmentImageDamageResult(BaseModel):
     error: str | None = None
     image_type: str | None = None
     reason: str | None = None
+    reason_code: str | None = None
 
 
 class AssessmentDamageResponse(BaseModel):

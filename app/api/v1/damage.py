@@ -13,6 +13,7 @@ from app.core.config import settings
 from app.damage.inference import DamageInferenceResult, DamageInputError
 from app.damage.worker import (
     MODEL_NAME,
+    DamageInferenceDisabled,
     DamageProvider,
     DamageWorkerInferenceFailed,
     DamageWorkerInvalidResponse,
@@ -34,6 +35,7 @@ from app.schemas.damage import (
     AssessmentDamageRequest,
     AssessmentDamageResponse,
     AssessmentImageDamageResult,
+    DamageImageType,
     DamageInspectionStatus,
     DamageFindingResponse,
     ImageDamageResponse,
@@ -46,11 +48,23 @@ logger = logging.getLogger(__name__)
 
 
 def get_damage_provider() -> DamageProvider:
+    enabled = settings.damage_inference_enabled
+    if enabled is None:
+        enabled = settings.app_env.casefold() != "production"
+    if not enabled:
+        return _DisabledDamageProvider()
     return IsolatedDamageProvider(
         settings.damage_inference_python,
         settings.damage_checkpoint_path,
         timeout_seconds=settings.damage_inference_timeout_seconds,
     )
+
+
+class _DisabledDamageProvider:
+    provider_name = IsolatedDamageProvider.provider_name
+
+    def detect(self, content: bytes, extension: str) -> DamageInferenceResult:
+        raise DamageInferenceDisabled("Damage inference is disabled by configuration.")
 
 
 def _finding_response(finding: DamageFinding) -> DamageFindingResponse:
@@ -73,6 +87,7 @@ def _analysis_response(
     *,
     reused: bool,
     status: DamageInspectionStatus | None = None,
+    image_type: str | None = None,
 ) -> ImageDamageResponse:
     ordered_findings = sorted(
         findings,
@@ -91,6 +106,7 @@ def _analysis_response(
         ),
         reused=reused,
         findings=[_finding_response(finding) for finding in ordered_findings],
+        image_type=image_type,
     )
 
 
@@ -171,6 +187,7 @@ def _record_inspection_outcome(
     reason: str | None = None,
     image_type: str | None = None,
     detection_count: int = 0,
+    reason_code: str | None = None,
 ) -> None:
     try:
         db.rollback()
@@ -194,6 +211,8 @@ def _record_inspection_outcome(
                 evidence_data["reason"] = reason
             if image_type:
                 evidence_data["image_type"] = image_type
+            if reason_code:
+                evidence_data["reason_code"] = reason_code
             if record is None:
                 record = EvidenceRecord(
                     assessment_id=assessment_id,
@@ -215,6 +234,7 @@ def _persist_findings(
     assessment_id: UUID,
     image_id: UUID,
     result: DamageInferenceResult,
+    image_type: str | None = None,
 ) -> ImageDamageResponse:
     try:
         db.rollback()
@@ -236,6 +256,7 @@ def _persist_findings(
                     existing,
                     reused=True,
                     status=_stored_damage_status(scan, existing),
+                    image_type=(scan.evidence_data or {}).get("image_type") if scan and isinstance(scan.evidence_data, dict) else image_type,
                 )
 
             findings: list[DamageFinding] = []
@@ -273,10 +294,14 @@ def _persist_findings(
                     else "completed_no_findings"
                 ),
                 "detection_count": len(findings),
+                "inference_time_seconds": result.inference_seconds,
+                "image_type": image_type,
             }
             db.flush()
 
-            response = _analysis_response(assessment_id, image_id, findings, reused=False)
+            response = _analysis_response(
+                assessment_id, image_id, findings, reused=False, image_type=image_type
+            )
         return response
     except HTTPException:
         raise
@@ -295,6 +320,7 @@ def inspect_assessment_image_damage(
     db: Session = Depends(get_db),
     storage: ImageStorage = Depends(get_image_storage),
     provider: DamageProvider = Depends(get_damage_provider),
+    image_type: DamageImageType | None = None,
 ) -> ImageDamageResponse:
     try:
         assessment = db.get(VehicleAssessment, assessment_id)
@@ -319,7 +345,8 @@ def inspect_assessment_image_damage(
     except ImageStorageError:
         reason = "Stored image is unavailable."
         _record_inspection_outcome(
-            db, assessment_id, image_id, "unavailable", reason=reason
+            db, assessment_id, image_id, "unavailable", reason=reason,
+            reason_code="stored_image_unavailable",
         )
         return ImageDamageResponse(
             assessment_id=assessment_id,
@@ -329,6 +356,7 @@ def inspect_assessment_image_damage(
             reused=False,
             findings=[],
             reason=reason,
+            reason_code="stored_image_unavailable",
         )
 
     try:
@@ -336,7 +364,8 @@ def inspect_assessment_image_damage(
     except InvalidImageError:
         reason = "Stored image is corrupt or unsupported."
         _record_inspection_outcome(
-            db, assessment_id, image_id, "unavailable", reason=reason
+            db, assessment_id, image_id, "unavailable", reason=reason,
+            reason_code="invalid_image",
         )
         return ImageDamageResponse(
             assessment_id=assessment_id,
@@ -346,6 +375,7 @@ def inspect_assessment_image_damage(
             reused=False,
             findings=[],
             reason=reason,
+            reason_code="invalid_image",
         )
 
     ocr_results = list(
@@ -361,12 +391,13 @@ def inspect_assessment_image_damage(
     # ineligible, so YOLO is never called for an unclassified image.
     classification_failed = False
     try:
-        decision = cached_decision(image, content, ocr_results)
+        decision = cached_decision(image, content, ocr_results, image_type)
         if decision is None:
             decision = classify_image(
                 content=content,
                 ocr_results=ocr_results,
                 original_filename=image.original_filename,
+                declared_image_type=image_type,
             )
             store_classification(image, decision)
             db.add(image)
@@ -381,7 +412,7 @@ def inspect_assessment_image_damage(
             rejection_reason=f"classification_failed: {type(exc).__name__}",
             classified_at=datetime.now(timezone.utc),
             signals={},
-            cache_key=classification_cache_key(content, ocr_results),
+            cache_key=classification_cache_key(content, ocr_results, image_type),
         )
         store_classification(image, decision)
         try:
@@ -399,6 +430,7 @@ def inspect_assessment_image_damage(
             "failed",
             reason=reason,
             image_type=decision.image_type,
+            reason_code="eligibility_classification_failed",
         )
         return ImageDamageResponse(
             assessment_id=assessment_id,
@@ -409,6 +441,7 @@ def inspect_assessment_image_damage(
             findings=[],
             image_type=decision.image_type,
             reason=reason,
+            reason_code="eligibility_classification_failed",
         )
 
     if not decision.eligible_for_damage_inference:
@@ -454,6 +487,11 @@ def inspect_assessment_image_damage(
             "unavailable",
             reason=decision.rejection_reason,
             image_type=decision.image_type,
+            reason_code=(
+                "eligibility_not_submitted_insufficient_classification_evidence"
+                if decision.rejection_reason == "insufficient_classification_evidence"
+                else "image_rejected_by_eligibility"
+            ),
         )
         return ImageDamageResponse(
             assessment_id=assessment_id,
@@ -464,6 +502,11 @@ def inspect_assessment_image_damage(
             findings=[],
             image_type=decision.image_type,
             reason=decision.rejection_reason,
+            reason_code=(
+                "eligibility_not_submitted_insufficient_classification_evidence"
+                if decision.rejection_reason == "insufficient_classification_evidence"
+                else "image_rejected_by_eligibility"
+            ),
         )
 
     try:
@@ -485,28 +528,42 @@ def inspect_assessment_image_damage(
     except DamageInputError:
         status_value: DamageInspectionStatus = "unavailable"
         reason = "Stored image is corrupt or unsupported."
-    except DamageWorkerUnavailable:
+        reason_code = "invalid_image"
+    except DamageWorkerUnavailable as exc:
         status_value = "unavailable"
-        reason = "Damage inference is unavailable."
+        reason_code = getattr(exc, "reason_code", "inference_unavailable")
+        reason = (
+            "Damage inference is disabled by configuration."
+            if reason_code == "inference_disabled"
+            else "The damage model checkpoint is unavailable."
+            if reason_code == "checkpoint_unavailable"
+            else "The damage inference runtime is unavailable."
+            if reason_code in {"runtime_unavailable", "runner_unavailable"}
+            else "Damage inference is unavailable."
+        )
     except DamageWorkerTimeout:
         status_value = "unavailable"
         reason = "Damage inference timed out."
+        reason_code = "inference_timeout"
     except DamageWorkerInvalidResponse:
         status_value = "unavailable"
         reason = "Damage inference returned an invalid response."
+        reason_code = "invalid_worker_response"
     except DamageWorkerInferenceFailed as exc:
         logger.warning("Damage inference worker failed: %s", type(exc).__name__)
         status_value = "failed"
         reason = "Damage inference failed."
+        reason_code = "inference_failed"
     except Exception as exc:
         logger.warning("Damage inference provider failed: %s", type(exc).__name__)
         status_value = "failed"
         reason = "Damage inference failed."
+        reason_code = "inference_failed"
     else:
-        return _persist_findings(db, assessment_id, image_id, result)
+        return _persist_findings(db, assessment_id, image_id, result, decision.image_type)
 
     _record_inspection_outcome(
-        db, assessment_id, image_id, status_value, reason=reason
+        db, assessment_id, image_id, status_value, reason=reason, reason_code=reason_code
     )
     return ImageDamageResponse(
         assessment_id=assessment_id,
@@ -516,6 +573,7 @@ def inspect_assessment_image_damage(
         reused=False,
         findings=[],
         reason=reason,
+        reason_code=reason_code,
     )
 
 
@@ -540,6 +598,7 @@ def inspect_assessment_damage(
 
     results: list[AssessmentImageDamageResult] = []
     for image_id in payload.image_ids:
+        declared_image_type = payload.image_types.get(image_id)
         try:
             item = inspect_assessment_image_damage(
                 assessment_id=assessment_id,
@@ -547,6 +606,7 @@ def inspect_assessment_damage(
                 db=db,
                 storage=storage,
                 provider=provider,
+                image_type=declared_image_type,
             )
             results.append(
                 AssessmentImageDamageResult(
@@ -557,6 +617,7 @@ def inspect_assessment_damage(
                     error=item.reason,
                     image_type=item.image_type,
                     reason=item.reason,
+                    reason_code=item.reason_code,
                 )
             )
         except HTTPException as exc:
@@ -567,6 +628,7 @@ def inspect_assessment_damage(
                     status="failed",
                     error=str(exc.detail),
                     reason=str(exc.detail),
+                    reason_code="image_processing_failed",
                 )
             )
         except Exception as exc:
@@ -580,6 +642,7 @@ def inspect_assessment_damage(
                     status="failed",
                     error="Damage inspection failed.",
                     reason="Damage inspection failed.",
+                    reason_code="image_processing_failed",
                 )
             )
 

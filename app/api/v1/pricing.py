@@ -19,7 +19,10 @@ from app.schemas.vehicle_lookup import VehicleRegistrationDetails
 
 
 router = APIRouter(prefix="/api/v1/assessments", tags=["price estimates"])
-_MANUAL_SPECIFICATION_FIELDS = ("transmission", "mileage_kmpl", "max_power_bhp")
+_MANUAL_SPECIFICATION_FIELDS = (
+    "make", "model", "variant", "registration_year", "odometer_km", "fuel_type",
+    "seller_type", "transmission", "mileage_kmpl", "engine_cc", "max_power_bhp", "seats",
+)
 
 
 def _persist_manual_pricing_specifications(assessment, user_details) -> bool:

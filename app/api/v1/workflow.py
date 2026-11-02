@@ -1,4 +1,5 @@
 from uuid import UUID
+from types import SimpleNamespace
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import ValidationError
@@ -14,13 +15,18 @@ from app.api.v1.pricing import (
 )
 from app.api.v1.reports import _generate_assessment_report_snapshot, get_market_listing_provider
 from app.api.v1.vehicle_lookup import (
+    _challan_state,
+    _fastag_state,
+    _store_service_result,
+    get_challan_provider,
+    get_fastag_provider,
     get_vehicle_registration_provider,
     lookup_registration_from_manual,
     lookup_registration_from_ocr,
     normalize_manual_registration,
 )
 from app.core.config import settings
-from app.db.models import AssessmentReport, OCRResult, VehicleAssessment
+from app.db.models import AssessmentReport, EvidenceRecord, OCRResult, VehicleAssessment
 from app.db.session import get_db
 from app.pricing.model_defaults import get_model_defaults
 from app.pricing.provider import get_price_provider
@@ -32,12 +38,14 @@ from app.schemas.pricing import (
     PricingUserInput,
     VehiclePriceInput,
 )
+from app.schemas.reports import AssessmentReportResponse
 from app.schemas.workflow import (
     AssessmentWorkflowRequest,
     AssessmentWorkflowResponse,
     WorkflowStageError,
     WorkflowStageResult,
 )
+from app.schemas.vehicle_services import ChallanDetails, FastagDetails
 from app.storage.images import ImageStorage, get_image_storage
 from app.ocr.registration import build_registration_ocr_assessment, normalize_registration_candidate
 
@@ -58,6 +66,19 @@ _XGBOOST_REQUIRED_FIELDS = (
     "max_power_bhp",
     "seats",
 )
+_INDIAN_REGISTRATION_PREFIXES = {
+    "AN", "AP", "AR", "AS", "BR", "CG", "CH", "DD", "DL", "DN", "GA",
+    "GJ", "HP", "HR", "JH", "JK", "KA", "KL", "LA", "LD", "MH", "ML",
+    "MN", "MP", "MZ", "NL", "OD", "OR", "PB", "PY", "RJ", "SK", "TN",
+    "TR", "TS", "UA", "UK", "UP", "WB",
+}
+
+
+def _is_indian_registration_candidate(value: str | None) -> bool:
+    if not isinstance(value, str):
+        return False
+    normalized = value.strip().upper()
+    return normalized.startswith("BH") or normalized[:2] in _INDIAN_REGISTRATION_PREFIXES
 
 
 def _lookup_price_features(details) -> dict:
@@ -138,6 +159,15 @@ def _workflow_lookup_stage(
         candidate = assessment["normalized_candidate"]
     else:
         candidate = manual_registration
+
+    if manual_registration is None and not _is_indian_registration_candidate(candidate):
+        return WorkflowStageResult(
+            status="unavailable",
+            errors=[WorkflowStageError(
+                code="registration_not_found",
+                detail="No supported Indian registration candidate was available for vehicle lookup.",
+            )],
+        ), None
 
     saved = _saved_lookup_for_candidate(db, assessment_id, candidate)
     if saved is not None:
@@ -255,11 +285,8 @@ def _compose_price_input(
     # may be reused from it.
     stored = assessment.vehicle_details if isinstance(assessment.vehicle_details, dict) else {}
     for key in (
-        "odometer_km",
-        "seller_type",
-        "transmission",
-        "mileage_kmpl",
-        "max_power_bhp",
+        "make", "model", "variant", "registration_year", "odometer_km", "fuel_type",
+        "seller_type", "transmission", "mileage_kmpl", "engine_cc", "max_power_bhp", "seats",
     ):
         value = stored.get(key)
         if value is not None:
@@ -270,11 +297,18 @@ def _compose_price_input(
     if user_details is not None:
         user_dump = user_details.model_dump(exclude_unset=True)
         for key in (
+            "make",
+            "model",
+            "variant",
+            "registration_year",
             "odometer_km",
+            "fuel_type",
             "seller_type",
             "transmission",
             "mileage_kmpl",
+            "engine_cc",
             "max_power_bhp",
+            "seats",
         ):
             value = user_dump.get(key)
             if value is not None:
@@ -330,7 +364,10 @@ def _compose_price_input(
                     merged[field] = value
                     provenance[field] = "model_default"
 
-    manually_correctable = ("transmission", "mileage_kmpl", "max_power_bhp")
+    manually_correctable = (
+        "make", "model", "variant", "registration_year", "odometer_km", "fuel_type",
+        "seller_type", "transmission", "mileage_kmpl", "engine_cc", "max_power_bhp", "seats",
+    )
     try:
         PricingUserInput.model_validate({
             field: merged[field]
@@ -355,6 +392,8 @@ def _compose_price_input(
 
 def _stage_error(exc: Exception, *, image_id: UUID | None = None) -> WorkflowStageError:
     if isinstance(exc, HTTPException):
+        if exc.status_code == 422 and exc.detail == "No readable text was found in the image.":
+            return WorkflowStageError(image_id=image_id, code="no_text", detail="No readable text was detected.")
         code = {
             404: "not_found",
             422: "invalid_input",
@@ -373,9 +412,51 @@ def _stage_status(success_count: int, errors: list[WorkflowStageError]) -> str:
         return "available"
     if success_count:
         return "partial"
-    if all(error.code in {"provider_unavailable", "provider_timeout"} for error in errors):
+    if all(error.code == "no_text" for error in errors):
+        return "no_text"
+    if all(error.code in {"provider_not_configured", "provider_unavailable", "provider_timeout"} for error in errors):
         return "unavailable"
     return "failed"
+
+
+def _ocr_stage_error(db: Session, assessment_id: UUID, image_id: UUID, exc: Exception) -> WorkflowStageError:
+    """Prefer the persisted attempt outcome over inferring from a generic HTTP response."""
+    try:
+        attempt = db.scalar(
+            select(EvidenceRecord)
+            .where(
+                EvidenceRecord.assessment_id == assessment_id,
+                EvidenceRecord.image_id == image_id,
+                EvidenceRecord.evidence_type == "ocr_attempt",
+            )
+            .order_by(EvidenceRecord.created_at.desc(), EvidenceRecord.id.desc())
+        )
+        evidence = attempt.evidence_data if attempt and isinstance(attempt.evidence_data, dict) else {}
+        code = evidence.get("error_code")
+        if code in {
+            "provider_not_configured", "provider_timeout", "provider_unavailable",
+            "stored_image_unavailable", "invalid_image", "image_preprocessing_failed",
+            "invalid_provider_response", "no_text_detected", "inference_failed",
+            "unexpected_provider_error", "result_persistence_failed",
+        }:
+            safe_details = {
+                "provider_not_configured": "No OCR provider is configured.",
+                "provider_timeout": "The OCR provider timed out.",
+                "provider_unavailable": "The OCR provider is unavailable.",
+                "stored_image_unavailable": "The stored image could not be read.",
+                "invalid_image": "The image is corrupt or unsupported.",
+                "image_preprocessing_failed": "The image could not be prepared for OCR.",
+                "invalid_provider_response": "The OCR provider returned an invalid response.",
+                "no_text_detected": "No readable text was detected.",
+                "inference_failed": "The OCR provider reported an inference failure.",
+                "unexpected_provider_error": "The OCR attempt failed unexpectedly.",
+                "result_persistence_failed": "The OCR result could not be saved.",
+            }
+            stage_code = "no_text" if code == "no_text_detected" else code
+            return WorkflowStageError(image_id=image_id, code=stage_code, detail=safe_details[code])
+    except SQLAlchemyError:
+        db.rollback()
+    return _stage_error(exc, image_id=image_id)
 
 
 @router.post("/{assessment_id}/workflow", response_model=AssessmentWorkflowResponse)
@@ -389,6 +470,8 @@ def run_assessment_workflow(
     vehicle_lookup_provider=Depends(get_vehicle_registration_provider),
     price_provider=Depends(get_price_provider),
     market_provider=Depends(get_market_listing_provider),
+    challan_provider=Depends(get_challan_provider),
+    fastag_provider=Depends(get_fastag_provider),
 ) -> AssessmentWorkflowResponse:
     try:
         assessment = db.get(VehicleAssessment, assessment_id)
@@ -456,7 +539,10 @@ def run_assessment_workflow(
         )
         manual_specification_submitted = payload.vehicle is not None and any(
             getattr(payload.vehicle, field) is not None
-            for field in ("transmission", "mileage_kmpl", "max_power_bhp")
+            for field in (
+                "make", "model", "variant", "registration_year", "odometer_km", "fuel_type",
+                "seller_type", "transmission", "mileage_kmpl", "engine_cc", "max_power_bhp", "seats",
+            )
         )
         if (
             isinstance(pricing_stage, dict)
@@ -468,10 +554,46 @@ def run_assessment_workflow(
             # Return the stored workflow response; pricing is the final stage and
             # its result is already persisted. The frontend can reuse the report
             # without re-running the entire workflow.
+            cached_stages = dict(stored_stages)
+            cached_report = AssessmentReportResponse.model_validate(existing_report).model_dump(mode="json")
+            cached_stages["report"] = {"status": "available", "result": cached_report}
+            market = existing_report.report_data.get("market_valuation", {})
+            cached_stages["market_valuation"] = {
+                "status": "available" if isinstance(market, dict) and market.get("status") == "available" else "unavailable",
+                "result": {
+                    "status": market.get("status") if isinstance(market, dict) else "unavailable",
+                    "refresh_status": market.get("refresh_status") if isinstance(market, dict) else None,
+                    "evidence_count": market.get("evidence_count", 0) if isinstance(market, dict) else 0,
+                    "market_asking_price_range": market.get("market_asking_price_range") if isinstance(market, dict) else None,
+                },
+            }
+            service_rows = db.scalars(
+                select(OCRResult).where(
+                    OCRResult.assessment_id == assessment_id,
+                    OCRResult.result_type.in_(("challan_lookup", "fastag_lookup")),
+                )
+            ).all()
+            for result_type in ("challan_lookup", "fastag_lookup"):
+                row = next((item for item in reversed(service_rows) if item.result_type == result_type), None)
+                data = row.result_data if row and isinstance(row.result_data, dict) else {}
+                state = data.get("state") or "not_run"
+                cached_stages[result_type] = {
+                    "status": "completed" if state == "available" else state,
+                    "result": {"status": state, "provider": row.provider if row else None,
+                               "details": data.get("details"), "error_code": data.get("error_code")},
+                }
+            statuses = [
+                item.get("status")
+                for key, item in cached_stages.items()
+                if key not in {"report", "market_valuation"}
+                and (key != "vehicle_details_lookup" or settings.vehicle_lookup_enabled)
+            ]
+            has_success = any(item in {"available", "completed", "partial", "completed_with_findings", "completed_no_findings", "disabled", "not_run"} for item in statuses)
+            has_problem = any(item in {"partial", "unavailable", "failed", "no_text"} for item in statuses)
             return AssessmentWorkflowResponse(
                 assessment_id=assessment_id,
-                status=existing_report.status,
-                stages=stored_stages,
+                status="partial" if has_problem and has_success else "failed" if not has_success else "completed",
+                stages=cached_stages,
             )
     try:
         if _persist_manual_pricing_specifications(assessment, payload.vehicle):
@@ -496,7 +618,7 @@ def run_assessment_workflow(
                 ocr_results.append(result.model_dump(mode="json"))
             except Exception as exc:
                 db.rollback()
-                ocr_errors.append(_stage_error(exc, image_id=image_id))
+                ocr_errors.append(_ocr_stage_error(db, assessment_id, image_id, exc))
         ocr_status = _stage_status(len(ocr_results), ocr_errors)
         stages["ocr"] = WorkflowStageResult(
             status=ocr_status,
@@ -526,10 +648,110 @@ def run_assessment_workflow(
         lookup_details = None
     stages["vehicle_details_lookup"] = lookup_stage
 
+    # Vehicle services only run for a single, normalized registration
+    # candidate. OCR disagreement/low confidence never selects a winner.
+    registration_candidate = (
+        manual_registration
+        if _is_indian_registration_candidate(manual_registration)
+        else None
+    )
+    if registration_candidate is None:
+        registration_assessment = build_registration_ocr_assessment(ocr_results)
+        candidate = registration_assessment.get("normalized_candidate")
+        if registration_assessment.get("status") == "candidate" and _is_indian_registration_candidate(candidate):
+            registration_candidate = candidate
+
+    def vehicle_service_stage(result_type, enabled, provider, lookup_fn, result_model):
+        if registration_candidate is None:
+            outcome = SimpleNamespace(status="not_run", provider=None, details=None, error_code="registration_unavailable")
+        elif not enabled:
+            outcome = SimpleNamespace(status="disabled", provider=None, details=None, error_code="disabled")
+        else:
+            saved = db.scalar(
+                select(OCRResult)
+                .where(
+                    OCRResult.assessment_id == assessment_id,
+                    OCRResult.result_type == result_type,
+                    OCRResult.raw_text == registration_candidate,
+                )
+                .order_by(OCRResult.created_at.desc(), OCRResult.id.desc())
+            )
+            saved_data = saved.result_data if saved and isinstance(saved.result_data, dict) else {}
+            saved_status = saved_data.get("state")
+            if saved is not None and saved_status in {"available", "partial", "unavailable", "failed"}:
+                try:
+                    details = result_model.model_validate(saved_data.get("details")) if saved_data.get("details") is not None else None
+                except ValidationError:
+                    details = None
+                outcome = SimpleNamespace(
+                    status=saved_status,
+                    provider=saved.provider,
+                    details=details,
+                    error_code=saved_data.get("error_code"),
+                )
+            else:
+                try:
+                    outcome = lookup_fn(provider, registration_candidate)
+                except Exception:
+                    outcome = SimpleNamespace(status="failed", provider=None, details=None, error_code="provider_error")
+        image_id = next(
+            (
+                UUID(item["image_id"])
+                for item in ocr_results
+                if registration_candidate
+                and item.get("image_id")
+                and normalize_registration_candidate(item.get("text")) == registration_candidate
+            ),
+            None,
+        )
+        try:
+            _store_service_result(
+                db,
+                assessment_id=assessment_id,
+                image_id=image_id,
+                result_type=result_type,
+                registration_number=registration_candidate or "",
+                result=outcome,
+            )
+            db.commit()
+        except SQLAlchemyError:
+            db.rollback()
+            return WorkflowStageResult(status="failed", errors=[WorkflowStageError(code="result_persistence_failed", detail="Vehicle service results could not be saved.")])
+        result_status = outcome.status
+        stage_status = "completed" if result_status == "available" else result_status
+        if result_status in {"available", "partial"}:
+            return WorkflowStageResult(status=stage_status, result=outcome.model_dump(mode="json") if hasattr(outcome, "model_dump") else {
+                "status": result_status,
+                "provider": outcome.provider,
+                "details": outcome.details.model_dump(mode="json") if outcome.details is not None else None,
+            })
+        return WorkflowStageResult(
+            status=stage_status,
+            result={"status": stage_status, "error_code": outcome.error_code},
+            errors=[] if stage_status in {"disabled", "not_run"} else [WorkflowStageError(code=outcome.error_code or "provider_unavailable", detail="Vehicle service lookup did not return usable data.")],
+        )
+
+    try:
+        stages["challan_lookup"] = vehicle_service_stage(
+            "challan_lookup", settings.challan_lookup_enabled, challan_provider, _challan_state,
+            ChallanDetails,
+        )
+    except Exception:
+        db.rollback()
+        stages["challan_lookup"] = WorkflowStageResult(status="failed", errors=[WorkflowStageError(code="provider_error", detail="Challan lookup failed.")])
+    try:
+        stages["fastag_lookup"] = vehicle_service_stage(
+            "fastag_lookup", settings.fastag_lookup_enabled, fastag_provider, _fastag_state,
+            FastagDetails,
+        )
+    except Exception:
+        db.rollback()
+        stages["fastag_lookup"] = WorkflowStageResult(status="failed", errors=[WorkflowStageError(code="provider_error", detail="FASTag lookup failed.")])
+
     try:
         damage_response = inspect_assessment_damage(
             assessment_id=assessment_id,
-            payload=AssessmentDamageRequest(image_ids=payload.image_ids),
+            payload=AssessmentDamageRequest(image_ids=payload.image_ids, image_types=payload.image_types),
             db=db,
             storage=storage,
             provider=damage_provider,
@@ -537,10 +759,8 @@ def run_assessment_workflow(
         damage_errors = [
             WorkflowStageError(
                 image_id=item.image_id,
-                code=(
-                    "provider_unavailable"
-                    if item.status == "unavailable"
-                    else "inference_failed"
+                code=item.reason_code or (
+                    "provider_unavailable" if item.status == "unavailable" else "inference_failed"
                 ),
                 detail=item.error or item.reason or "Damage inspection did not complete.",
             )
@@ -650,21 +870,39 @@ def run_assessment_workflow(
             status="available",
             result=report_response.model_dump(mode="json"),
         )
+        market_result = report_response.report_data.get("market_valuation", {}) if isinstance(report_response.report_data, dict) else {}
+        market_refresh = market_result.get("refresh_status") if isinstance(market_result, dict) else None
+        market_status = market_result.get("status") if isinstance(market_result, dict) else None
+        stages["market_valuation"] = WorkflowStageResult(
+            status=("available" if market_status == "available" else "unavailable"),
+            result={"status": market_status, "refresh_status": market_refresh,
+                    "evidence_count": market_result.get("evidence_count", 0),
+                    "market_asking_price_range": market_result.get("market_asking_price_range")},
+        )
     except Exception as exc:
         db.rollback()
         stages["report"] = WorkflowStageResult(status="failed", errors=[_stage_error(exc)])
 
-    relevant_stages = {key: value for key, value in stages.items() if key != "vehicle_details_lookup" or settings.vehicle_lookup_enabled}
+    relevant_stages = {
+        key: value
+        for key, value in stages.items()
+        if key not in {"market_valuation"}
+        and (key != "vehicle_details_lookup" or settings.vehicle_lookup_enabled)
+    }
     successful_stages = sum(
         stage.status in {
             "available",
+            "completed",
             "completed_with_findings",
             "completed_no_findings",
+            "no_text",
+            "disabled",
+            "not_run",
         }
         for stage in relevant_stages.values()
     )
     has_partial_or_failed = any(
-        stage.status in {"partial", "unavailable", "failed"} for stage in relevant_stages.values()
+        stage.status in {"partial", "unavailable", "failed", "no_text"} for stage in relevant_stages.values()
     )
     overall_status = (
         "failed" if successful_stages == 0 else "partial" if has_partial_or_failed else "completed"

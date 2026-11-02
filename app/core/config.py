@@ -1,3 +1,4 @@
+import os
 from pathlib import Path
 from typing import Literal
 from urllib.parse import urlsplit
@@ -58,8 +59,13 @@ class Settings(BaseSettings):
         / "official_models"
         / "en_PP-OCRv5_mobile_rec"
     )
-    damage_inference_python: Path = (
-        PROJECT_ROOT / ".local-storage" / "damage-poc" / ".venv" / "Scripts" / "python.exe"
+    damage_inference_enabled: bool | None = None
+    damage_inference_python: Path = Field(
+        default_factory=lambda: PROJECT_ROOT
+        / ".local-storage"
+        / "damage-poc"
+        / ".venv"
+        / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
     )
     damage_checkpoint_path: Path = PROJECT_ROOT / ".local-storage" / "damage-poc" / "trained.pt"
     damage_inference_timeout_seconds: int = Field(default=180, gt=0, le=600)

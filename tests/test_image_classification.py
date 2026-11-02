@@ -73,3 +73,44 @@ def test_stale_cache_invalidated():
 
     changed = png_bytes(size=(101, 101))
     assert cached_decision(image, changed, None) is None
+
+
+def test_explicit_vehicle_type_makes_unknown_image_eligible_and_cache_is_type_specific():
+    content = png_bytes(size=(640, 480))
+    inferred = classify_image(content=content)
+    declared = classify_image(content=content, declared_image_type="vehicle_exterior")
+
+    assert inferred.eligible_for_damage_inference is False
+    assert declared.image_type == "vehicle_exterior"
+    assert declared.eligible_for_damage_inference is True
+    assert declared.cache_key != inferred.cache_key
+
+
+def test_explicit_vehicle_type_does_not_override_document_or_plate_evidence():
+    content = png_bytes(size=(800, 600))
+
+    document = classify_image(
+        content=content,
+        ocr_results=[{"text": "Registration Certificate"}],
+        declared_image_type="vehicle_exterior",
+    )
+    plate = classify_image(
+        content=png_bytes(size=(141, 59)),
+        ocr_results=[{"text": "RJ45CA1879"}],
+        declared_image_type="vehicle_exterior",
+    )
+
+    assert document.image_type == "document"
+    assert document.eligible_for_damage_inference is False
+    assert plate.image_type == "registration_plate"
+    assert plate.eligible_for_damage_inference is False
+
+
+def test_explicit_image_type_still_requires_minimum_dimensions():
+    decision = classify_image(
+        content=png_bytes(size=(200, 150)),
+        declared_image_type="vehicle_exterior",
+    )
+
+    assert decision.eligible_for_damage_inference is False
+    assert decision.rejection_reason == "low_resolution_or_unsupported_image"
