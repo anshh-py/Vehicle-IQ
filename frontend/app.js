@@ -7,8 +7,6 @@
   const photoGrid = document.getElementById('photo-grid');
   const overlay = document.getElementById('inspection-overlay');
   let photos = [];
-  let photoTypes = [];
-  let workflowImageTypes = {};
   let previewUrls = [];
   let assessmentId = null;
   let imageIds = [];
@@ -85,20 +83,9 @@
       remove.setAttribute('aria-label', `Remove photo ${index + 1}`);
       remove.addEventListener('click', () => {
         photos = photos.filter((_, photoIndex) => photoIndex !== index);
-        photoTypes = photoTypes.filter((_, photoIndex) => photoIndex !== index);
         updatePhotoPreview();
       });
-      const imageType = document.createElement('select');
-      imageType.className = 'photo-type';
-      imageType.setAttribute('aria-label', `Photo ${index + 1} type`);
-      [['', 'Photo type (optional)'], ['vehicle_exterior', 'Exterior'], ['vehicle_closeup', 'Close-up'], ['registration_plate', 'Registration plate'], ['document', 'Document'], ['vehicle_interior', 'Interior']].forEach(([value, label]) => {
-        const option = node('option', '', label);
-        option.value = value;
-        imageType.append(option);
-      });
-      imageType.value = photoTypes[index] || '';
-      imageType.addEventListener('change', () => { photoTypes[index] = imageType.value; });
-      card.append(image, node('span', 'photo-thumb-name', photo.name), imageType, remove);
+      card.append(image, node('span', 'photo-thumb-name', photo.name), remove);
       photoGrid.append(card);
     });
   }
@@ -117,7 +104,6 @@
     }
     setMessage($('form-message'), '');
     photos = [...photos, ...incoming];
-    photoTypes = [...photoTypes, ...incoming.map(() => '')];
     updatePhotoPreview();
   }
 
@@ -325,8 +311,6 @@
     if (status === 'failed') return ['Could not complete', 'warn'];
     if (status === 'completed_with_findings') return ['Findings returned', ''];
     if (status === 'completed_no_findings') return ['No findings returned', ''];
-    if (status === 'disabled') return ['Disabled', 'muted'];
-    if (status === 'not_run') return ['Not run', 'muted'];
     return ['Unavailable', 'muted'];
   }
 
@@ -348,10 +332,7 @@
     setResultStatus('vehicle-status', status, tone);
     const facts = node('div', 'vehicle-facts');
     appendFact(facts, 'Registration reference', submittedRegistration || verifiedDetails.registration_number || report.assessment?.registration_number || 'Not provided');
-    appendFact(facts, 'Vehicle details lookup', cleanStatus(lookup.status)[0]);
     appendFact(facts, 'Photos submitted', sampleReportActive ? 'Illustrative sample' : `${imageIds.length}`);
-    appendFact(facts, 'Challan check', cleanStatus(report.challan_lookup?.status)[0]);
-    appendFact(facts, 'FASTag check', cleanStatus(report.fastag_lookup?.status)[0]);
     if (verifiedDetails.make || verifiedDetails.model) {
       appendFact(facts, 'Vehicle', [verifiedDetails.make, verifiedDetails.model, verifiedDetails.variant].filter(Boolean).join(' '));
       appendFact(facts, 'Year / fuel', [verifiedDetails.manufacturing_year, verifiedDetails.fuel_type].filter(Boolean).join(' · '));
@@ -526,18 +507,11 @@
   }
 
   const pricingFieldDefinitions = {
-    make: { label: 'Make', type: 'text', maxLength: 120, placeholder: '' },
-    model: { label: 'Model', type: 'text', maxLength: 120, placeholder: '' },
-    variant: { label: 'Variant', type: 'text', maxLength: 120, placeholder: '' },
-    registration_year: { label: 'Registration year', type: 'number', min: 1886, max: new Date().getFullYear(), step: 1, placeholder: '' },
-    fuel_type: { label: 'Fuel type', options: [['petrol', 'Petrol'], ['diesel', 'Diesel'], ['cng', 'CNG'], ['lpg', 'LPG'], ['electric', 'Electric']] },
     odometer_km: { label: 'Odometer · km', type: 'number', min: 0, max: 2000000, step: 1, placeholder: '' },
     seller_type: { label: 'Seller type', options: [['Individual', 'Individual'], ['Dealer', 'Dealer'], ['Trustmark Dealer', 'Trustmark Dealer']] },
     transmission: { label: 'Transmission type', options: [['manual', 'Manual'], ['automatic', 'Automatic'], ['amt', 'AMT'], ['cvt', 'CVT'], ['dct', 'DCT']] },
     mileage_kmpl: { label: 'Mileage · km/l', type: 'number', min: 0.1, max: 100, step: 'any', placeholder: '' },
     max_power_bhp: { label: 'Maximum power · bhp', type: 'number', min: 0.1, max: 2000, step: 'any', placeholder: '' },
-    engine_cc: { label: 'Engine capacity Â· cc', type: 'number', min: 1, max: 10000, step: 1, placeholder: '' },
-    seats: { label: 'Number of seats', type: 'number', min: 1, max: 9, step: 1, placeholder: '' },
   };
 
   const fuelMap = { Petrol: 'petrol', Diesel: 'diesel', CNG: 'cng', LPG: 'lpg', Electric: 'electric' };
@@ -774,20 +748,6 @@
     const report = reportStage?.result?.report_data;
     $('sample-report-banner').hidden = !sampleReportActive;
     const market = report?.market_valuation || {};
-    const marketStatus = market.refresh_status === 'refresh_failed'
-      ? 'The latest market search failed; the report is showing its previously saved evidence.'
-      : market.status === 'available'
-      ? `Comparable market evidence available (${Number(market.evidence_count || 0)} listings)`
-      : market.refresh_status === 'provider_not_configured'
-        ? 'Market valuation unavailable — no comparable-listing provider is configured.'
-        : ['provider_failed', 'provider_error', 'provider_unavailable'].includes(market.refresh_status)
-          ? 'Market valuation unavailable — the listing search did not complete.'
-          : market.refresh_status === 'insufficient_vehicle_details'
-            ? 'Market valuation unavailable — more verified vehicle details are needed.'
-            : market.status === 'low_evidence'
-              ? `Not enough comparable listings for a market range (${Number(market.evidence_count || 0)} of ${Number(market.minimum_evidence_count || 5)} required).`
-              : 'No verified comparable listings were available for a market range.';
-    overview.append(node('p', 'market-status-note', marketStatus));
     const marketListings = Array.isArray(market.market_research_results)
       ? market.market_research_results.filter(listing =>
         listing
@@ -1052,9 +1012,8 @@
     }));
   }
 
-  async function resumeInspection(id, sequence, justUploadedImageIds = null, vehicle = null, imageTypes = null) {
+  async function resumeInspection(id, sequence, justUploadedImageIds = null, vehicle = null) {
     assessmentId = id;
-    workflowImageTypes = imageTypes || workflowImageTypes || {};
     showOverlay('Getting your review ready');
     try {
       if (Array.isArray(justUploadedImageIds) && justUploadedImageIds.length > 0) {
@@ -1082,10 +1041,6 @@
       }
       updateOverlay('Taking a closer look at your photos');
       const workflowPayload = { image_ids: imageIds };
-      const selectedImageTypes = Object.fromEntries(
-        Object.entries(workflowImageTypes).filter(([selectedId, imageType]) => imageIds.includes(selectedId) && imageType),
-      );
-      if (Object.keys(selectedImageTypes).length) workflowPayload.image_types = selectedImageTypes;
       const vehicleDetails = vehicle || pricingVehicle;
       if (vehicleDetails && Object.keys(vehicleDetails).length) {
         workflowPayload.vehicle = vehicleDetails;
@@ -1134,7 +1089,6 @@
         sequence,
         options.imageIds || null,
         options.vehicle || null,
-        options.imageTypes || null,
       );
       return;
     }
@@ -1234,11 +1188,7 @@
       pricingVehicle = readVehicleForm(pricingForm);
       updateOverlay('Updating your inspection report');
       const workflow = await post(`/${encodeURIComponent(assessmentId)}/workflow`, {
-        json: {
-          image_ids: imageIds,
-          vehicle: pricingVehicle,
-          ...(Object.keys(workflowImageTypes).length ? { image_types: workflowImageTypes } : {}),
-        },
+        json: { image_ids: imageIds, vehicle: pricingVehicle },
         timeoutMs: 180_000,
       });
       latestWorkflow = workflow;
@@ -1346,13 +1296,9 @@
         uploadCount += 1;
       }
       imageIds = uploaded.map(image => image.id);
-      workflowImageTypes = Object.fromEntries(
-        uploaded.map((image, index) => [image.id, photoTypes[index]]).filter(([, imageType]) => imageType),
-      );
       await navigate(`/inspection/${encodeURIComponent(assessmentId)}`, {
         imageIds,
         vehicle: pricingVehicle,
-        imageTypes: workflowImageTypes,
       });
     } catch (error) {
       const context = assessmentId
@@ -1374,8 +1320,6 @@
 
   $('new-inspection').addEventListener('click', () => {
     photos = [];
-    photoTypes = [];
-    workflowImageTypes = {};
     previewUrls.forEach(url => URL.revokeObjectURL(url));
     previewUrls = [];
     imageIds = [];

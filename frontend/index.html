@@ -85,20 +85,11 @@
           <label class="field"><span>Registration number</span><input id="registration-number" name="registration_number" autocomplete="off" maxlength="32" placeholder="e.g. RJ45CA1879"></label>
           <label class="field asking-field"><span>Seller's asking price</span><span class="optional-label inline">OPTIONAL</span><div class="money-input"><span aria-hidden="true">₹</span><input id="asking-price" name="asking_price" type="number" min="0.01" max="100000000" step="0.01" inputmode="decimal" placeholder="Amount in INR"></div></label>
           <div class="vehicle-input-grid">
-            <label class="field"><span>Make</span><input name="make" maxlength="120" autocomplete="off" placeholder="Enter if known"></label>
-            <label class="field"><span>Model</span><input name="model" maxlength="120" autocomplete="off" placeholder="Enter if known"></label>
-            <label class="field"><span>Variant</span><input name="variant" maxlength="120" autocomplete="off" placeholder="Enter if known"></label>
-            <label class="field"><span>Fuel type</span><select name="fuel_type"><option value="">Select if known</option><option value="petrol">Petrol</option><option value="diesel">Diesel</option><option value="cng">CNG</option><option value="lpg">LPG</option><option value="electric">Electric</option></select></label>
-            <label class="field"><span>Registration year</span><input name="registration_year" type="number" min="1886" max="2026" step="1" inputmode="numeric" placeholder="e.g. 2021"></label>
             <label class="field"><span>Seller type</span><select name="seller_type"><option value="">Select if known</option><option value="Individual">Individual</option><option value="Dealer">Dealer</option><option value="Trustmark Dealer">Trustmark Dealer</option></select></label>
             <label class="field"><span>Odometer · km</span><input name="odometer_km" type="number" min="0" max="2000000" step="1" inputmode="numeric" placeholder="e.g. 42,000"></label>
             <label class="field"><span>Transmission type</span><select name="transmission"><option value="">Select if known</option><option value="manual">Manual</option><option value="automatic">Automatic</option><option value="amt">AMT</option><option value="cvt">CVT</option><option value="dct">DCT</option></select></label>
             <label class="field"><span>Mileage · km/l</span><input name="mileage_kmpl" type="number" min="0.1" max="100" step="any" inputmode="decimal" placeholder="e.g. 18.5"></label>
             <label class="field"><span>Maximum power · bhp</span><input name="max_power_bhp" type="number" min="0.1" max="2000" step="any" inputmode="decimal" placeholder="e.g. 88.5"><small class="field-help">Use vehicle documents or manufacturer specifications rather than guess.</small></label>
-          </div>
-          <div class="vehicle-input-grid">
-            <label class="field"><span>Engine capacity Â· cc</span><input name="engine_cc" type="number" min="1" max="10000" step="1" inputmode="numeric" placeholder="Enter if known"></label>
-            <label class="field"><span>Number of seats</span><input name="seats" type="number" min="1" max="9" step="1" inputmode="numeric" placeholder="Enter if known"></label>
           </div>
           <p class="vehicle-input-note">Prefilled details returned by the vehicle lookup appear in your report and can be corrected there.</p>
           <div class="details-spacer"></div>
