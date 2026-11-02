@@ -116,41 +116,13 @@ def test_submission_reuses_existing_upload_workflow_and_pricing_contracts():
         assert f'name="{field}"' in initial_form
 
 
-def test_registration_fallback_runs_after_ocr_and_before_report_presentation():
-    script = (FRONTEND / "app.js").read_text(encoding="utf-8")
-    page = (FRONTEND / "index.html").read_text(encoding="utf-8")
-    styles = (FRONTEND / "styles.css").read_text(encoding="utf-8")
-    resume = script.split("async function resumeInspection", maxsplit=1)[1].split("async function loadRoute", maxsplit=1)[0]
-    manual_submit = script.split("registrationForm.addEventListener('submit'", maxsplit=1)[1].split("async function loadRoute", maxsplit=1)[0]
-    submission = script.split("form.addEventListener('submit', async event =>", maxsplit=1)[1].split("$('new-inspection')", maxsplit=1)[0]
-
-    assert 'id="registration-dialog"' in page
-    assert "Registration Number Required" in page
-    assert "We couldn't extract the vehicle registration number from your photos." in page
-    assert "Enter vehicle registration number (e.g. RJ14AB1234)" in page
-    assert "Continue to Inspection" in page
-    assert "workflowHasValidOcrRegistration(workflow)" in resume
-    assert "registration.status === 'candidate'" in script
-    assert resume.index("post(`/${encodeURIComponent(id)}/workflow`") < resume.index("showRegistrationDialog(registrationPrefill)")
-    assert "if (!manualRegistrationAlreadySaved && !workflowHasValidOcrRegistration(workflow))" in resume
-    assert "if (!isSupportedRegistration(registrationNumber))" in manual_submit
-    assert manual_submit.index("if (!isSupportedRegistration(registrationNumber))") < manual_submit.index("/registration-number")
-    assert manual_submit.index("/registration-number") < manual_submit.index("/workflow") < manual_submit.index("navigate(`/report/${encodeURIComponent(id)}`)")
-    assert "registrationSubmissionInProgress" in manual_submit
-    assert "registration_number: registrationNumber" in manual_submit
-    assert "if (registration) assessmentBody.registration_number" not in submission
-    assert "registrationPrefill: registration" in submission
-    assert ".registration-dialog::backdrop" in styles
-
-
 def test_inspection_is_single_page_with_optional_vehicle_inputs_and_inline_report_editor():
     page = (FRONTEND / "index.html").read_text(encoding="utf-8")
     script = (FRONTEND / "app.js").read_text(encoding="utf-8")
     styles = (FRONTEND / "styles.css").read_text(encoding="utf-8")
     initial_form = page.split('<form id="inspection-form"', maxsplit=1)[1].split("</form>", maxsplit=1)[0]
 
-    assert 'id="registration-dialog"' in page
-    assert '<dialog id="pricing-dialog"' not in page
+    assert "<dialog" not in page
     assert "Complete vehicle details." not in page
     assert 'id="pricing-form"' in page
     assert 'id="pricing-form"' not in initial_form

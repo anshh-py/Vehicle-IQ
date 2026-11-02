@@ -96,8 +96,7 @@ def _saved_lookup_for_candidate(db: Session, assessment_id: UUID, candidate: str
         try:
             from app.schemas.vehicle_lookup import VehicleRegistrationDetails
 
-            details_source = {key: value for key, value in source.items() if key != "source"}
-            return VehicleRegistrationDetails.model_validate(details_source), row.provider
+            return VehicleRegistrationDetails.model_validate(source), row.provider
         except ValidationError:
             continue
     return None

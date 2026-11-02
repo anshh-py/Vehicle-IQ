@@ -29,22 +29,6 @@
     target.hidden = !message;
   }
 
-  function normalizeRegistration(value) {
-    return String(value || '').trim().replace(/\s+/g, '').toUpperCase();
-  }
-
-  function isSupportedRegistration(value) {
-    return /^[A-Z]{2}[0-9]{1,2}[A-Z]{1,4}[0-9]{1,4}$/.test(value)
-      || /^[0-9]{2}BH[0-9]{4}[A-Z]{1,2}$/.test(value);
-  }
-
-  function workflowHasValidOcrRegistration(workflow) {
-    const report = workflow?.stages?.report?.result?.report_data || {};
-    const registration = report.registration_ocr_assessment || {};
-    return registration.status === 'candidate'
-      && isSupportedRegistration(normalizeRegistration(registration.normalized_candidate));
-  }
-
   function requestError(message, status) {
     const error = new Error(message);
     error.status = status;
@@ -168,7 +152,6 @@
       if (response.status === 422 && file) throw requestError('One of the selected files is not a supported image. Choose a JPEG, PNG, or WebP photo.', 422);
       if (response.status === 422 && path.endsWith('/price-estimates')) throw requestError('Check the vehicle details and try the price estimate again.', 422);
       if (response.status === 422) throw requestError('Check the registration and asking price details, then try again.', 422);
-      if (response.status === 409 && path.endsWith('/registration-number')) throw requestError('A registration number is already saved for this assessment. It was not changed.', 409);
       if (response.status === 404) throw requestError('This review could not be found. Start a new inspection and try again.', 404);
       if (response.status === 429) throw requestError('Please wait a moment before trying again.', 429);
       if (response.status === 503 || response.status === 504 || response.status === 502) throw requestError('One or more inspection services are temporarily unavailable. Your results will show which parts completed.', response.status);
@@ -1029,10 +1012,9 @@
     }));
   }
 
-  async function resumeInspection(id, sequence, justUploadedImageIds = null, vehicle = null, registrationPrefill = '') {
+  async function resumeInspection(id, sequence, justUploadedImageIds = null, vehicle = null) {
     assessmentId = id;
     showOverlay('Getting your review ready');
-    let manualRegistrationAlreadySaved = false;
     try {
       if (Array.isArray(justUploadedImageIds) && justUploadedImageIds.length > 0) {
         imageIds = justUploadedImageIds;
@@ -1047,11 +1029,7 @@
           return;
         }
 
-        const assessment = await get(`/${encodeURIComponent(id)}`);
-        manualRegistrationAlreadySaved = assessment.vehicle_details?.registration_number_source === 'manual';
-        if (!registrationPrefill && manualRegistrationAlreadySaved) {
-          registrationPrefill = assessment.registration_number || '';
-        }
+        await get(`/${encodeURIComponent(id)}`);
         const images = await get(`/${encodeURIComponent(id)}/images`);
         if (sequence !== routeLoadSequence) return;
         if (!Array.isArray(images) || images.length < 1) {
@@ -1074,11 +1052,6 @@
       if (sequence !== routeLoadSequence) return;
       latestWorkflow = workflow;
       workflowAssessmentId = id;
-      if (!manualRegistrationAlreadySaved && !workflowHasValidOcrRegistration(workflow)) {
-        await closeOverlay();
-        if (sequence === routeLoadSequence) showRegistrationDialog(registrationPrefill);
-        return;
-      }
       const complete = workflow.status === 'completed' || workflow.status === 'partial';
       await closeOverlay({ complete, message: complete ? 'Your review is ready' : 'Some review steps could not be completed' });
       if (sequence === routeLoadSequence) await navigate(`/report/${encodeURIComponent(id)}`);
@@ -1098,7 +1071,6 @@
   async function loadRoute(options = {}) {
     const sequence = ++routeLoadSequence;
     const route = routeFor(window.location.hash);
-    if (route.page !== 'inspection' && registrationDialog.open) registrationDialog.close();
     if (route.page !== 'inspection' && !overlay.hidden) {
       overlay.hidden = true;
       overlay.setAttribute('aria-hidden', 'true');
@@ -1117,7 +1089,6 @@
         sequence,
         options.imageIds || null,
         options.vehicle || null,
-        options.registrationPrefill || '',
       );
       return;
     }
@@ -1140,76 +1111,6 @@
       }
     }
   }
-
-  const registrationDialog = $('registration-dialog');
-  const registrationForm = $('registration-form');
-  let registrationSubmissionInProgress = false;
-
-  function showRegistrationDialog(prefill = '') {
-    $('manual-registration').value = prefill;
-    setMessage($('registration-message'), '');
-    if (!registrationDialog.open) registrationDialog.showModal();
-    document.body.classList.add('modal-open');
-    $('manual-registration').focus({ preventScroll: true });
-  }
-
-  registrationDialog.addEventListener('cancel', event => event.preventDefault());
-
-  registrationForm.addEventListener('submit', async event => {
-    event.preventDefault();
-    if (registrationSubmissionInProgress) return;
-    const input = $('manual-registration');
-    const registrationNumber = normalizeRegistration(input.value);
-    input.value = registrationNumber;
-    if (!isSupportedRegistration(registrationNumber)) {
-      setMessage($('registration-message'), 'Enter a valid Indian registration number, such as RJ14AB1234.');
-      input.focus();
-      return;
-    }
-
-    const button = registrationForm.querySelector('[type="submit"]');
-    registrationSubmissionInProgress = true;
-    button.disabled = true;
-    input.disabled = true;
-    setMessage($('registration-message'), '');
-    const id = assessmentId;
-    const sequence = routeLoadSequence;
-    try {
-      await post(`/${encodeURIComponent(id)}/registration-number`, {
-        json: { registration_number: registrationNumber },
-      });
-      registrationDialog.close();
-      document.body.classList.remove('modal-open');
-      showOverlay('Checking registration details');
-      const workflow = await post(`/${encodeURIComponent(id)}/workflow`, {
-        json: { image_ids: imageIds, ...(pricingVehicle ? { vehicle: pricingVehicle } : {}) },
-        timeoutMs: 180_000,
-      });
-      if (sequence !== routeLoadSequence) return;
-      latestWorkflow = workflow;
-      workflowAssessmentId = id;
-      if (workflow.stages?.report?.status !== 'available') {
-        throw requestError('The registration was saved, but the report could not be refreshed. Try continuing again.', 502);
-      }
-      await closeOverlay({ complete: true, message: 'Your review is ready' });
-      await navigate(`/report/${encodeURIComponent(id)}`);
-    } catch (error) {
-      if (sequence !== routeLoadSequence) return;
-      if (!overlay.hidden) await closeOverlay({ message: 'We could not complete the registration check' });
-      document.body.classList.remove('modal-open');
-      showRegistrationDialog(registrationNumber);
-      setMessage(
-        $('registration-message'),
-        error instanceof Error
-          ? `${error.message} You can retry; your assessment and photos are kept.`
-          : 'We could not complete the registration check. Please try again.',
-      );
-    } finally {
-      registrationSubmissionInProgress = false;
-      button.disabled = false;
-      input.disabled = false;
-    }
-  });
 
   let skipNextHashChange = '';
 
@@ -1380,8 +1281,9 @@
     let uploadCount = 0;
     try {
       const assessmentBody = {};
-      const registration = $('registration-number').value;
+      const registration = $('registration-number').value.trim();
       const askingPrice = $('asking-price').value;
+      if (registration) assessmentBody.registration_number = registration;
       if (askingPrice) assessmentBody.asking_price_inr = Number(askingPrice);
       const assessment = await post('', { json: assessmentBody });
       assessmentId = assessment.id;
@@ -1397,7 +1299,6 @@
       await navigate(`/inspection/${encodeURIComponent(assessmentId)}`, {
         imageIds,
         vehicle: pricingVehicle,
-        registrationPrefill: registration,
       });
     } catch (error) {
       const context = assessmentId

@@ -24,7 +24,6 @@ VALID_REQUEST = {
 }
 
 LOOKUP_RESULT = {
-    "source": "manual",
     "registration_number": "MH12AB3456",
     "make": "Maruti Suzuki",
     "model": "Swift",

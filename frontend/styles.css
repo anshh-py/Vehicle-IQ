@@ -28,14 +28,6 @@
 html { scroll-behavior: smooth; background: var(--bg); }
 body { min-width: 320px; margin: 0; background: var(--bg); color: var(--text); font: 400 14px/1.55 var(--body); }
 body.modal-open { overflow: hidden; }
-.registration-dialog { width: min(500px, calc(100% - 28px)); max-width: none; padding: 0; border: 1px solid #34463c; color: var(--text); background: #101815; box-shadow: 0 28px 100px #000b; }
-.registration-dialog::backdrop { background: #050908c9; backdrop-filter: blur(10px); }
-#registration-form { padding: clamp(22px, 5vw, 38px); }
-#registration-dialog-title { margin: 0; color: #f3f7f1; font: 600 clamp(25px, 5vw, 34px)/1.05 var(--display); text-transform: uppercase; }
-.registration-dialog-copy { margin: 13px 0 22px; color: #aab8ae; font-size: 13px; line-height: 1.65; }
-.registration-dialog .field input { width: 100%; min-width: 0; }
-.registration-dialog .start-button { width: 100%; margin-top: 15px; }
-.registration-dialog .form-message { margin-top: 12px; }
 button, input, select { font: inherit; }
 button, a, input, select, summary { -webkit-tap-highlight-color: transparent; }
 a { color: inherit; text-decoration: none; }

@@ -119,67 +119,7 @@ def test_ocr_registration_lookup_normalizes_persists_and_appears_in_report(looku
     assert report.status_code == 200
     report_data = report.json()["report_data"]
     assert report_data["registration_lookup_results"][0]["details"]["model"] == "Swift"
-    # This legacy fixture has no source image, so it is lookup evidence rather
-    # than a completed per-photo OCR result in the report stage count.
-    assert report_data["stages"]["ocr"]["result_count"] == 0
-
-
-def test_manual_registration_is_normalized_and_saved_with_source_without_losing_vehicle_details(lookup_api):
-    client, engine, assessment_id, _ocr_id = lookup_api
-    with Session(engine) as session:
-        assessment = session.get(VehicleAssessment, UUID(assessment_id))
-        assessment.vehicle_details = {"seller_type": "Individual", "odometer_km": 42000}
-        session.commit()
-
-    response = client.post(
-        f"/api/v1/assessments/{assessment_id}/registration-number",
-        json={"registration_number": " rj45 ca1879 "},
-    )
-
-    assert response.status_code == 200
-    assert response.json()["registration_number"] == "RJ45CA1879"
-    assert response.json()["source"] == "manual"
-    with Session(engine) as session:
-        assessment = session.get(VehicleAssessment, UUID(assessment_id))
-        assert assessment.registration_number == "RJ45CA1879"
-        assert assessment.vehicle_details == {
-            "seller_type": "Individual",
-            "odometer_km": 42000,
-            "registration_number_source": "manual",
-        }
-
-
-def test_manual_registration_rejects_invalid_format_without_saving(lookup_api):
-    client, engine, assessment_id, _ocr_id = lookup_api
-    response = client.post(
-        f"/api/v1/assessments/{assessment_id}/registration-number",
-        json={"registration_number": "not a plate"},
-    )
-
-    assert response.status_code == 422
-    with Session(engine) as session:
-        assessment = session.get(VehicleAssessment, UUID(assessment_id))
-        assert assessment.registration_number is None
-        assert assessment.vehicle_details is None
-
-
-def test_manual_registration_cannot_replace_valid_ocr_candidate(lookup_api):
-    client, engine, assessment_id, ocr_id = lookup_api
-    with Session(engine) as session:
-        result = session.get(OCRResult, UUID(ocr_id))
-        result.raw_text = "RJ45CA1879"
-        result.result_data = {"confidence": 0.98}
-        session.commit()
-
-    response = client.post(
-        f"/api/v1/assessments/{assessment_id}/registration-number",
-        json={"registration_number": "KA01AB1234"},
-    )
-
-    assert response.status_code == 409
-    with Session(engine) as session:
-        assessment = session.get(VehicleAssessment, UUID(assessment_id))
-        assert assessment.registration_number is None
+    assert report_data["stages"]["ocr"]["result_count"] == 1
 
 
 def test_registration_lookup_removes_leading_ocr_noise(lookup_api):
