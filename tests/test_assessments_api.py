@@ -201,6 +201,13 @@ def test_assessment_database_errors_are_logged_safely_and_keep_generic_responses
     class DriverFailure(Exception):
         sqlstate = "08006"
 
+        def __str__(self):
+            return (
+                "connection refused; "
+                "postgresql://dbuser:super-secret@db.example/vehicle_iq "
+                "password=super-secret token=secret-token"
+            )
+
     class FailingSession:
         def add(self, _item):
             pass
@@ -234,6 +241,34 @@ def test_assessment_database_errors_are_logged_safely_and_keep_generic_responses
         "operation": operation,
         "request_id": response.headers["x-request-id"],
         "exception_class": "OperationalError",
+        "underlying_exception_class": "DriverFailure",
         "sqlstate": "08006",
+        "error_category": "connection_refused",
+        "error_message": "Database connection was refused.",
     }
-    assert "private connection detail" not in caplog.text
+    assert "super-secret" not in caplog.text
+    assert "secret-token" not in caplog.text
+    assert "dbuser" not in caplog.text
+    assert "db.example" not in caplog.text
+    assert "vehicle_iq" not in caplog.text
+
+
+@pytest.mark.parametrize(
+    ("driver_message", "expected_category", "expected_message"),
+    [
+        ("password authentication failed for user 'private-user'", "authentication", "Database authentication failed."),
+        ('could not translate host name "private-host" to address: name resolution failed', "dns", "Database host name could not be resolved."),
+        ("connection timed out", "timeout", "Database connection timed out."),
+        ("SSL certificate verify failed", "ssl_tls", "Database TLS/SSL negotiation failed."),
+        ("network is unreachable", "network", "Database network connection failed."),
+        ("server sent an unrecognized startup parameter", "other", "Database operation failed; driver details were omitted."),
+    ],
+)
+def test_database_error_messages_map_to_safe_diagnostic_categories(
+    client, caplog, driver_message, expected_category, expected_message
+):
+    from app.api.v1.assessments import _safe_database_message
+
+    category, safe_message = _safe_database_message(driver_message)
+
+    assert (category, safe_message) == (expected_category, expected_message)

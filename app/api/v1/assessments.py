@@ -29,7 +29,7 @@ def _database_error(detail: str) -> HTTPException:
 
 
 def _log_database_error(operation: str, exc: SQLAlchemyError) -> None:
-    """Log diagnostic metadata only; driver messages can contain sensitive details."""
+    """Log useful database diagnostics without forwarding driver-provided details."""
     original = getattr(exc, "orig", None)
     diagnostic = getattr(original, "diag", None)
     sqlstate = (
@@ -39,6 +39,8 @@ def _log_database_error(operation: str, exc: SQLAlchemyError) -> None:
     )
     if not isinstance(sqlstate, str) or len(sqlstate) != 5 or not sqlstate.isascii() or not sqlstate.isalnum():
         sqlstate = None
+    raw_message = str(original) if original is not None else str(exc)
+    error_category, safe_message = _safe_database_message(raw_message)
     logger.error(
         json.dumps(
             {
@@ -46,11 +48,52 @@ def _log_database_error(operation: str, exc: SQLAlchemyError) -> None:
                 "operation": operation,
                 "request_id": request_id_context.get(),
                 "exception_class": type(exc).__name__,
+                "underlying_exception_class": type(original).__name__ if original is not None else None,
                 "sqlstate": sqlstate,
+                "error_category": error_category,
+                "error_message": safe_message,
             },
             separators=(",", ":"),
         )
     )
+
+
+def _safe_database_message(message: str) -> tuple[str, str]:
+    """Map common PostgreSQL connection failures to fixed, non-sensitive diagnostics."""
+    normalized = message.casefold()
+    categories = (
+        (
+            "authentication",
+            ("password authentication failed", "authentication failed", "no password supplied", "invalid password"),
+            "Database authentication failed.",
+        ),
+        (
+            "dns",
+            ("could not translate host name", "name or service not known", "name resolution", "getaddrinfo", "nodename nor servname"),
+            "Database host name could not be resolved.",
+        ),
+        ("connection_refused", ("connection refused",), "Database connection was refused."),
+        (
+            "timeout",
+            ("timed out", "timeout expired", "operation timed out"),
+            "Database connection timed out.",
+        ),
+        ("ssl_tls", ("ssl", "tls", "certificate verify failed"), "Database TLS/SSL negotiation failed."),
+        (
+            "network",
+            ("network is unreachable", "no route to host", "connection reset", "server closed the connection"),
+            "Database network connection failed.",
+        ),
+        (
+            "capacity",
+            ("too many connections", "remaining connection slots", "connection limit"),
+            "Database connection capacity was exceeded.",
+        ),
+    )
+    for category, indicators, safe_message in categories:
+        if any(indicator in normalized for indicator in indicators):
+            return category, safe_message
+    return "other", "Database operation failed; driver details were omitted."
 
 
 def _vehicle_details_without_asking_price(details: dict | None) -> dict | None:
