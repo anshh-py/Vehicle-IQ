@@ -1,7 +1,7 @@
 (() => {
   'use strict';
 
-  const API = `http://127.0.0.1:8081/api/v1/assessments`;
+  const API = `https://vehicle-iq-8wzk.onrender.com/api/v1/assessments`;
   const form = document.getElementById('inspection-form');
   const photoInput = document.getElementById('photo-input');
   const photoGrid = document.getElementById('photo-grid');
