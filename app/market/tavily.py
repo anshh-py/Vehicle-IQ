@@ -19,7 +19,6 @@ from app.pricing.market import (
     YEAR_TOLERANCE,
     MarketListing,
     MarketVehicleCriteria,
-    _locations_overlap,
     calculate_market_comparables,
 )
 
@@ -190,6 +189,7 @@ class TavilyMarketListingProvider:
         self.transport = transport
         self.rejected_listing_counts: dict[str, int] = {}
         self.market_research_rejection_counts: dict[str, int] = {}
+        self.comparison_rejection_counts: dict[str, int] = {}
         self.search_observability: dict[str, int] = {}
         self.market_research_results: list[dict[str, Any]] = []
         self.search_scopes: list[str] = []
@@ -205,24 +205,25 @@ class TavilyMarketListingProvider:
         queries = self._queries(criteria)[:2]
         self.market_research_results = []
         self.market_research_rejection_counts = {}
+        self.comparison_rejection_counts = {}
         self.search_observability = {
             "queries_issued": 0,
             "raw_results_returned": 0,
             "listings_extracted": 0,
+            "valid_individual_listings": 0,
+            "invalid_non_listing_results": 0,
+            "irrelevant_vehicle_results": 0,
             "extraction_rejected": 0,
             "relevance_rejected": 0,
             "market_research_rejected": 0,
             "duplicates_removed": 0,
             "outliers_removed": 0,
+            "final_comparable_listings": 0,
         }
         self.search_scopes = []
         for tier, query in enumerate(queries):
             self.search_observability["queries_issued"] += 1
-            self.search_scopes.append(
-                f"{criteria.location} and nearby regions"
-                if criteria.location
-                else "Location not specified; no geographic fallback"
-            )
+            self.search_scopes.append("India nationwide; no city preference")
             results = self._search(query)
             self.search_observability["raw_results_returned"] += len(results)
             query_research_accepted = 0
@@ -264,10 +265,21 @@ class TavilyMarketListingProvider:
                             "year_mismatch",
                             "non_listing_source",
                             "editorial_or_video_result",
+                            "collection_page",
+                            "not_a_used_listing",
                         }:
                             self.search_observability["relevance_rejected"] += 1
                         else:
                             self.search_observability["extraction_rejected"] += 1
+                        if reason == "irrelevant_vehicle":
+                            self.search_observability["irrelevant_vehicle_results"] += 1
+                        if reason in {
+                            "non_listing_source", "collection_page",
+                            "editorial_or_video_result", "not_a_used_listing",
+                            "invalid_listing_url", "malformed_search_result",
+                            "unusable_market_result",
+                        }:
+                            self.search_observability["invalid_non_listing_results"] += 1
                     self._log_search_result(
                         query,
                         len(results),
@@ -300,6 +312,7 @@ class TavilyMarketListingProvider:
                     continue
                 seen_urls.add(url_key)
                 listings.append(listing)
+                self.search_observability["valid_individual_listings"] += 1
                 query_comparable_accepted += 1
                 self._log_search_result(
                     query,
@@ -335,13 +348,12 @@ class TavilyMarketListingProvider:
             ):
                 break
         for reason, count in final_result.rejected_counts.items():
-            rejected[reason] = rejected.get(reason, 0) + count
-            if reason not in {"duplicate_listing", "price_outlier"}:
-                self.search_observability["relevance_rejected"] += count
+            self.comparison_rejection_counts[reason] = count
         self.search_observability["outliers_removed"] = final_result.rejected_counts.get(
             "price_outlier", 0
         )
         self.rejected_listing_counts = rejected
+        self.search_observability["final_comparable_listings"] = len(final_result.listings)
         self.market_research_rejection_counts = research_rejected
         self.market_research_results = sorted(
             research_by_url.values(),
@@ -353,6 +365,7 @@ class TavilyMarketListingProvider:
             final_accepted_listing_count=len(final_result.listings),
             final_market_research_listing_count=len(self.market_research_results),
             final_rejected_listing_counts=dict(rejected),
+            comparison_rejection_counts=dict(self.comparison_rejection_counts),
         )
         return final_result.listings
 
@@ -407,6 +420,7 @@ class TavilyMarketListingProvider:
         )
         _log_diagnostic(
             "tavily_search_result_processed",
+            processing_stage="individual_listing_validation",
             query=cls._safe_log_text(query, limit=500),
             result_count=result_count,
             result_domain=domain,
@@ -415,8 +429,10 @@ class TavilyMarketListingProvider:
             price_extracted=amount is not None,
             extracted_price_inr=format(amount, "f") if amount is not None else None,
             price_parse_status=price_status,
+            market_research_stage_status="accepted" if research is not None else "rejected",
             market_research_accepted=research is not None,
             market_research_rejection_reason=research_reason,
+            comparable_stage_status="accepted" if comparable_accepted else "rejected",
             comparable_accepted=comparable_accepted,
             comparable_rejection_reason=comparable_reason,
         )
@@ -473,9 +489,7 @@ class TavilyMarketListingProvider:
     @classmethod
     def _queries(cls, criteria: MarketVehicleCriteria) -> list[str]:
         identity = f'"{criteria.make.strip()} {criteria.model.strip()}"'
-        location = f" near {criteria.location}" if criteria.location else ""
-        search_suffix = f"used car prices India -Grand -Nios{location}"
-        candidates: list[tuple[int, str]] = []
+        search_suffix = "used car listing India"
         detailed_terms = [
             str(criteria.year) if criteria.year is not None else None,
             str(criteria.variant).strip() if criteria.variant else None,
@@ -484,64 +498,15 @@ class TavilyMarketListingProvider:
             f"{criteria.mileage_km} km" if criteria.mileage_km is not None else None,
         ]
         detailed = " ".join(term for term in detailed_terms if term)
-        candidates.append(
-            (
-                100
-                + (30 if criteria.year is not None else 0)
-                + (25 if criteria.variant else 0)
-                + (20 if criteria.location else 0)
-                + (10 if criteria.fuel_type else 0)
-                + (8 if criteria.transmission else 0),
-                f"{identity} {detailed} {search_suffix}".replace("  ", " "),
-            )
-        )
-        if criteria.year is not None:
-            candidates.append(
-                (
-                    100 + 30 + (20 if criteria.location else 0),
-                    f"{identity} {criteria.year} {search_suffix}",
-                )
-            )
-        if criteria.variant:
-            candidates.append(
-                (
-                    100 + 25 + (20 if criteria.location else 0),
-                    f"{identity} {criteria.variant} {search_suffix}",
-                )
-            )
-        if criteria.fuel_type or criteria.transmission:
-            mechanical_terms = " ".join(
-                term
-                for term in (
-                    criteria.fuel_type.strip() if criteria.fuel_type else None,
-                    criteria.transmission.strip() if criteria.transmission else None,
-                )
-                if term
-            )
-            candidates.append(
-                (
-                    100
-                    + (10 if criteria.fuel_type else 0)
-                    + (8 if criteria.transmission else 0)
-                    + (20 if criteria.location else 0),
-                    f"{identity} {mechanical_terms} {search_suffix}",
-                )
-            )
-        ranked: dict[str, int] = {}
-        for score, query in candidates:
-            ranked[query] = max(score, ranked.get(query, score))
-        return [
-            query
-            for query, _score in sorted(
-                ranked.items(), key=lambda item: (-item[1], item[0])
-            )[:2]
+        exact_query = f"{identity} {detailed} {search_suffix}".replace("  ", " ")
+        broad_terms = [
+            str(criteria.year) if criteria.year is not None else None,
+            "used cars for sale India",
         ]
-
-    @staticmethod
-    def _located_query(query: str, location: str | None) -> str:
-        if location:
-            return f"{query} near {location}"
-        return query
+        broad_query = f"{identity} {' '.join(term for term in broad_terms if term)}"
+        if broad_query == exact_query:
+            broad_query = f"{identity} used car advertisements across India"
+        return [exact_query, broad_query]
 
     @classmethod
     def _matches_vehicle_identity(cls, text: str, criteria: MarketVehicleCriteria) -> bool:
@@ -549,6 +514,9 @@ class TavilyMarketListingProvider:
         if not cls._contains_phrase(text, identity):
             return False
         if criteria.model.strip().casefold() != "i10":
+            if criteria.model.strip().casefold() == "grand i10":
+                pattern = re.compile(r"\bgrand\s+i10\b(?!\s+nios)", re.IGNORECASE)
+                return bool(pattern.search(text))
             return True
         pattern = re.compile(
             rf"(?<!\w){re.escape(criteria.make.strip())}[\W_]+i10(?!\w)",
@@ -564,11 +532,8 @@ class TavilyMarketListingProvider:
     def _result_matches_vehicle_identity(
         cls, title: str, content: str, criteria: MarketVehicleCriteria
     ) -> bool:
-        if (
-            criteria.model.strip().casefold() == "i10"
-            and re.search(r"\b(?:grand\s+i10|i10\s+nios)\b", title, re.IGNORECASE)
-        ):
-            return False
+        # A target identity in the title wins even when a related model is
+        # mentioned for comparison. Related-model-only titles remain excluded.
         if cls._matches_vehicle_identity(title, criteria):
             return True
         if cls._contains_phrase(title, criteria.make) and cls._contains_phrase(
@@ -627,8 +592,16 @@ class TavilyMarketListingProvider:
             return None, "non_listing_source"
         if cls._is_collection_page(parts.path, criteria) or cls._is_collection_title(title):
             return None, "collection_page"
-        editorial_text = f"{title} {parts.path}".casefold()
-        if any(marker in editorial_text for marker in _EDITORIAL_MARKERS):
+        editorial_path = parts.path.casefold()
+        title_has_editorial_marker = any(
+            marker in title.casefold() for marker in _EDITORIAL_MARKERS
+        )
+        is_individual_listing = any(
+            marker in editorial_path for marker in _USED_LISTING_PATH_MARKERS
+        ) or cls._contains_used_listing_marker(evidence)
+        if any(marker in editorial_path for marker in _EDITORIAL_MARKERS) or (
+            title_has_editorial_marker and not is_individual_listing
+        ):
             return None, "editorial_or_video_result"
         if not cls._contains_used_listing_marker(evidence):
             path = parts.path.casefold()
@@ -677,7 +650,7 @@ class TavilyMarketListingProvider:
             "fuel_type": cls._fuel_type(evidence),
             "transmission": cls._transmission(evidence),
             "mileage_km": cls._mileage(evidence),
-            "location": cls._reported_location(evidence, criteria.location),
+            "location": cls._reported_location(evidence, None),
             "currency": "INR" if re.search(r"(?:₹|INR\b|Rs\.?\s*)", evidence, re.IGNORECASE) else None,
             "asking_price_inr": format(price, "f") if price is not None else None,
             "retrieved_at": retrieved_at.isoformat(),
@@ -687,7 +660,7 @@ class TavilyMarketListingProvider:
                 cls._fuel_type(evidence),
                 cls._transmission(evidence),
                 cls._mileage(evidence),
-                cls._reported_location(evidence, criteria.location),
+                cls._reported_location(evidence, None),
                 criteria,
             ),
             "priced_used_listing": True,
@@ -732,10 +705,6 @@ class TavilyMarketListingProvider:
             else:
                 allowed = max(5_000, int(criteria.mileage_km * 0.15))
                 score += 5 if abs(mileage_km - criteria.mileage_km) <= allowed else 1
-        else:
-            score += 3
-        if criteria.location:
-            score += 5 if _locations_overlap(location, criteria.location) else 3 if location is None else 1
         else:
             score += 3
         return score
@@ -938,8 +907,16 @@ class TavilyMarketListingProvider:
             return None, "non_listing_source"
         if cls._is_collection_page(parts.path, criteria) or cls._is_collection_title(title):
             return None, "collection_page"
-        editorial_text = f"{title} {parts.path}".casefold()
-        if any(marker in editorial_text for marker in _EDITORIAL_MARKERS):
+        editorial_path = parts.path.casefold()
+        title_has_editorial_marker = any(
+            marker in title.casefold() for marker in _EDITORIAL_MARKERS
+        )
+        is_individual_listing = any(
+            marker in editorial_path for marker in _USED_LISTING_PATH_MARKERS
+        ) or cls._contains_used_listing_marker(evidence)
+        if any(marker in editorial_path for marker in _EDITORIAL_MARKERS) or (
+            title_has_editorial_marker and not is_individual_listing
+        ):
             return None, "editorial_or_video_result"
         if not cls._result_matches_vehicle_identity(
             title, f"{content}\n{raw_content}", criteria
@@ -979,7 +956,7 @@ class TavilyMarketListingProvider:
         fuel_type = cls._fuel_type(evidence)
         transmission = cls._transmission(evidence)
         mileage = cls._mileage(evidence)
-        location = cls._reported_location(evidence, criteria.location)
+        location = cls._reported_location(evidence, None)
         host = parts.hostname.casefold()
         source_name = host[4:] if host.startswith("www.") else host
         try:

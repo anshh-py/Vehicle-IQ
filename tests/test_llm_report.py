@@ -76,6 +76,28 @@ def test_prompt_includes_all_report_evidence_and_marks_market_as_unverified():
     assert "market_evidence_available" not in user_prompt
 
 
+def test_groq_receives_validated_comparable_sources_and_market_diagnostics():
+    report_data = {
+        "market_valuation": {
+            "status": "available",
+            "market_research_results": [{"source_url": "https://cars24.com/ad/1"}],
+            "priced_comparables": [
+                {"title": "Hyundai i10 2013", "source_url": "https://cars24.com/ad/1", "advertised_price_inr": "225000", "year": 2013}
+            ],
+            "search_observability": {"raw_results_returned": 12, "final_comparable_listings": 1},
+            "geographic_scope": ["India nationwide; no city preference"],
+        },
+        "assessment": {"asking_price_inr": "250000", "vehicle_details": {"make": "Hyundai", "model": "i10"}},
+        "pricing": {"result": {"amount_inr": "240000", "status": "research_only"}},
+        "limitations": ["No market range below the evidence minimum."],
+    }
+    _system_prompt, user_prompt = build_llm_prompt(report_data)
+    assert "https://cars24.com/ad/1" in user_prompt
+    assert "225000" in user_prompt
+    assert "India nationwide; no city preference" in user_prompt
+    assert "asking_price_inr" in user_prompt or "asking_price" in user_prompt
+
+
 def test_market_narrative_is_grounded_in_report_values_and_legacy_output_is_compatible():
     payload = {
         "vehicle_overview": "A", "overall_condition_summary": "B",

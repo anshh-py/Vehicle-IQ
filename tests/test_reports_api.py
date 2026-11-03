@@ -622,10 +622,20 @@ def test_tavily_market_response_contains_only_search_evidence_and_no_api_key(
     market = response.json()["report_data"]["market_valuation"]
     assert market["status"] == "available"
     assert market["evidence_count"] == 5
-    assert market["search_observability"]["queries_issued"] == 1
-    assert market["search_observability"]["raw_results_returned"] == 6
-    assert market["search_observability"]["market_research_rejected"] == 1
-    assert market["market_research_rejection_counts"] == {"missing_price": 1}
+    assert market["search_observability"]["queries_issued"] == 2
+    assert market["search_observability"]["raw_results_returned"] == 12
+    assert market["search_observability"]["listings_extracted"] == 10
+    assert market["search_observability"]["valid_individual_listings"] == 5
+    assert market["search_observability"]["market_research_rejected"] == 2
+    assert market["market_research_rejection_counts"] == {"missing_price": 2}
+    assert market["rejection_counts_by_stage"]["market_research_discovery"] == {
+        "missing_price": 2
+    }
+    assert market["rejection_counts_by_stage"]["individual_listing_validation"] == {
+        "missing_or_ambiguous_price": 2,
+        "duplicate_listing": 5,
+    }
+    assert market["rejection_counts_by_stage"]["comparable_validation"] == {}
     assert market["priced_comparable_count"] == 5
     assert market["relevant_result_count"] == 5
     assert len(market["priced_comparables"]) == 5
@@ -654,9 +664,9 @@ def test_tavily_market_response_contains_only_search_evidence_and_no_api_key(
     )
     assert snapshot_record.report_market_research_count == 5
     assert snapshot_record.report_priced_comparable_count == 5
-    assert snapshot_record.market_queries_issued == 1
-    assert snapshot_record.market_raw_results_returned == 6
-    assert snapshot_record.market_research_rejection_counts == {"missing_price": 1}
+    assert snapshot_record.market_queries_issued == 2
+    assert snapshot_record.market_raw_results_returned == 12
+    assert snapshot_record.market_research_rejection_counts == {"missing_price": 2}
     assert '"event":"market_report_snapshot_results"' in caplog.text
     assert '"report_serialized_priced_listing_count":5' in caplog.text
 
@@ -796,7 +806,7 @@ def test_market_inputs_propagate_city_and_state_to_search_criteria(report_api):
         criteria, _asking_price, _ml_prediction = _market_inputs(assessment, [])
 
     assert criteria is not None
-    assert criteria.location == "Jaipur, Rajasthan"
+    assert criteria.location is None
 
 
 @pytest.mark.parametrize(
@@ -864,8 +874,8 @@ def test_market_report_preserves_context_with_zero_or_limited_priced_results(
     market = response.json()["report_data"]["market_valuation"]
     assert market["status"] == "unavailable"
     assert market["vehicle_researched"] == {"make": "Example Motors", "model": "i10"}
-    assert market["search_location"] == "Jaipur, Rajasthan"
-    assert market["geographic_scope"] == ["Jaipur, Rajasthan and nearby regions"]
+    assert market["search_location"] is None
+    assert market["geographic_scope"] == ["India nationwide; no city preference"]
     assert market["relevant_result_count"] == priced_count
     assert market["priced_comparable_count"] == 0
     assert market["priced_comparables"] == []

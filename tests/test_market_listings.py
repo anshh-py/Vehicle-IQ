@@ -205,7 +205,15 @@ def test_location_relevance():
     criteria = MarketVehicleCriteria(make="Maruti Suzuki", model="Swift", year=2021, mileage_km=40000, location="Jaipur")
     result = calculate_market_comparables(listings, criteria, valuation_date=now)
     assert result.evidence_count == 6
-    assert all(item.match_type == "approximate_match" for item in result.listings)
+    no_location = criteria.model_copy(update={"location": None})
+    unrestricted = calculate_market_comparables(listings, no_location, valuation_date=now)
+    assert [item.match_type for item in result.listings] == [
+        item.match_type for item in unrestricted.listings
+    ]
+    assert [item.relevance_score for item in result.listings] == [
+        item.relevance_score for item in unrestricted.listings
+    ]
+    assert all("location:" not in " ".join(item.match_differences) for item in result.listings)
 
 
 def test_duplicate_listing_excluded():
@@ -309,18 +317,14 @@ def test_missing_transmission_rejected_when_target_transmission_known():
     )
 
 
-def test_missing_location_rejected_when_target_location_known():
+def test_missing_listing_location_does_not_affect_eligibility_or_match():
     now = datetime(2026, 10, 30, tzinfo=timezone.utc)
     listings = [_listing(source_id=f"L{i}") for i in range(6)]
     listings[0].location = None
     criteria = MarketVehicleCriteria(make="Maruti Suzuki", model="Swift", year=2021, mileage_km=40000, location="Jaipur")
     result = calculate_market_comparables(listings, criteria, valuation_date=now)
     assert result.evidence_count == 6
-    assert any(
-        "location: not reported" in difference
-        for item in result.listings
-        for difference in item.match_differences
-    )
+    assert all("location:" not in " ".join(item.match_differences) for item in result.listings)
 
 
 def test_mileage_tolerance_exact_5000_boundary():

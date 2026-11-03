@@ -66,7 +66,7 @@ def _first_query_only(results):
     return handler
 
 
-def test_search_builds_vehicle_and_location_query_and_extracts_supported_fields():
+def test_search_is_nationwide_and_extracts_listing_location_as_metadata():
     observed = {"payloads": []}
 
     def handler(request):
@@ -76,7 +76,10 @@ def test_search_builds_vehicle_and_location_query_and_extracts_supported_fields(
             200,
             json={
                 "results": [
-                    _result(index)
+                    _result(
+                        index,
+                        content=f"Used car listing in Jaipur; asking price Rs {12_00_000 + index * 10_000:,}",
+                    )
                     for index in range(1, MIN_COMPARABLE_COUNT + 1)
                 ]
             },
@@ -89,7 +92,7 @@ def test_search_builds_vehicle_and_location_query_and_extracts_supported_fields(
     assert observed["payloads"][0] == {
         "api_key": "test-secret",
         "query": (
-            '"Hyundai Creta" 2021 SX petrol manual 42000 km used car prices India -Grand -Nios near Jaipur'
+            '"Hyundai Creta" 2021 SX petrol manual 42000 km used car listing India'
         ),
         "search_depth": "basic",
         "topic": "general",
@@ -115,6 +118,7 @@ def test_search_builds_vehicle_and_location_query_and_extracts_supported_fields(
     assert listing.retrieved_at.tzinfo == timezone.utc
     assert listing.match_type == "exact_match"
     assert provider.search_observability["queries_issued"] == 1
+    assert provider.search_scopes == ["India nationwide; no city preference"]
 
 
 def test_missing_api_key_disables_provider_without_revealing_secrets(monkeypatch):
@@ -410,9 +414,10 @@ def test_progressive_search_expands_year_then_model_and_records_match_types():
     assert len(observed_queries) == 2
     assert observed_queries[0].startswith('"Hyundai Creta" ')
     assert "2021 SX petrol manual 42000 km" in observed_queries[0]
-    assert observed_queries[1] == '"Hyundai Creta" 2021 used car prices India -Grand -Nios near Jaipur'
+    assert observed_queries[1] == '"Hyundai Creta" 2021 used cars for sale India'
     assert all("India" in query for query in observed_queries)
-    assert all("Jaipur" in query for query in observed_queries)
+    assert all("Jaipur" not in query for query in observed_queries)
+    assert all("Grand" not in query and "Nios" not in query for query in observed_queries)
     assert [item.match_type for item in listings].count("exact_match") == 1
     assert [item.match_type for item in listings].count("close_match") >= 2
     assert len(listings) >= MIN_COMPARABLE_COUNT
@@ -420,6 +425,8 @@ def test_progressive_search_expands_year_then_model_and_records_match_types():
     assert provider.search_observability["queries_issued"] == 2
     assert provider.search_observability["raw_results_returned"] == 5
     assert provider.search_observability["listings_extracted"] == 5
+    assert provider.search_observability["valid_individual_listings"] == 5
+    assert provider.search_observability["final_comparable_listings"] >= MIN_COMPARABLE_COUNT
 
 
 def test_same_model_variants_and_transmission_mileage_are_approximate():
@@ -558,19 +565,16 @@ def test_search_candidates_are_ranked_and_capped_at_two_without_broad_fallback()
     provider.fetch_listings(CRITERIA)
 
     assert observed_queries == [
-        '"Hyundai Creta" 2021 SX petrol manual 42000 km used car prices India -Grand -Nios near Jaipur',
-        '"Hyundai Creta" 2021 used car prices India -Grand -Nios near Jaipur',
+        '"Hyundai Creta" 2021 SX petrol manual 42000 km used car listing India',
+        '"Hyundai Creta" 2021 used cars for sale India',
     ]
     assert provider.search_scopes == [
-        "Jaipur and nearby regions",
-        "Jaipur and nearby regions",
+        "India nationwide; no city preference",
+        "India nationwide; no city preference",
     ]
     regional_criteria = CRITERIA.model_copy(update={"location": "Jaipur, Rajasthan"})
-    assert all(
-        query.endswith("near Jaipur, Rajasthan")
-        for query in TavilyMarketListingProvider._queries(regional_criteria)
-    )
-    assert all("India" in query and "-Grand -Nios" in query for query in TavilyMarketListingProvider._queries(regional_criteria))
+    assert TavilyMarketListingProvider._queries(regional_criteria) == TavilyMarketListingProvider._queries(CRITERIA)
+    assert all("India" in query and "near Jaipur" not in query for query in TavilyMarketListingProvider._queries(regional_criteria))
 
 
 def test_missing_optional_details_produce_one_useful_identity_query():
@@ -578,10 +582,13 @@ def test_missing_optional_details_produce_one_useful_identity_query():
 
     queries = TavilyMarketListingProvider._queries(criteria)
 
-    assert queries == ['"Hyundai i10" used car prices India -Grand -Nios']
+    assert queries == [
+        '"Hyundai i10" used car listing India',
+        '"Hyundai i10" used cars for sale India',
+    ]
 
 
-def test_query_priority_keeps_make_model_identity_and_year_variant_location():
+def test_query_priority_keeps_vehicle_identity_and_year_variant_without_location():
     criteria = MarketVehicleCriteria(
         make="Honda",
         model="City",
@@ -593,8 +600,8 @@ def test_query_priority_keeps_make_model_identity_and_year_variant_location():
     queries = TavilyMarketListingProvider._queries(criteria)
 
     assert len(queries) == 2
-    assert queries[0] == '"Honda City" 2020 ZX used car prices India -Grand -Nios near Jaipur, Rajasthan'
-    assert queries[1] == '"Honda City" 2020 used car prices India -Grand -Nios near Jaipur, Rajasthan'
+    assert queries[0] == '"Honda City" 2020 ZX used car listing India'
+    assert queries[1] == '"Honda City" 2020 used cars for sale India'
     assert all(query.startswith('"Honda City" ') for query in queries)
 
 
@@ -878,6 +885,21 @@ def test_i10_exact_model_identity_is_retained():
     assert research is not None
     assert research["asking_price_inr"] == "250000.00"
     assert research["source_url"] == result["url"]
+
+
+def test_i10_listing_survives_comparison_mention_of_related_models():
+    criteria = MarketVehicleCriteria(make="Hyundai", model="i10", year=2013)
+    result = {
+        "title": "Hyundai i10 GLS Sportz 2013 used car; compare Grand i10 Nios",
+        "url": "https://cars24.com/listing/i10-ad-123",
+        "content": "Petrol used car asking price Rs 225000.",
+    }
+    listing, reason = TavilyMarketListingProvider._listing_from_result(
+        result, criteria, datetime.now(timezone.utc)
+    )
+    assert reason is None
+    assert listing is not None
+    assert listing.model == "i10"
 
 
 @pytest.mark.parametrize(

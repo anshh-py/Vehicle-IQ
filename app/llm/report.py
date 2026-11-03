@@ -40,11 +40,17 @@ def build_llm_prompt(report_data: dict[str, Any]) -> tuple[str, str]:
             for key in (
                 "status", "unavailable_reason", "evidence_count",
                 "minimum_evidence_count", "market_asking_price_range",
-                "market_research_results", "limitations", "sources",
+                "priced_comparables", "market_research_results",
+                "search_observability", "geographic_scope",
+                "rejected_listing_counts", "comparison_rejection_counts",
+                "market_research_rejection_counts", "rejection_counts_by_stage",
+                "limitations", "sources", "vehicle_researched",
             )
             if key in market
         }
         if isinstance(market.get("market_research_results"), list):
+            # Discovery context is kept compact; the validated comparable set
+            # below is the complete evidence used for any market range.
             market["market_research_results"] = market["market_research_results"][:5]
     else:
         market = {"status": "unavailable", "evidence_count": 0}
@@ -89,7 +95,7 @@ def build_llm_prompt(report_data: dict[str, Any]) -> tuple[str, str]:
         "When status is unavailable or failed, state that no conclusion about damage can be drawn. "
         "Never omit a stored damage detection. "
         "Never claim that no damage findings exist when detections are present. "
-        "Summarize supplied market evidence only when present. Search results are discovered advertisements, not verified active listings or completed sales. "
+        "Summarize the supplied validated comparable listings, their source URLs, asking prices and years when present. Search results are discovered advertisements, not verified active listings or completed sales. "
         "Never invent a listing, price, source, market range, or missing vehicle field. Do not calculate or alter market statistics; repeat only the supplied deterministic range and evidence count. "
         "When market valuation is unavailable or evidence is below the stated minimum, say that no market range is available. Keep the market asking-price evidence separate from the XGBoost estimate. "
         "Describe OCR registration candidates as unverified text and vehicle API values as provider-reported, not independently verified. "

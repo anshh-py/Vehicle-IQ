@@ -129,19 +129,6 @@ def _key(value: str | None) -> str | None:
     return " ".join(value.casefold().split()) or None
 
 
-def _location_tokens(value: str | None) -> set[str]:
-    if not value:
-        return set()
-    import re
-
-    return {token.casefold() for token in re.findall(r"[a-z]+", value)}
-
-
-def _locations_overlap(left: str | None, right: str | None) -> bool:
-    """Allow an exact city or a shared stated region/state token."""
-    return bool(_location_tokens(left) & _location_tokens(right))
-
-
 def _listing_url_key(url: HttpUrl) -> str:
     parts = urlsplit(str(url))
     return urlunsplit((parts.scheme.lower(), parts.netloc.lower(), parts.path.rstrip("/"), "", ""))
@@ -232,12 +219,6 @@ def _classify(
                 differences.append(
                     f"mileage_km: {listing.mileage_km} vs {criteria.mileage_km}"
                 )
-    if criteria.location is not None:
-        if listing.location is None:
-            differences.append("location: not reported")
-        elif not _locations_overlap(listing.location, criteria.location):
-            differences.append(f"location: {listing.location} vs {criteria.location}")
-
     score = _relevance_score(listing, criteria)
     known_vehicle_mismatch = False
     if criteria.fuel_type and listing.fuel_type and _key(listing.fuel_type) != _key(criteria.fuel_type):
@@ -256,8 +237,6 @@ def _classify(
         )
         if abs(listing.mileage_km - criteria.mileage_km) > mileage_tolerance:
             known_vehicle_mismatch = True
-    if criteria.location and listing.location and not _locations_overlap(listing.location, criteria.location):
-        known_vehicle_mismatch = True
     if not differences:
         return "exact_match", differences
     if (
@@ -279,7 +258,10 @@ def _relevance_score(listing: MarketListing, criteria: MarketVehicleCriteria) ->
             ratio = SequenceMatcher(None, target, actual).ratio()
             score += 20 if ratio >= 0.95 else 14 if ratio >= 0.65 else 5
         else:
-            score += 8
+            # Treat an unreported optional trim as usable evidence; it remains
+            # below a known matching trim but should not be discarded solely
+            # because the advertisement omitted that field.
+            score += 11
     else:
         score += 12
     if criteria.year is not None:
@@ -301,10 +283,6 @@ def _relevance_score(listing: MarketListing, criteria: MarketVehicleCriteria) ->
         else:
             allowed = max(MILEAGE_TOLERANCE_FLOOR_KM, int(criteria.mileage_km * MILEAGE_TOLERANCE_FRACTION))
             score += 5 if abs(listing.mileage_km - criteria.mileage_km) <= allowed else 1
-    else:
-        score += 3
-    if criteria.location:
-        score += 5 if _locations_overlap(listing.location, criteria.location) else 3 if listing.location is None else 1
     else:
         score += 3
     return min(100, max(0, score))

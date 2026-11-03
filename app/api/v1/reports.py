@@ -207,19 +207,6 @@ def _market_inputs(
     model = source.get("model")
     if not isinstance(make, str) or not make.strip() or not isinstance(model, str) or not model.strip():
         return None, asking_price, ml_prediction
-    location_source = {**vehicle, **lookup_details, **details}
-    location = location_source.get("location")
-    if not isinstance(location, str) or not location.strip():
-        location_parts = [
-            value.strip()
-            for value in (location_source.get("city"), location_source.get("state"))
-            if isinstance(value, str) and value.strip()
-        ]
-        location = ", ".join(dict.fromkeys(location_parts)) or None
-    elif isinstance(location_source.get("state"), str) and location_source["state"].strip():
-        state = location_source["state"].strip()
-        if state.casefold() not in location.casefold():
-            location = f"{location.strip()}, {state}"
     try:
         criteria = MarketVehicleCriteria(
             make=make,
@@ -229,7 +216,8 @@ def _market_inputs(
             fuel_type=source.get("fuel_type"),
             transmission=source.get("transmission", source.get("transmission_type")),
             mileage_km=source.get("odometer_km", source.get("mileage_km")),
-            location=location,
+            # Registration/RTO geography must not constrain nationwide research.
+            location=None,
         )
     except Exception:
         criteria = None
@@ -283,8 +271,8 @@ def _market_section(
             "vehicle_researched": (
                 {"make": criteria.make, "model": criteria.model} if criteria else None
             ),
-            "search_location": criteria.location if criteria else None,
-            "geographic_scope": [],
+            "search_location": None,
+            "geographic_scope": ["India nationwide; no city preference"],
             "relevant_result_count": 0,
             "priced_comparable_count": 0,
             "exact_vehicle_match_count": 0,
@@ -305,11 +293,20 @@ def _market_section(
             "sources": [],
             "comparables": [],
             "rejected_listing_counts": {},
+            "comparison_rejection_counts": {},
             "market_research_rejection_counts": {},
+            "rejection_counts_by_stage": {
+                "market_research_discovery": {},
+                "individual_listing_validation": {},
+                "comparable_validation": {},
+            },
             "search_observability": {
                 "queries_issued": 0,
                 "raw_results_returned": 0,
                 "listings_extracted": 0,
+                "valid_individual_listings": 0,
+                "invalid_non_listing_results": 0,
+                "irrelevant_vehicle_results": 0,
                 "extraction_rejected": 0,
                 "relevance_rejected": 0,
                 "market_research_rejected": 0,
@@ -318,6 +315,7 @@ def _market_section(
                 "final_exact_count": 0,
                 "final_close_count": 0,
                 "final_approximate_count": 0,
+                "final_comparable_listings": 0,
             },
             "data_origin": "unavailable",
             "refresh_status": "provider_not_configured",
@@ -336,7 +334,7 @@ def _market_section(
             "ml_prediction": ml_prediction,
             "vehicle_researched": None,
             "search_location": None,
-            "geographic_scope": [],
+            "geographic_scope": ["India nationwide; no city preference"],
             "relevant_result_count": 0,
             "priced_comparable_count": 0,
             "exact_vehicle_match_count": 0,
@@ -357,11 +355,20 @@ def _market_section(
             "sources": [],
             "comparables": [],
             "rejected_listing_counts": {},
+            "comparison_rejection_counts": {},
             "market_research_rejection_counts": {},
+            "rejection_counts_by_stage": {
+                "market_research_discovery": {},
+                "individual_listing_validation": {},
+                "comparable_validation": {},
+            },
             "search_observability": {
                 "queries_issued": 0,
                 "raw_results_returned": 0,
                 "listings_extracted": 0,
+                "valid_individual_listings": 0,
+                "invalid_non_listing_results": 0,
+                "irrelevant_vehicle_results": 0,
                 "extraction_rejected": 0,
                 "relevance_rejected": 0,
                 "market_research_rejected": 0,
@@ -370,6 +377,7 @@ def _market_section(
                 "final_exact_count": 0,
                 "final_close_count": 0,
                 "final_approximate_count": 0,
+                "final_comparable_listings": 0,
             },
             "data_origin": "unavailable",
             "refresh_status": "insufficient_vehicle_details",
@@ -391,11 +399,20 @@ def _market_section(
         result_data = result.model_dump(mode="json")
         market_range = result_data.get("price_range")
         provider_rejections = getattr(provider, "rejected_listing_counts", {})
-        rejected_counts = dict(result.rejected_counts)
-        if isinstance(provider_rejections, dict):
-            for reason, count in provider_rejections.items():
-                if isinstance(reason, str) and isinstance(count, int) and count > 0:
-                    rejected_counts[reason] = rejected_counts.get(reason, 0) + count
+        if not isinstance(provider_rejections, dict):
+            provider_rejections = {}
+        rejected_counts = {
+            reason: count
+            for reason, count in provider_rejections.items()
+            if isinstance(reason, str)
+            and isinstance(count, int)
+            and not isinstance(count, bool)
+            and count > 0
+        }
+        if not hasattr(provider, "rejected_listing_counts"):
+            # Providers returning raw records without their own extraction-stage
+            # diagnostics expose those validation failures through the comparator.
+            rejected_counts = dict(result.rejected_counts)
         exact_count = sum(
             listing.match_type == "exact_match" for listing in result.listings
         )
@@ -473,45 +490,34 @@ def _market_section(
         # robust price calculation. Broader discovery records remain separate.
         priced_comparables = [listing.model_dump(mode="json") for listing in result.listings]
         sources = sorted({listing.source_name for listing in result.listings})
-        raw_search_scopes = getattr(provider, "search_scopes", [])
-        if not isinstance(raw_search_scopes, list):
-            raw_search_scopes = []
-        search_scopes = list(
-            dict.fromkeys(
-                scope.strip()
-                for scope in raw_search_scopes
-                if isinstance(scope, str) and scope.strip()
-            )
-        )
-        if not search_scopes:
-            search_scopes = [
-                f"{criteria.location} and nearby regions" if criteria.location else "India"
-            ]
+        search_scopes = ["India nationwide; no city preference"]
         provider_observability = getattr(provider, "search_observability", {})
         if not isinstance(provider_observability, dict):
             provider_observability = {}
-        relevance_rejected = sum(
-            count
-            for reason, count in result.rejected_counts.items()
-            if reason not in {"duplicate_listing", "price_outlier"}
-        )
         search_observability = {
             "queries_issued": provider_observability.get("queries_issued", 0),
             "raw_results_returned": provider_observability.get("raw_results_returned", 0),
             "listings_extracted": provider_observability.get("listings_extracted", 0),
             "extraction_rejected": provider_observability.get("extraction_rejected", 0),
-            "relevance_rejected": provider_observability.get("relevance_rejected", 0)
-            + relevance_rejected,
+            "relevance_rejected": provider_observability.get("relevance_rejected", 0),
             "market_research_rejected": provider_observability.get(
                 "market_research_rejected", 0
             ),
-            "duplicates_removed": provider_observability.get("duplicates_removed", 0)
-            + result.rejected_counts.get("duplicate_listing", 0),
-            "outliers_removed": provider_observability.get("outliers_removed", 0)
-            + result.rejected_counts.get("price_outlier", 0),
+            "duplicates_removed": provider_observability.get("duplicates_removed", 0),
+            "outliers_removed": result.rejected_counts.get("price_outlier", 0),
             "final_exact_count": exact_count,
             "final_close_count": close_count,
             "final_approximate_count": approximate_count,
+            "final_comparable_listings": len(priced_comparables),
+            "valid_individual_listings": provider_observability.get(
+                "valid_individual_listings", provider_observability.get("listings_extracted", 0)
+            ),
+            "invalid_non_listing_results": provider_observability.get(
+                "invalid_non_listing_results", 0
+            ),
+            "irrelevant_vehicle_results": provider_observability.get(
+                "irrelevant_vehicle_results", 0
+            ),
         }
         search_observability = {
             key: value if isinstance(value, int) and not isinstance(value, bool) else 0
@@ -539,8 +545,8 @@ def _market_section(
             "seller_asking_price_inr": format(asking_price, "f") if asking_price is not None else None,
             "ml_prediction": ml_prediction,
             "vehicle_researched": {"make": criteria.make, "model": criteria.model},
-            "search_location": criteria.location,
-            "geographic_scope": search_scopes,
+            "search_location": None,
+            "geographic_scope": search_scopes or ["India nationwide; no city preference"],
             "relevant_result_count": len(market_research_results),
             "priced_comparable_count": len(priced_comparables),
             "exact_vehicle_match_count": exact_count,
@@ -567,7 +573,13 @@ def _market_section(
             "sources": sources,
             "comparables": [listing.model_dump(mode="json") for listing in result.listings],
             "rejected_listing_counts": rejected_counts,
+            "comparison_rejection_counts": dict(result.rejected_counts),
             "market_research_rejection_counts": market_research_rejection_counts,
+            "rejection_counts_by_stage": {
+                "market_research_discovery": market_research_rejection_counts,
+                "individual_listing_validation": rejected_counts,
+                "comparable_validation": dict(result.rejected_counts),
+            },
             "search_observability": search_observability,
             "data_origin": "freshly_retrieved",
             "refresh_status": "completed",
@@ -618,8 +630,8 @@ def _market_section(
             "seller_asking_price_inr": format(asking_price, "f") if asking_price is not None else None,
             "ml_prediction": ml_prediction,
             "vehicle_researched": {"make": criteria.make, "model": criteria.model},
-            "search_location": criteria.location,
-            "geographic_scope": [],
+            "search_location": None,
+            "geographic_scope": ["India nationwide; no city preference"],
             "relevant_result_count": 0,
             "priced_comparable_count": 0,
             "exact_vehicle_match_count": 0,
@@ -640,11 +652,20 @@ def _market_section(
             "sources": [],
             "comparables": [],
             "rejected_listing_counts": {},
+            "comparison_rejection_counts": {},
             "market_research_rejection_counts": {},
+            "rejection_counts_by_stage": {
+                "market_research_discovery": {},
+                "individual_listing_validation": {},
+                "comparable_validation": {},
+            },
             "search_observability": {
                 "queries_issued": 0,
                 "raw_results_returned": 0,
                 "listings_extracted": 0,
+                "valid_individual_listings": 0,
+                "invalid_non_listing_results": 0,
+                "irrelevant_vehicle_results": 0,
                 "extraction_rejected": 0,
                 "relevance_rejected": 0,
                 "market_research_rejected": 0,
@@ -653,6 +674,7 @@ def _market_section(
                 "final_exact_count": 0,
                 "final_close_count": 0,
                 "final_approximate_count": 0,
+                "final_comparable_listings": 0,
             },
             "data_origin": "unavailable",
             "refresh_status": "provider_error",
