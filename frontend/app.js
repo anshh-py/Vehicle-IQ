@@ -108,18 +108,19 @@
       const category = document.createElement('select');
       category.setAttribute('aria-label', `Photo ${index + 1} type`);
       [
-        ['unknown', 'Choose type'],
+        ['', 'Choose type'],
         ['vehicle_exterior', 'Vehicle exterior'],
         ['vehicle_interior', 'Vehicle interior'],
         ['damage_closeup', 'Damage close-up'],
         ['registration_plate', 'Registration plate'],
         ['document', 'Document'],
+        ['unknown', 'Not sure'],
       ].forEach(([value, label]) => {
         const option = node('option', '', label);
         option.value = value;
         category.append(option);
       });
-      category.value = photoCategories[index] || 'unknown';
+      category.value = photoCategories[index] ?? '';
       category.addEventListener('change', () => { photoCategories[index] = category.value; });
       categoryLabel.append(category);
       card.append(image, node('span', 'photo-thumb-name', photo.name), categoryLabel, remove);
@@ -141,7 +142,7 @@
     }
     setMessage($('form-message'), '');
     photos = [...photos, ...incoming];
-    photoCategories = [...photoCategories, ...incoming.map(() => 'unknown')];
+    photoCategories = [...photoCategories, ...incoming.map(() => '')];
     updatePhotoPreview();
   }
 
@@ -368,8 +369,17 @@
     const lookup = report.vehicle_details_lookup || {};
     const verifiedDetails = ['available', 'partial'].includes(lookup.status) ? (lookup.details || {}) : {};
     const submittedDetails = report.assessment?.vehicle_details || {};
-    const [status, tone] = cleanStatus(ocr.status);
-    setResultStatus('vehicle-status', status, tone);
+    if (['available', 'partial'].includes(lookup.status)) {
+      setResultStatus('vehicle-status', lookup.status === 'partial' ? 'Vehicle details partial' : 'Vehicle details available', lookup.status === 'partial' ? 'warn' : '');
+    } else if (submittedDetails.make || submittedDetails.model || submittedDetails.brand) {
+      setResultStatus('vehicle-status', 'Details supplied', '');
+    } else if (lookup.status === 'failed') {
+      setResultStatus('vehicle-status', 'Lookup failed', 'warn');
+    } else if (lookup.error_code === 'provider_disabled') {
+      setResultStatus('vehicle-status', 'Lookup disabled', 'muted');
+    } else {
+      setResultStatus('vehicle-status', 'Vehicle details unavailable', 'muted');
+    }
     const facts = node('div', 'vehicle-facts');
     appendFact(facts, 'Registration reference', submittedRegistration || verifiedDetails.registration_number || report.assessment?.registration_number || 'Not provided');
     appendFact(facts, 'Photos submitted', sampleReportActive ? 'Illustrative sample' : `${imageIds.length}`);
@@ -471,56 +481,148 @@
       content.append(node('p', 'quiet-copy', 'No damage inference is included in this illustrative sample.'));
       return;
     }
-    const scans = stage.result?.results || [];
     const reportData = workflow.stages?.report?.result?.report_data || {};
     const condition = reportData.condition_assessment || {};
     if (condition.category) {
-      content.append(node('p', 'condition-category', `Condition evidence: ${condition.category.replace(/_/g, ' ')}`));
+      content.append(node('p', 'condition-category', 'Condition evidence: ' + condition.category.replace(/_/g, ' ')));
     }
-    const findings = Array.isArray(stage.result?.findings)
-      ? stage.result.findings
-      : scans.flatMap(scan => scan.findings || []);
-    if (!findings.length) {
-      const line = node('p', 'quiet-copy', stage.status === 'completed_no_findings'
-        ? 'No damage was detected in the supplied images. This does not establish that the vehicle is damage-free.'
-        : stage.status === 'failed'
-          ? 'Damage inspection failed before it could be completed. No conclusion about damage can be drawn from these images.'
-          : 'Damage inspection was unavailable for these images. No conclusion about damage can be drawn.');
+    const reportDamage = reportData.stages?.damage_detection || {};
+    const imageResults = Array.isArray(reportDamage.image_results) ? reportDamage.image_results : [];
+    const scans = Array.isArray(stage.result?.results) ? stage.result.results : [];
+    const allFindings = [
+      ...(Array.isArray(stage.result?.findings) ? stage.result.findings : []),
+      ...(Array.isArray(reportData.damage_findings) ? reportData.damage_findings : []),
+      ...scans.flatMap(scan => Array.isArray(scan.findings) ? scan.findings : []),
+      ...imageResults.flatMap(scan => Array.isArray(scan.findings) ? scan.findings : []),
+    ].filter((finding, index, values) => {
+      const key = finding.id || [
+        finding.image_id, finding.damage_type, finding.confidence,
+        JSON.stringify(finding.bounding_box || null), finding.component, finding.description,
+      ].join('|');
+      return values.findIndex(candidate => {
+        const candidateKey = candidate.id || [
+          candidate.image_id, candidate.damage_type, candidate.confidence,
+          JSON.stringify(candidate.bounding_box || null), candidate.component, candidate.description,
+        ].join('|');
+        return candidateKey === key;
+      }) === index;
+    });
+    const imageRecords = Array.isArray(reportData.images) ? reportData.images : [];
+    const orderedIds = [...new Set([
+      ...imageRecords.map(image => image.id).filter(Boolean),
+      ...imageIds.filter(Boolean),
+      ...scans.map(scan => scan.image_id).filter(Boolean),
+      ...imageResults.map(scan => scan.image_id).filter(Boolean),
+    ])];
+    if (!orderedIds.length) {
       const emptyFindings = node('div', 'empty-findings');
-      emptyFindings.append(node('span', '', '✦'), line);
+      emptyFindings.append(node('span', '', '•'), node('p', 'quiet-copy', 'No uploaded image evidence is available for this review.'));
       content.append(emptyFindings);
       return;
     }
-    const list = node('div', 'finding-list');
-    const evidenceImages = new Set();
-    findings.forEach(finding => {
-      const item = node('div', 'finding-item');
-      const label = node('div', '');
-      label.append(node('strong', '', finding.damage_type || 'Visible finding'));
-      if (finding.component) label.append(node('small', '', finding.component));
-      const confidence = Number.isFinite(finding.confidence)
-        ? `${(finding.confidence * 100).toFixed(1)}% model confidence`
-        : 'Confidence unavailable';
-      item.append(label, node('span', 'confidence', confidence));
-      if (finding.description) item.append(node('p', 'finding-description', finding.description));
-      const photoIndex = imageIds.indexOf(finding.image_id);
-      if (photoIndex >= 0 && !evidenceImages.has(finding.image_id)) {
-        evidenceImages.add(finding.image_id);
-        const evidencePhoto = document.createElement('img');
-        evidencePhoto.className = 'finding-evidence';
-        const preview = previewUrls[photoIndex];
-        if (preview) evidencePhoto.src = preview;
-        else evidencePhoto.dataset.imageId = finding.image_id;
-        evidencePhoto.hidden = !preview;
-        evidencePhoto.alt = `Submitted photo ${photoIndex + 1} associated with this finding`;
-        item.append(evidencePhoto);
+
+    const cardList = node('div', 'condition-image-list');
+    const svgNamespace = 'http://www.w3.org/2000/svg';
+    orderedIds.forEach((imageId, index) => {
+      const metadata = imageRecords.find(image => image.id === imageId) || {};
+      const scan = imageResults.find(item => item.image_id === imageId)
+        || scans.find(item => item.image_id === imageId) || {};
+      const findings = allFindings.filter(item => item.image_id === imageId);
+      const outcome = scan.inspection_outcome || scan.status || metadata.inspection_outcome
+        || metadata.damage_inspection_status || 'unavailable';
+      const category = scan.image_type || metadata.image_type;
+      const card = node('article', 'condition-image-card');
+      card.dataset.imageId = imageId;
+      const heading = node('div', 'condition-image-heading');
+      heading.append(node('h4', '', metadata.original_filename || ('Submitted photo ' + (index + 1))));
+      const status = node('span', 'condition-outcome', 'Inspection unavailable');
+      const frame = node('div', 'condition-image-frame');
+      const photo = document.createElement('img');
+      photo.className = 'condition-photo';
+      photo.alt = 'Original submitted vehicle photo ' + (index + 1);
+      const photoIndex = imageIds.indexOf(imageId);
+      const preview = photoIndex >= 0 ? previewUrls[photoIndex] : null;
+      if (preview) photo.src = preview;
+      else photo.dataset.imageId = imageId;
+      const original = node('a', 'condition-original', 'Open original photo');
+      original.dataset.imageId = imageId;
+      original.target = '_blank';
+      original.rel = 'noopener noreferrer';
+      if (preview) original.href = preview;
+      const annotation = document.createElementNS(svgNamespace, 'svg');
+      annotation.classList.add('damage-annotation-layer');
+      annotation.setAttribute('aria-hidden', 'true');
+      frame.append(photo, annotation);
+      card.append(heading, status, frame, original);
+
+      if (outcome === 'completed_with_findings' || scan.status === 'completed_with_findings') {
+        status.textContent = findings.length ? 'Damage detected' : 'Findings recorded';
+        status.dataset.tone = 'warn';
+      } else if (outcome === 'completed_no_findings' || scan.status === 'completed_no_findings') {
+        status.textContent = 'No visible damage detected';
+        card.append(node('p', 'quiet-copy', 'This completed visual scan does not establish mechanical or hidden structural condition.'));
+      } else if (outcome === 'inference_failed' || outcome === 'failed' || scan.status === 'failed') {
+        status.textContent = 'Inspection failed';
+        status.dataset.tone = 'warn';
+        card.append(node('p', 'quiet-copy', 'Damage inspection failed. No conclusion about damage can be drawn from this image.'));
+      } else if (outcome === 'inference_unavailable' || outcome === 'inspection_unavailable' || scan.status === 'unavailable') {
+        status.textContent = 'Inspection unavailable';
+        card.append(node('p', 'quiet-copy', scan.reason || 'Damage inspection could not be performed; this is not a no-damage result.'));
+      } else if (outcome === 'classification_uncertain' || category === 'unknown') {
+        status.textContent = 'Needs image review';
+        card.append(node('p', 'quiet-copy', scan.reason || 'Image type could not be classified confidently. Review the image type before scanning.'));
+      } else if (outcome === 'ineligible' || scan.damage_eligible === false || metadata.damage_eligible === false) {
+        status.textContent = 'Not eligible for damage scan';
+        card.append(node('p', 'quiet-copy', scan.reason || metadata.damage_rejection_reason || 'This image type was excluded from damage inspection.'));
+      } else {
+        status.textContent = 'Inspection unavailable';
+        card.append(node('p', 'quiet-copy', 'No completed inspection result is recorded for this image.'));
       }
-      list.append(item);
+
+      findings.forEach(finding => {
+        const row = node('div', 'condition-finding');
+        row.append(node('strong', '', String(finding.damage_type || 'Visible finding').replace(/_/g, ' ')));
+        if (finding.severity) row.append(node('span', 'finding-severity', String(finding.severity).replace(/_/g, ' ')));
+        const description = finding.description || (finding.component
+          ? 'Part: ' + finding.component
+          : 'Part or precise location was not identified by the model.');
+        row.append(node('p', 'quiet-copy', description));
+        const confidenceValue = Number(finding.confidence);
+        if (finding.confidence !== null && finding.confidence !== undefined
+          && Number.isFinite(confidenceValue) && confidenceValue >= 0 && confidenceValue <= 1) {
+          row.append(node('span', 'confidence', (confidenceValue * 100).toFixed(1) + '% model confidence'));
+        }
+        card.append(row);
+
+        const box = finding.bounding_box;
+        if (!box || !['x1', 'y1', 'x2', 'y2'].every(key => Number.isFinite(Number(box[key])))) return;
+        const addAnnotation = () => {
+          if (!photo.naturalWidth || !photo.naturalHeight) return;
+          let { x1, y1, x2, y2 } = Object.fromEntries(['x1', 'y1', 'x2', 'y2'].map(key => [key, Number(box[key])]));
+          if ([x1, y1, x2, y2].every(value => value >= 0 && value <= 1)) {
+            x1 *= photo.naturalWidth; x2 *= photo.naturalWidth;
+            y1 *= photo.naturalHeight; y2 *= photo.naturalHeight;
+          }
+          if (x2 <= x1 || y2 <= y1) return;
+          annotation.setAttribute('viewBox', '0 0 ' + photo.naturalWidth + ' ' + photo.naturalHeight);
+          const rect = document.createElementNS(svgNamespace, 'rect');
+          rect.setAttribute('x', String(x1)); rect.setAttribute('y', String(y1));
+          rect.setAttribute('width', String(x2 - x1)); rect.setAttribute('height', String(y2 - y1));
+          rect.classList.add('damage-box');
+          rect.setAttribute('aria-label', String(finding.damage_type || 'Damage') + ' detected region');
+          annotation.append(rect);
+        };
+        if (photo.complete) addAnnotation();
+        else photo.addEventListener('load', addAnnotation, { once: true });
+      });
+      if (!findings.length && outcome === 'completed_with_findings') {
+        card.append(node('p', 'quiet-copy', 'The scan reports findings, but per-finding details are unavailable in the saved report.'));
+      }
+      cardList.append(card);
     });
-    content.append(list);
+    content.append(cardList);
     content.append(node('p', 'quiet-copy', 'Findings are model outputs, not a substitute for an in-person inspection.'));
   }
-
   function pricingNeedsFeatures(stage) {
     const unresolved = [
       ...(stage?.result?.missing_fields || []),
@@ -658,8 +760,18 @@
     const stage = workflow.stages?.pricing || {};
     const report = workflow.stages?.report?.result?.report_data;
     const decision = report?.pricing_decision || {};
-    const [status, tone] = cleanStatus(stage.status);
-    setResultStatus('price-status', status, tone);
+    let priceStatus = 'Inspection unavailable';
+    let priceTone = 'muted';
+    if (decision.pricing_eligible === true && stage.status === 'available') {
+      priceStatus = decision.condition_adjustment_inr ? 'Valuation adjusted' : 'Valuation available';
+      priceTone = '';
+    } else if (decision.pricing_eligible === false) {
+      priceStatus = ['inspection_unavailable', 'inspection_failed'].includes(decision.condition_category)
+        ? 'Inspection unavailable'
+        : 'Valuation withheld';
+      priceTone = 'warn';
+    }
+    setResultStatus('price-status', priceStatus, priceTone);
     const prediction = stage.result;
     if (decision.pricing_eligible !== true) {
       content.append(node('p', 'valuation-withheld', decision.withholding_message || 'A reliable condition-adjusted resale estimate is unavailable.'));
@@ -783,6 +895,9 @@
     }
     const box = node('div', 'recommendation-box');
     box.dataset.kind = recommendation.status || 'insufficient_evidence';
+    if (recommendation.risk_level === 'high') {
+      box.append(node('span', 'recommendation-risk', 'High risk'));
+    }
     box.append(node('h4', '', (recommendation.status || 'insufficient_evidence').replace(/_/g, ' ')));
     box.append(node('p', '', recommendation.explanation || 'No recommendation explanation was returned.'));
     if (Array.isArray(recommendation.next_steps) && recommendation.next_steps.length) {
@@ -1069,14 +1184,21 @@
   }
 
   async function loadPersistedEvidence(id) {
-    const images = [...document.querySelectorAll('.finding-evidence[data-image-id]')];
+    const images = [...document.querySelectorAll('.condition-photo[data-image-id]')];
     await Promise.all(images.map(async image => {
-      const content = await getImageContent(id, image.dataset.imageId);
+      const imageId = image.dataset.imageId;
+      const content = await getImageContent(id, imageId);
       if (!content || !image.isConnected) return;
       const url = URL.createObjectURL(content);
       previewUrls.push(url);
       image.src = url;
-      image.hidden = false;
+      image.removeAttribute('data-image-id');
+      const original = [...document.querySelectorAll('.condition-original[data-image-id]')]
+        .find(link => link.dataset.imageId === imageId);
+      if (original) {
+        original.href = url;
+        original.removeAttribute('data-image-id');
+      }
     }));
   }
 
@@ -1440,7 +1562,14 @@
       const uploaded = [];
       for (let i = 0; i < photos.length; i += 1) {
         updateOverlay(`Adding photo ${i + 1} of ${photos.length}`);
-        const image = await post(`/${assessmentId}/images`, { file: photos[i], imageType: photoCategories[i] || 'unknown' });
+        const selectedCategory = photoCategories[i] || '';
+        const image = await post(`/${assessmentId}/images`, { file: photos[i], imageType: selectedCategory });
+        if (selectedCategory && image.image_type !== selectedCategory) {
+          throw new Error(`Photo ${i + 1} category could not be saved. Please try uploading it again.`);
+        }
+        if (selectedCategory && image.damage_eligible !== (['vehicle_exterior', 'vehicle_interior', 'damage_closeup'].includes(selectedCategory))) {
+          throw new Error(`Photo ${i + 1} eligibility did not match its selected category. Please retry this inspection.`);
+        }
         uploaded.push(image);
         uploadCount += 1;
       }

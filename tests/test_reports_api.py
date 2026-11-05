@@ -194,6 +194,10 @@ def test_generate_report_gathers_and_persists_available_results(report_api):
     assert registration_ocr["raw_evidence"][0]["confidence"] == pytest.approx(0.99)
     assert body["report_data"]["damage_findings"][0]["damage_type"] == "dent"
     assert body["report_data"]["stages"]["damage_detection"]["image_results"][0]["status"] == "completed_with_findings"
+    image_result = body["report_data"]["stages"]["damage_detection"]["image_results"][0]
+    assert image_result["findings"][0]["damage_type"] == "dent"
+    assert image_result["findings"][0]["confidence"] == pytest.approx(0.91)
+    assert image_result["findings"][0]["bounding_box"] == {"x1": 1, "y1": 2, "x2": 5, "y2": 6}
     assert body["report_data"]["price_estimates"][0]["amount"] is None
     assert body["report_data"]["pricing_decision"]["audit"]["base_ml_estimate_inr"] == "625000.00"
     assert body["report_data"]["price_estimates"][0]["vehicle"] == {
@@ -248,7 +252,8 @@ def test_buyer_recommendation_insufficient_without_asking_or_ml_and_market_unava
     response = client.post(f"/api/v1/assessments/{assessment_id}/report")
 
     recommendation = response.json()["report_data"]["buyer_recommendation"]
-    assert recommendation["status"] == "insufficient_evidence"
+    assert recommendation["status"] == "further_inspection"
+    assert "condition has not been established" in recommendation["explanation"]
     assert recommendation["asking_price_inr"] is None
     assert recommendation["ml_estimate_inr"] is None
     assert recommendation["absolute_difference_inr"] is None
@@ -306,7 +311,7 @@ def test_buyer_recommendation_handles_missing_ml_prediction_and_configurable_thr
 
     missing_model = client.post(f"/api/v1/assessments/{assessment_id}/report")
     assert missing_model.status_code == 200
-    assert missing_model.json()["report_data"]["buyer_recommendation"]["status"] == "insufficient_evidence"
+    assert missing_model.json()["report_data"]["buyer_recommendation"]["status"] == "further_inspection"
 
     _add_pipeline_results(engine, assessment_id)
     with Session(engine) as session:
@@ -343,6 +348,40 @@ def test_complete_empty_damage_scan_permits_base_estimate_and_refresh_is_stable(
     assert first["price_estimates"][-1]["customer_facing"] is True
 
 
+def test_report_keeps_per_image_damage_evidence_and_unavailable_photo(report_api):
+    client, engine, assessment_id = report_api
+    _add_pipeline_results(engine, assessment_id)
+    with Session(engine) as session:
+        session.add(UploadedImage(
+            assessment_id=UUID(assessment_id),
+            storage_provider="local",
+            storage_bucket="vehicle-images",
+            object_key="second-test-image-key",
+            original_filename="plate.png",
+            content_type="image/png",
+            byte_size=456,
+            sha256="second-test-digest",
+            image_metadata={"damage_eligibility": {
+                "image_type": "registration_plate",
+                "classification_source": "user_input",
+                "damage_eligible": False,
+                "damage_rejection_reason": "registration_plate_not_eligible_for_damage_inference",
+            }},
+        ))
+        session.commit()
+
+    body = client.post(f"/api/v1/assessments/{assessment_id}/report").json()["report_data"]
+    outcomes = body["stages"]["damage_detection"]["image_results"]
+    assert len(outcomes) == 2
+    damaged = next(image for image in outcomes if image["findings"])
+    excluded = next(image for image in outcomes if image["image_type"] == "registration_plate")
+    assert damaged["findings"][0]["damage_type"] == "dent"
+    assert damaged["findings"][0]["bounding_box"] == {"x1": 1, "y1": 2, "x2": 5, "y2": 6}
+    assert excluded["status"] == "unavailable"
+    assert excluded["inspection_outcome"] == "ineligible"
+    assert excluded["damage_eligible"] is False
+
+
 def test_severe_condition_suppresses_customer_estimate_but_preserves_labeled_audit_value(report_api):
     client, engine, assessment_id = report_api
     _add_pipeline_results(engine, assessment_id)
@@ -369,9 +408,40 @@ def test_severe_condition_suppresses_customer_estimate_but_preserves_labeled_aud
     assert decision["audit"]["base_ml_estimate_inr"] == "625000.00"
     recommendation = body["buyer_recommendation"]
     assert recommendation["status"] == "further_inspection"
+    assert recommendation["risk_level"] == "high"
+    assert "avoid purchasing" in recommendation["explanation"].lower()
+    assert "safe and economically sensible" in recommendation["explanation"]
+    assert not recommendation["absolute_difference_inr"]
     assert recommendation["ml_estimate_inr"] is None
     assert recommendation["absolute_difference_inr"] is None
     assert body["price_estimates"][-1]["valuation_role"] == "audit_only_base_ml_estimate"
+
+
+def test_unavailable_damage_inspection_withholds_base_estimate_and_advises_inspection(report_api):
+    client, engine, assessment_id = report_api
+    _add_pipeline_results(engine, assessment_id)
+    with Session(engine) as session:
+        session.query(DamageFinding).filter_by(assessment_id=UUID(assessment_id)).delete()
+        scan = session.scalar(select(EvidenceRecord).where(
+            EvidenceRecord.assessment_id == UUID(assessment_id),
+            EvidenceRecord.evidence_type == "damage_detection",
+        ))
+        scan.evidence_data = {"status": "unavailable", "detection_count": 0, "inspection_outcome": "inference_unavailable"}
+        session.commit()
+
+    body = client.post(f"/api/v1/assessments/{assessment_id}/report").json()["report_data"]
+    decision = body["pricing_decision"]
+    recommendation = body["buyer_recommendation"]
+    assert decision["pricing_eligible"] is False
+    assert decision["condition_category"] == "inspection_unavailable"
+    assert decision["customer_facing_estimate_inr"] is None
+    assert decision["withholding_message"] == (
+        "Condition assessment unavailable. A reliable condition-adjusted resale estimate cannot be provided."
+    )
+    assert recommendation["status"] == "further_inspection"
+    assert "condition has not been established" in recommendation["explanation"]
+    assert "not mean the vehicle is damaged or damage-free" in recommendation["explanation"]
+    assert recommendation["ml_estimate_inr"] is None
 
 
 def test_llm_cannot_override_withheld_pricing_decision(report_api, monkeypatch):
@@ -380,6 +450,8 @@ def test_llm_cannot_override_withheld_pricing_decision(report_api, monkeypatch):
     client, engine, assessment_id = report_api
     _add_pipeline_results(engine, assessment_id)
     with Session(engine) as session:
+        finding = session.scalar(select(DamageFinding).where(DamageFinding.assessment_id == UUID(assessment_id)))
+        finding.damage_type = "major_collision"
         assessment = session.get(VehicleAssessment, UUID(assessment_id))
         assessment.asking_price_inr = Decimal("650000")
         session.commit()
@@ -395,6 +467,7 @@ def test_llm_cannot_override_withheld_pricing_decision(report_api, monkeypatch):
     body = client.post(f"/api/v1/assessments/{assessment_id}/report").json()["report_data"]
     assert body["pricing_decision"]["pricing_eligible"] is False
     assert "625000" not in body["llm_narrative"]["buyer_recommendations"]
+    assert "avoid purchasing" in body["llm_narrative"]["buyer_recommendations"].lower()
     assert body["llm_narrative"]["price_estimate_explanation"] == body["pricing_decision"]["withholding_message"]
 
 

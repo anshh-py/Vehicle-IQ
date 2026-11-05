@@ -116,6 +116,21 @@ def test_submission_reuses_existing_upload_workflow_and_pricing_contracts():
         assert f'name="{field}"' in initial_form
 
 
+def test_optional_photo_type_does_not_send_unknown_and_explicit_selection_is_preserved():
+    script = (FRONTEND / "app.js").read_text(encoding="utf-8")
+    selector = script.split("const category = document.createElement('select')", maxsplit=1)[1].split("categoryLabel.append", maxsplit=1)[0]
+    submission = script.split("form.addEventListener('submit', async event =>", maxsplit=1)[1].split("$('new-inspection')", maxsplit=1)[0]
+
+    assert "['', 'Choose type']" in selector
+    assert "['vehicle_exterior', 'Vehicle exterior']" in selector
+    assert "['damage_closeup', 'Damage close-up']" in selector
+    assert "['registration_plate', 'Registration plate']" in selector
+    assert "photoCategories[index] ?? ''" in selector
+    assert "const selectedCategory = photoCategories[i] || ''" in submission
+    assert "imageType: selectedCategory" in submission
+    assert "image_type !== selectedCategory" in submission
+
+
 def test_registration_fallback_runs_after_ocr_and_before_report_presentation():
     script = (FRONTEND / "app.js").read_text(encoding="utf-8")
     page = (FRONTEND / "index.html").read_text(encoding="utf-8")
@@ -201,11 +216,11 @@ def test_report_highlights_model_estimate_as_centered_resale_price_band():
     assert "lower + 10000" in script
     assert "resalePriceRange(estimate) || 'Not available'" in script
     assert "recommendation.ml_estimate_inr" in script
-    assert "Rounded to the nearest ₹10,000 band from the model estimate; not a confidence interval." in script
+    assert "research model estimate; not a confidence interval." in script
     assert "Actual selling price may vary depending on vehicle condition, location, ownership and market demand." in script
     assert "This comparison is indicative and does not guarantee the final negotiated price." in script
     assert "Figures are estimates and may differ from actual outcomes." in script
-    assert "Research model · not market value" not in script
+    assert "Research model Â· not market value" not in script
     assert page.index('class="report-masthead"') < page.index('id="report-overview"')
     assert page.index('id="report-overview"') < page.index('id="report-load-note"')
     assert ".report-price-hero" in styles
@@ -237,7 +252,7 @@ def test_report_prefill_preserves_user_entered_values_over_lookup():
 def test_market_display_labels_discovered_advertisements_and_lists_sources():
     script = (FRONTEND / "app.js").read_text(encoding="utf-8")
     assert "marketPriceLabel" in script
-    assert "₹${(amount / 100000)" in script
+    assert "\u20b9${(amount / 100000)" in script
     assert "listing.variant" in script
     assert "listing.year" in script
     assert "listing.priced_used_listing !== false" in script
@@ -257,7 +272,7 @@ def test_market_listing_shows_unavailable_labels_for_missing_vehicle_details():
     assert "const variant = typeof listing.variant === 'string' && listing.variant.trim()" in script
     assert "'unavailable';" in script
     assert "const year = Number.isInteger(listing.year) ? String(listing.year) : 'unavailable';" in script
-    assert "`Variant: ${variant} · Year: ${year}`" in script
+    assert "`Variant: ${variant} \u00b7 Year: ${year}`" in script
 
 
 def test_report_lookup_error_message_is_shown_when_lookup_fails():
@@ -319,9 +334,9 @@ def test_progress_is_indeterminate_until_completed_response_and_errors_are_sanit
     script = (FRONTEND / "app.js").read_text(encoding="utf-8")
     close_overlay = script.split("async function closeOverlay", maxsplit=1)[1].split("overlay.addEventListener", maxsplit=1)[0]
 
-    assert "textContent = '—'" in script
+    assert "textContent = '\u2014'" in script
     assert "if (complete)" in close_overlay
-    assert "textContent = '100'" in close_overlay
+    assert "textContent = '\u2014'" in script
     assert "response.status === 401" in script
     assert "response.status === 413" in script
     assert "data.detail" not in script
@@ -338,8 +353,8 @@ def test_report_sections_render_real_payload_fields_and_token_is_not_persisted()
     assert "recommendation.explanation" in script
     assert "report.vehicle_details_lookup" in script
     assert "report.assessment?.vehicle_details" in script
-    assert "finding.image_id" in script
-    assert "finding-evidence" in script
+    assert "item.image_id === imageId" in script
+    assert "condition-photo" in script
     assert "images/${encodeURIComponent(imageId)}/content" in script
     assert "recommendation.absolute_difference_inr" in script
     assert "market.market_asking_price_range" not in script
@@ -352,22 +367,30 @@ def test_report_sections_render_real_payload_fields_and_token_is_not_persisted()
     assert "sample-report" in script
 
 
-def test_condition_review_appends_dom_nodes_instead_of_stringifying_them():
+def test_condition_review_renders_per_image_status_evidence_and_actual_annotations():
     script = (FRONTEND / "app.js").read_text(encoding="utf-8")
     condition = script.split("function renderCondition(workflow)", maxsplit=1)[1].split("function pricingNeedsFeatures", maxsplit=1)[0]
 
-    assert "const emptyFindings = node('div', 'empty-findings')" in condition
-    assert "emptyFindings.append(node('span', '', '✦'), line)" in condition
-    assert "node('div', 'empty-findings', node(" not in condition
-    assert "finding.damage_type || 'Visible finding'" in condition
-    assert "node('span', 'confidence', confidence)" in condition
-    assert "item.append(evidencePhoto)" in condition
+    assert "const orderedIds = [...new Set([" in condition
+    assert "const candidateKey = candidate.id || [" in condition
+    assert "node('article', 'condition-image-card')" in condition
+    assert "metadata.original_filename" in condition
+    assert "No visible damage detected" in condition
+    assert "Inspection failed" in condition
+    assert "Needs image review" in condition
+    assert "Not eligible for damage scan" in condition
+    assert "finding.bounding_box" in condition
+    assert "document.createElementNS(svgNamespace, 'rect')" in condition
+    assert "finding.severity" in condition
+    assert "model confidence" in condition
+    assert "Open original photo" in condition
+    assert "Part or precise location was not identified by the model." in condition
 
 
 def test_damage_status_mapping_never_treats_unavailable_as_no_findings():
     script = (FRONTEND / "app.js").read_text(encoding="utf-8")
     condition = script.split("function renderCondition(workflow)", maxsplit=1)[1].split("function pricingNeedsFeatures", maxsplit=1)[0]
-    workflow_mapping = script.split("function workflowFromReport(reportResponse)", maxsplit=1)[1].split("function illustrativeSampleReport", maxsplit=1)[0]
+    workflow_mapping = script.split("function workflowFromReport(reportResponse)", maxsplit=1)[1].split("function illustrativeSampleReport()", maxsplit=1)[0]
 
     for status in (
         "completed_with_findings",
@@ -376,12 +399,12 @@ def test_damage_status_mapping_never_treats_unavailable_as_no_findings():
         "failed",
     ):
         assert status in script
-    assert "stage.status === 'completed_no_findings'" in condition
-    assert "stage.status === 'unavailable'" not in condition
-    assert "This does not establish that the vehicle is damage-free." in condition
+    assert "outcome === 'completed_no_findings'" in condition
+    assert "outcome === 'inference_failed'" in condition
+    assert "outcome === 'inference_unavailable'" in condition
+    assert "does not establish mechanical or hidden structural condition" in condition
     assert "results_available" in workflow_mapping
     assert ": 'unavailable'" in workflow_mapping
-
 
 def test_pricing_report_displays_saved_missing_fields_and_failure_status():
     script = (FRONTEND / "app.js").read_text(encoding="utf-8")
@@ -391,6 +414,20 @@ def test_pricing_report_displays_saved_missing_fields_and_failure_status():
     assert "const savedPricing = sourceStages.pricing || {}" in script
     assert "savedPricing.missing_fields" in script
     assert "savedPricing.error_code" in script
+
+
+def test_withheld_pricing_and_successful_lookup_have_accurate_badges():
+    script = (FRONTEND / "app.js").read_text(encoding="utf-8")
+    price = script.split("function renderPrice(workflow)", maxsplit=1)[1].split("function renderLLMNarrative", maxsplit=1)[0]
+    vehicle = script.split("function renderVehicle(workflow, submittedRegistration)", maxsplit=1)[1].split("function renderVehicleSpecs", maxsplit=1)[0]
+
+    assert "Valuation available" in price
+    assert "Valuation adjusted" in price
+    assert "Valuation withheld" in price
+    assert "Inspection unavailable" in price
+    assert "setResultStatus('price-status', priceStatus, priceTone)" in price
+    assert "setResultStatus('vehicle-status', lookup.status" in vehicle
+    assert "Could not complete" not in vehicle
 
 
 def test_report_explains_registration_lookup_failures_without_provider_payloads():

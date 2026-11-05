@@ -165,3 +165,23 @@ button { color: inherit; }
 }
 
 .sample-report-banner { width: var(--page); margin: 0 auto 22px; padding: 12px 15px; border: 1px solid #a7ce6c70; border-radius: 8px; background: #a7ce6c12; color: #d6e7bd; font-size: 11px; line-height: 1.5; }
+
+/* Evidence-first per-photo condition review */
+.condition-image-list { display: grid; grid-template-columns: repeat(auto-fit,minmax(min(100%,310px),1fr)); gap: 14px; }
+.condition-image-card { min-width: 0; padding: 12px; border: 1px solid #2e4033; background: #0c1410; }
+.condition-image-heading { display: flex; align-items: flex-start; justify-content: space-between; gap: 10px; margin-bottom: 9px; }
+.condition-image-heading h4 { min-width: 0; margin: 0; overflow-wrap: anywhere; color: #e7eee8; font-size: 11px; font-weight: 600; }
+.condition-outcome { flex: 0 0 auto; color: #9bb3a2; font-size: 8px; }
+.condition-outcome[data-tone="warn"] { color: var(--amber); }
+.condition-image-frame { position: relative; overflow: hidden; background: #080d0c; border: 1px solid #27372d; }
+.condition-photo { display: block; width: 100%; max-height: 360px; object-fit: contain; }
+.damage-annotation-layer { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; overflow: visible; }
+.damage-box { fill: #a4f17a1a; stroke: #b7ff87; stroke-width: 3; vector-effect: non-scaling-stroke; }
+.condition-original { display: inline-block; margin-top: 7px; color: #a6d88c; font-size: 8px; text-decoration: underline; text-underline-offset: 3px; }
+.condition-finding { position: relative; margin-top: 10px; padding: 10px; border-left: 2px solid var(--amber); background: #141b15; }
+.condition-finding strong { display: inline-block; color: #f0f4ed; font-size: 10px; text-transform: capitalize; }
+.finding-severity { margin-left: 8px; color: var(--amber); font-size: 8px; text-transform: capitalize; }
+.condition-finding .quiet-copy { margin: 4px 0 0; }
+.condition-image-card > .quiet-copy { margin: 8px 0 0; }
+.recommendation-risk { display: inline-block; margin: 0 0 8px; padding: 4px 7px; border: 1px solid #966f48; color: #ffc477; font-size: 8px; letter-spacing: .08em; text-transform: uppercase; }
+@media (max-width: 540px) { .condition-image-list { grid-template-columns: 1fr; } .condition-image-card { padding: 9px; } .condition-photo { max-height: 280px; } }

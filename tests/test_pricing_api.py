@@ -9,7 +9,7 @@ from sqlalchemy.orm import Session
 from sqlalchemy.pool import StaticPool
 
 from app.db.base import Base
-from app.db.models import OCRResult, PriceEstimate, VehicleAssessment
+from app.db.models import EvidenceRecord, OCRResult, PriceEstimate, UploadedImage, VehicleAssessment
 from app.db.session import get_db
 from app.main import app
 from app.pricing.provider import PipelinePriceProvider, get_price_provider
@@ -50,6 +50,33 @@ def _save_lookup(engine, assessment_id):
             provider="verified_test_api",
             raw_text="MH12AB3456",
             result_data=LOOKUP_RESULT,
+        ))
+        session.commit()
+
+
+def _save_completed_clean_damage_scan(engine, assessment_id):
+    """Model a real completed zero-finding scan for report-policy tests."""
+    with Session(engine) as session:
+        image = UploadedImage(
+            assessment_id=UUID(assessment_id),
+            storage_provider="local", storage_bucket="vehicle-images",
+            object_key="completed-clean-test-image", original_filename="vehicle.png",
+            content_type="image/png", byte_size=123, sha256="completed-clean-test-digest",
+            image_metadata={"damage_eligibility": {
+                "image_type": "vehicle_exterior", "classification_source": "user_input",
+                "damage_eligible": True,
+            }},
+        )
+        session.add(image)
+        session.flush()
+        session.add(EvidenceRecord(
+            assessment_id=UUID(assessment_id), image_id=image.id,
+            evidence_type="damage_detection", source_reference="test_completed_inference",
+            evidence_data={
+                "status": "completed_no_findings", "detection_count": 0,
+                "inspection_outcome": "completed_no_findings", "damage_eligible": True,
+                "image_type": "vehicle_exterior",
+            },
         ))
         session.commit()
 
@@ -196,6 +223,7 @@ def test_pricing_to_report_flow_keeps_ml_and_market_values_separate(pricing_api)
         assessment = session.get(VehicleAssessment, UUID(assessment_id))
         assessment.asking_price_inr = Decimal("675000.00")
         session.commit()
+    _save_completed_clean_damage_scan(engine, assessment_id)
 
     estimate_response = client.post(
         f"/api/v1/assessments/{assessment_id}/price-estimates", json=VALID_REQUEST
@@ -232,6 +260,7 @@ def test_pricing_to_report_flow_keeps_ml_and_market_values_separate(pricing_api)
 def test_pricing_to_report_flow_without_asking_price(pricing_api):
     client, (engine, assessment_id) = pricing_api
     _save_lookup(engine, assessment_id)
+    _save_completed_clean_damage_scan(engine, assessment_id)
     app.dependency_overrides[get_price_provider] = lambda: FakePriceProvider()
 
     estimate_response = client.post(
@@ -278,6 +307,7 @@ def test_model_artifact_failure_returns_safe_502_without_persisting(
 def test_provider_failure_does_not_persist_estimate(pricing_api):
     client, (engine, assessment_id) = pricing_api
     _save_lookup(engine, assessment_id)
+    _save_completed_clean_damage_scan(engine, assessment_id)
 
     with Session(engine) as session:
         assessment = session.get(VehicleAssessment, UUID(assessment_id))

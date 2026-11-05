@@ -321,13 +321,34 @@ def test_ml_estimate_inr_is_consistent_with_stored_price_estimate(
     workflow_client,
 ):
     """ML estimate in report should match the stored price estimate amount."""
-    from app.db.models import PriceEstimate
+    from app.db.models import EvidenceRecord, PriceEstimate, UploadedImage
 
     client = workflow_client.client
     assessment_id = _create_test_assessment(client)
 
     # Create a price estimate directly in the database
     with Session(workflow_client.engine) as session:
+        image = UploadedImage(
+            assessment_id=assessment_id,
+            storage_provider="local", storage_bucket="vehicle-images",
+            object_key="completed-clean-reliability-image", original_filename="vehicle.png",
+            content_type="image/png", byte_size=123, sha256="completed-clean-reliability-digest",
+            image_metadata={"damage_eligibility": {
+                "image_type": "vehicle_exterior", "classification_source": "user_input",
+                "damage_eligible": True,
+            }},
+        )
+        session.add(image)
+        session.flush()
+        session.add(EvidenceRecord(
+            assessment_id=assessment_id, image_id=image.id,
+            evidence_type="damage_detection", source_reference="test_completed_inference",
+            evidence_data={
+                "status": "completed_no_findings", "detection_count": 0,
+                "inspection_outcome": "completed_no_findings", "damage_eligible": True,
+                "image_type": "vehicle_exterior",
+            },
+        ))
         price_estimate = PriceEstimate(
             assessment_id=assessment_id,
             amount=Decimal("167276.00"),

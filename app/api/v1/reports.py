@@ -735,10 +735,10 @@ def _build_report_data(
     else:
         ocr_status = no_success_ocr_status()
 
-    findings_by_image: dict[UUID, int] = {}
+    findings_by_image: dict[UUID, list[DamageFinding]] = {}
     for finding in damage_findings:
         if finding.image_id is not None:
-            findings_by_image[finding.image_id] = findings_by_image.get(finding.image_id, 0) + 1
+            findings_by_image.setdefault(finding.image_id, []).append(finding)
 
     latest_damage_scans: dict[UUID, EvidenceRecord] = {}
     latest_eligibility_scans: dict[UUID, EvidenceRecord] = {}
@@ -758,7 +758,8 @@ def _build_report_data(
             destination[scan.image_id] = scan
 
     def damage_outcome(image: UploadedImage) -> dict[str, Any]:
-        finding_count = findings_by_image.get(image.id, 0)
+        image_findings = findings_by_image.get(image.id, [])
+        finding_count = len(image_findings)
         scan = latest_damage_scans.get(image.id)
         data = scan.evidence_data if scan and isinstance(scan.evidence_data, dict) else {}
         status_value = data.get("status")
@@ -815,6 +816,18 @@ def _build_report_data(
             "detection_count": data.get("detection_count", finding_count),
             "damage_types": data.get("damage_types", []),
             "inference_seconds": data.get("inference_seconds"),
+            "findings": [
+                {
+                    "id": str(finding.id),
+                    "damage_type": finding.damage_type,
+                    "severity": finding.severity,
+                    "confidence": finding.confidence,
+                    "component": finding.component,
+                    "description": finding.description,
+                    "bounding_box": finding.bounding_box,
+                }
+                for finding in image_findings
+            ],
         }
 
     damage_image_results = [damage_outcome(image) for image in images]
@@ -1169,11 +1182,30 @@ def _buyer_recommendation(
     )
 
     policy_withheld = pricing_decision_data is not None and not pricing_decision_data.get("pricing_eligible")
+    high_risk = False
     if policy_withheld:
-        if damage_findings or pricing_decision_data.get("condition_category") == "severe_damage":
+        if pricing_decision_data.get("condition_category") == "severe_damage":
             recommendation = "further_inspection"
-            explanation = pricing_decision_data.get("withholding_message") or "Obtain a professional inspection and repair assessment before relying on a resale estimate."
-            next_steps = ["Obtain an in-person inspection and repair assessment before negotiating on price."]
+            high_risk = True
+            explanation = (
+                "Potentially severe damage was detected. Avoid purchasing unless a qualified "
+                "professional inspection and repair assessment establish that the vehicle is "
+                "safe and economically sensible. No negotiation is based on the unadjusted ML estimate."
+            )
+            next_steps = [
+                "Do not proceed with purchase until a qualified professional inspection and repair assessment establish safety and economic viability."
+            ]
+        elif pricing_decision_data.get("condition_category") in {"inspection_unavailable", "inspection_failed"}:
+            recommendation = "further_inspection"
+            explanation = (
+                "The vehicle's condition has not been established because image inspection "
+                "was unavailable or failed. This does not mean the vehicle is damaged or damage-free."
+            )
+            next_steps = ["Arrange a qualified in-person inspection before purchase."]
+        elif damage_findings:
+            recommendation = "further_inspection"
+            explanation = pricing_decision_data.get("withholding_message") or "Recorded visual findings require professional review; no repair cost or severity deduction has been inferred."
+            next_steps = ["Obtain an in-person inspection and repair assessment before deciding on purchase or price."]
         else:
             recommendation = "insufficient_evidence"
             explanation = pricing_decision_data.get("withholding_message") or "A reliable condition-adjusted resale estimate is unavailable from the current inspection evidence."
@@ -1229,6 +1261,7 @@ def _buyer_recommendation(
 
     return {
         "status": recommendation,
+        "risk_level": "high" if high_risk else None,
         "comparison_basis": "none_due_to_valuation_policy" if policy_withheld else "ml_estimate_only",
         "comparison_tolerance_percent": int(tolerance),
         "asking_price_inr": format(asking, "f") if asking is not None else None,
@@ -1292,9 +1325,21 @@ def _enforce_pricing_decision_in_narrative(report_data: dict[str, Any]) -> None:
         return
     message = decision.get("withholding_message") or "A customer-facing resale estimate is unavailable under the condition policy."
     narrative["price_estimate_explanation"] = message
-    narrative["buyer_recommendations"] = message + " " + " ".join(
-        str(step) for step in _buyer_recommendation_next_steps(decision)
-    )
+    if decision.get("condition_category") == "severe_damage":
+        narrative["buyer_recommendations"] = (
+            "High risk: avoid purchasing unless a qualified professional inspection and repair "
+            "assessment establish that the vehicle is safe and economically sensible. "
+            "Do not negotiate from the unadjusted ML estimate."
+        )
+    elif decision.get("condition_category") in {"inspection_unavailable", "inspection_failed"}:
+        narrative["buyer_recommendations"] = (
+            "The vehicle's condition has not been established; inspection failure does not mean "
+            "the vehicle is damaged or damage-free. Arrange an in-person inspection before purchase."
+        )
+    else:
+        narrative["buyer_recommendations"] = message + " " + " ".join(
+            str(step) for step in _buyer_recommendation_next_steps(decision)
+        )
 
 
 def _buyer_recommendation_next_steps(decision: dict[str, Any]) -> list[str]:

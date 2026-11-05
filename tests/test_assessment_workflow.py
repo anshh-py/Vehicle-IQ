@@ -222,9 +222,13 @@ def test_complete_assessment_workflow_preserves_partial_external_results(workflo
     assert report["stages"]["damage_detection"]["images_with_findings"] == 10
     assert report["stages"]["pricing"]["status"] == "available"
     recommendation = report["buyer_recommendation"]
-    assert recommendation["ml_estimate_inr"] == "625000.00"
-    assert recommendation["absolute_difference_inr"] == "75000.00"
-    assert recommendation["difference_percent_of_ml_estimate"] == "12.00"
+    assert report["pricing_decision"]["pricing_eligible"] is False
+    assert report["pricing_decision"]["condition_category"] == "minor_cosmetic"
+    assert report["pricing_decision"]["customer_facing_estimate_inr"] is None
+    assert recommendation["ml_estimate_inr"] is None
+    assert recommendation["absolute_difference_inr"] is None
+    assert recommendation["difference_percent_of_ml_estimate"] is None
+    assert "No damage deduction has been invented" in report["pricing_decision"]["withholding_message"]
     assert recommendation["market_evidence_available"] is False
     assert report["market_valuation"]["status"] == "unavailable"
 
