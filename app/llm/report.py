@@ -76,16 +76,28 @@ def build_llm_prompt(report_data: dict[str, Any]) -> tuple[str, str]:
         "damage_inspection": _safe(damage_inspection or {"status": "unavailable"}),
         "damage_findings": _safe(report_data.get("damage_findings") or []),
         "price_estimates": _safe(report_data.get("price_estimates") or []),
+        "pricing_decision": _safe(report_data.get("pricing_decision") or {}),
         "pricing_workflow": _safe(report_data.get("pricing") or (report_data.get("stages", {}).get("pricing") if isinstance(report_data.get("stages"), dict) else {})),
         "buyer_recommendation": buyer_recommendation,
         "market_valuation": market,
         "limitations": _safe(report_data.get("limitations") or []),
     }
+    decision = report_data.get("pricing_decision")
+    if isinstance(decision, dict) and not decision.get("pricing_eligible"):
+        # Keep suppressed base estimates in the deterministic audit record,
+        # but never provide their amount to narrative generation.
+        evidence["price_estimates"] = [
+            {key: value for key, value in item.items() if key not in {"amount", "lower_bound", "upper_bound"}}
+            for item in evidence["price_estimates"] if isinstance(item, dict)
+        ]
+        if isinstance(evidence.get("market_valuation"), dict):
+            evidence["market_valuation"]["ml_prediction"] = {"status": "withheld_by_condition_policy"}
     system_prompt = (
         "You are an automotive inspection report assistant. "
         "Use only the supplied structured evidence. "
         "Do not invent vehicle specifications, damage findings, market prices, repair costs, mechanical condition, or inspection results. "
         "Do not recalculate or change the XGBoost price estimate. "
+        "The deterministic pricing_decision controls whether a customer-facing resale estimate may be shown. Never override it. If pricing_eligible is false, do not reveal or restate the audit-only base estimate; explain only the withholding_message and required next steps. "
         "Fields with provenance vehicle_api are reported by the VehicleX registration lookup; describe them as API-reported facts, not as independently verified facts. "
         "Do not label Vehicle API fields as unverified. "
         "Distinguish API-reported facts from independently verified facts. "

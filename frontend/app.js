@@ -7,6 +7,7 @@
   const photoGrid = document.getElementById('photo-grid');
   const overlay = document.getElementById('inspection-overlay');
   let photos = [];
+  let photoCategories = [];
   let previewUrls = [];
   let assessmentId = null;
   let imageIds = [];
@@ -99,9 +100,29 @@
       remove.setAttribute('aria-label', `Remove photo ${index + 1}`);
       remove.addEventListener('click', () => {
         photos = photos.filter((_, photoIndex) => photoIndex !== index);
+        photoCategories = photoCategories.filter((_, photoIndex) => photoIndex !== index);
         updatePhotoPreview();
       });
-      card.append(image, node('span', 'photo-thumb-name', photo.name), remove);
+      const categoryLabel = node('label', 'photo-category-field');
+      categoryLabel.append(node('span', '', 'Photo type'));
+      const category = document.createElement('select');
+      category.setAttribute('aria-label', `Photo ${index + 1} type`);
+      [
+        ['unknown', 'Choose type'],
+        ['vehicle_exterior', 'Vehicle exterior'],
+        ['vehicle_interior', 'Vehicle interior'],
+        ['damage_closeup', 'Damage close-up'],
+        ['registration_plate', 'Registration plate'],
+        ['document', 'Document'],
+      ].forEach(([value, label]) => {
+        const option = node('option', '', label);
+        option.value = value;
+        category.append(option);
+      });
+      category.value = photoCategories[index] || 'unknown';
+      category.addEventListener('change', () => { photoCategories[index] = category.value; });
+      categoryLabel.append(category);
+      card.append(image, node('span', 'photo-thumb-name', photo.name), categoryLabel, remove);
       photoGrid.append(card);
     });
   }
@@ -120,6 +141,7 @@
     }
     setMessage($('form-message'), '');
     photos = [...photos, ...incoming];
+    photoCategories = [...photoCategories, ...incoming.map(() => 'unknown')];
     updatePhotoPreview();
   }
 
@@ -139,12 +161,13 @@
     addPhotos(event.dataTransfer.files);
   });
 
-  async function post(path, { json, file, timeoutMs = 60_000 } = {}) {
+  async function post(path, { json, file, imageType, timeoutMs = 60_000 } = {}) {
     const headers = {};
     const options = { method: 'POST', headers };
     if (file) {
       const body = new FormData();
       body.append('file', file, file.name);
+      if (imageType) body.append('image_type', imageType);
       options.body = body;
     } else {
       headers['Content-Type'] = 'application/json';
@@ -449,6 +472,11 @@
       return;
     }
     const scans = stage.result?.results || [];
+    const reportData = workflow.stages?.report?.result?.report_data || {};
+    const condition = reportData.condition_assessment || {};
+    if (condition.category) {
+      content.append(node('p', 'condition-category', `Condition evidence: ${condition.category.replace(/_/g, ' ')}`));
+    }
     const findings = Array.isArray(stage.result?.findings)
       ? stage.result.findings
       : scans.flatMap(scan => scan.findings || []);
@@ -629,10 +657,15 @@
     prompt.hidden = true;
     const stage = workflow.stages?.pricing || {};
     const report = workflow.stages?.report?.result?.report_data;
+    const decision = report?.pricing_decision || {};
     const [status, tone] = cleanStatus(stage.status);
     setResultStatus('price-status', status, tone);
     const prediction = stage.result;
-    if (prediction && stage.status === 'available') {
+    if (decision.pricing_eligible !== true) {
+      content.append(node('p', 'valuation-withheld', decision.withholding_message || 'A reliable condition-adjusted resale estimate is unavailable.'));
+      if (decision.condition_category) content.append(node('p', 'quiet-copy', `Condition status: ${String(decision.condition_category).replace(/_/g, ' ')}. The base model prediction is retained for audit and is not shown as a resale estimate.`));
+      if (decision.human_review_required) content.append(node('p', 'quiet-copy', 'A qualified in-person inspection is recommended before relying on a resale valuation.'));
+    } else if (prediction && stage.status === 'available') {
       const highlight = node('div', 'price-highlight');
       highlight.append(node('small', '', 'RESEARCH MODEL ESTIMATE · INR'));
       highlight.append(node('strong', '', money(prediction.amount)));
@@ -791,10 +824,13 @@
       return rightExact - leftExact;
     });
     const recommendation = report?.buyer_recommendation || {};
-    const estimate = recommendation.ml_estimate_inr;
+    const decision = report?.pricing_decision || {};
+    const estimate = decision.pricing_eligible === true
+      ? (decision.customer_facing_estimate_inr || recommendation.ml_estimate_inr)
+      : null;
     const estimateTile = node('section', 'report-price-hero');
     estimateTile.setAttribute('aria-label', 'Estimated resale price');
-    estimateTile.append(node('p', 'report-price-label', 'ESTIMATED RESALE PRICE'));
+    estimateTile.append(node('p', 'report-price-label', decision.pricing_eligible === true ? 'ESTIMATED RESALE PRICE' : 'RESALE VALUATION WITHHELD'));
     estimateTile.append(node(
       'strong',
       'report-price-range',
@@ -803,7 +839,9 @@
     estimateTile.append(node(
       'p',
       'report-price-method',
-      'Rounded to the nearest ₹10,000 band from the model estimate; not a confidence interval.',
+      decision.pricing_eligible !== true
+        ? (decision.withholding_message || 'A condition-adjusted resale estimate is not available.')
+        : 'Rounded to the nearest ₹10,000 band from the research model estimate; not a confidence interval.',
     ));
     estimateTile.append(node(
       'p',
@@ -876,6 +914,7 @@
             ? (reportFindings.length ? 'completed_with_findings' : 'unavailable')
             : 'unavailable';
     const latestEstimate = Array.isArray(data.price_estimates) ? data.price_estimates.at(-1) : null;
+    const pricingDecision = data.pricing_decision || {};
     const savedPricing = sourceStages.pricing || {};
     const missingFields = Array.isArray(savedPricing.missing_fields) ? savedPricing.missing_fields : [];
     const savedPricingStatus = savedPricing.status;
@@ -896,7 +935,7 @@
       pricing: {
         status: pricingStatus,
         result: pricingStatus === 'available'
-          ? { amount: latestEstimate.amount, model_name: latestEstimate.model_name }
+          ? { amount: pricingDecision.pricing_eligible === true ? (pricingDecision.customer_facing_estimate_inr || latestEstimate.amount) : null, model_name: latestEstimate.model_name }
           : { missing_fields: missingFields },
         errors: pricingErrorCode ? [{ code: pricingErrorCode }] : [],
       },
@@ -937,6 +976,16 @@
           ocr: { status: 'unavailable', result_count: 0 },
           damage_detection: { status: 'unavailable', finding_count: 0 },
           pricing: { status: 'available', estimate_count: 1 },
+        },
+        condition_assessment: {
+          category: 'inspection_unavailable', inspection_status: 'unavailable',
+          requires_human_review: true, finding_count: 0,
+        },
+        pricing_decision: {
+          status: 'withheld_inspection_unavailable', pricing_eligible: false,
+          customer_facing_estimate_inr: null,
+          withholding_message: 'Condition assessment unavailable. A reliable condition-adjusted resale estimate cannot be provided.',
+          condition_category: 'inspection_unavailable', human_review_required: true,
         },
         ocr_results: [],
         registration_lookup_results: [],
@@ -1391,7 +1440,7 @@
       const uploaded = [];
       for (let i = 0; i < photos.length; i += 1) {
         updateOverlay(`Adding photo ${i + 1} of ${photos.length}`);
-        const image = await post(`/${assessmentId}/images`, { file: photos[i] });
+        const image = await post(`/${assessmentId}/images`, { file: photos[i], imageType: photoCategories[i] || 'unknown' });
         uploaded.push(image);
         uploadCount += 1;
       }
@@ -1421,6 +1470,7 @@
 
   $('new-inspection').addEventListener('click', () => {
     photos = [];
+    photoCategories = [];
     previewUrls.forEach(url => URL.revokeObjectURL(url));
     previewUrls = [];
     imageIds = [];

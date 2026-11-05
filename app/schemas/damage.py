@@ -34,6 +34,15 @@ class ImageDamageResponse(BaseModel):
     findings: list[DamageFindingResponse]
     image_type: str | None = None
     reason: str | None = None
+    inspection_outcome: str | None = None
+    condition_category: str | None = None
+    requires_human_review: bool = False
+    classification_source: str | None = None
+    damage_eligible: bool | None = None
+    damage_rejection_reason: str | None = None
+    classification_method: str | None = None
+    classification_evidence: dict | None = None
+    inference_seconds: float | None = None
 
 
 class AssessmentDamageRequest(BaseModel):
@@ -56,6 +65,15 @@ class AssessmentImageDamageResult(BaseModel):
     error: str | None = None
     image_type: str | None = None
     reason: str | None = None
+    inspection_outcome: str | None = None
+    condition_category: str | None = None
+    requires_human_review: bool = False
+    classification_source: str | None = None
+    damage_eligible: bool | None = None
+    damage_rejection_reason: str | None = None
+    classification_method: str | None = None
+    classification_evidence: dict | None = None
+    inference_seconds: float | None = None
 
 
 class AssessmentDamageResponse(BaseModel):

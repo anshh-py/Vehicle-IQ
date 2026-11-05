@@ -216,6 +216,19 @@ def test_paddle_local_provider_returns_and_persists_real_response_fields(ocr_api
         assert record.result_data["confidence"] == pytest.approx(0.9977)
 
 
+def test_ocr_html_is_sanitized_for_display_and_raw_provider_text_is_preserved(ocr_api):
+    client, assessment_id, image_id, _storage, engine, fake = ocr_api
+    fake.result = OCRRecognition(text="<table><tr><td>Registration</td><td>RJ45CA1879</td></tr></table>")
+    response = client.post(f"/api/v1/assessments/{assessment_id}/images/{image_id}/ocr")
+    assert response.status_code == 200
+    assert response.json()["text"] == "Registration\nRJ45CA1879"
+    with Session(engine) as session:
+        record = session.scalar(select(OCRResult))
+        assert record.raw_text == fake.result.text
+        assert record.result_data["display_text"] == "Registration\nRJ45CA1879"
+        assert record.result_data["raw_provider_evidence_available"] is True
+
+
 def test_public_provider_name_is_returned_and_persisted(ocr_api):
     client, assessment_id, image_id, _storage, engine, fake = ocr_api
     fake.provider_name = "huggingface_gradio"
@@ -371,7 +384,7 @@ def test_public_no_text_output_is_persisted_as_unreadable_not_completed(ocr_api)
     [
         (OCRServiceUnavailable(), 503, "OCR service is unavailable.", "unavailable"),
         (OCRInvalidResponse(), 502, "OCR service returned an invalid response.", "failed"),
-        (OCRInferenceFailed(), 502, "OCR inference failed. The OCR service returned no error details.", "failed"),
+        (OCRInferenceFailed(), 502, "OCR inference failed. The provider did not complete recognition.", "failed"),
         (OCRUnreadableText(), 422, "No readable text was found in the image.", "unreadable"),
     ],
 )
@@ -388,19 +401,25 @@ def test_ocr_service_failures_are_safe_and_persist_noncompleted_status(ocr_api, 
         assert record is not None
         assert record.status == expected_status
         assert record.raw_text is None
+        if expected_status != "unreadable":
+            assert record.result_data["diagnostic"]["provider"] == "baidu_unlimited_ocr"
+            assert record.result_data["diagnostic"]["operation"] == "recognize"
 
 
-def test_ocr_inference_failure_detail_is_logged_and_returned_safely(ocr_api, caplog):
+def test_ocr_inference_failure_detail_is_not_exposed_or_logged(ocr_api, caplog):
     client, assessment_id, image_id, _storage, engine, fake = ocr_api
     fake.error = OCRInferenceFailed("Hugging Face OCR Space inference failed: CUDA worker is unavailable")
 
     response = client.post(f"/api/v1/assessments/{assessment_id}/images/{image_id}/ocr")
 
     assert response.status_code == 502
-    assert response.json()["detail"] == str(fake.error)
-    assert "CUDA worker is unavailable" in caplog.text
+    assert response.json()["detail"] == "OCR inference failed. The provider did not complete recognition."
+    assert "CUDA worker is unavailable" not in caplog.text
+    assert "category=inference_failed" in caplog.text
     with Session(engine) as session:
-        assert session.scalar(select(OCRResult)).status == "failed"
+        record = session.scalar(select(OCRResult))
+        assert record.status == "failed"
+        assert record.result_data["diagnostic"]["category"] == "inference_failed"
 
 
 def test_ocr_returns_404_for_missing_assessment_or_unrelated_image(ocr_api):

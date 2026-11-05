@@ -24,7 +24,7 @@ def test_landing_report_assets_and_hero_image_are_served():
     assert "hero-visual" in page.text
     assert 'id="photo-input" type="file"' in page.text
     assert "report-shell" in page.text
-    assert "/dashboard/assets/vehicle-hero.png" in page.text
+    assert "./assets/vehicle-hero.png" in page.text
     assert hero.content.startswith(b"\x89PNG\r\n\x1a\n")
     assert len(hero.content) > 100_000
     assert "prefers-reduced-motion" in styles.text
@@ -406,7 +406,7 @@ def test_dark_mobile_layout_and_accessible_upload_controls():
     page = (FRONTEND / "index.html").read_text(encoding="utf-8")
     styles = (FRONTEND / "styles.css").read_text(encoding="utf-8")
 
-    assert '<a class="header-action" href="/inspect">' in page
+    assert '<a class="header-action" href="#/inspect">' in page
     assert 'aria-label="Main navigation"' in page
     assert 'aria-labelledby="photos-title"' in page
     assert 'aria-describedby="upload-help"' in page

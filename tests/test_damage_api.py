@@ -13,7 +13,7 @@ from sqlalchemy.pool import StaticPool
 from app.damage.inference import DamageDetection, DamageInferenceResult
 from app.damage.worker import MODEL_NAME, DamageWorkerUnavailable
 from app.db.base import Base
-from app.db.models import DamageFinding, EvidenceRecord, UploadedImage, VehicleAssessment
+from app.db.models import DamageFinding, EvidenceRecord, OCRResult, UploadedImage, VehicleAssessment
 from app.db.session import get_db
 from app.main import app
 from app.api.v1.damage import get_damage_provider
@@ -22,6 +22,12 @@ from app.api.v1.damage import get_damage_provider
 def png_bytes() -> bytes:
     output = BytesIO()
     Image.new("RGB", (32, 20), color=(200, 200, 200)).save(output, format="PNG")
+    return output.getvalue()
+
+
+def vehicle_png_bytes() -> bytes:
+    output = BytesIO()
+    Image.new("RGB", (415, 378), color=(200, 200, 200)).save(output, format="PNG")
     return output.getvalue()
 
 
@@ -116,6 +122,65 @@ def damage_api(tmp_path, *, content=None, provider=None) -> Generator[DamageAPIF
     finally:
         app.dependency_overrides.clear()
         engine.dispose()
+
+
+@pytest.mark.parametrize("category", ["vehicle_exterior", "vehicle_interior", "damage_closeup"])
+def test_explicit_eligible_categories_invoke_provider_even_when_ocr_failed(damage_api_fixture, category):
+    api = damage_api_fixture
+    content = vehicle_png_bytes()
+    uploaded = api.client.post(
+        f"/api/v1/assessments/{api.assessment_id}/images",
+        files={"file": ("unnamed.png", content, "image/png")},
+        data={"image_type": category},
+    )
+    assert uploaded.status_code == 201
+    image_id = uploaded.json()["id"]
+    with Session(api.engine) as session:
+        session.add(OCRResult(
+            assessment_id=UUID(api.assessment_id), image_id=UUID(image_id),
+            result_type="image_ocr", status="failed", provider="test-ocr",
+            result_data={"error_code": "inference_failed"},
+        ))
+        session.commit()
+
+    response = api.client.post(
+        f"/api/v1/assessments/{api.assessment_id}/images/{image_id}/damage"
+    )
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["status"] == "completed_with_findings"
+    assert payload["image_type"] == category
+    assert payload["inspection_outcome"] == "completed_with_findings"
+    assert len(api.provider.calls) == 1
+    assert api.provider.calls[0][0] == content
+
+    report = api.client.post(f"/api/v1/assessments/{api.assessment_id}/report")
+    assert report.status_code == 200
+    image_report = next(item for item in report.json()["report_data"]["images"] if item["id"] == image_id)
+    assert image_report["image_type"] == category
+    assert image_report["damage_eligible"] is True
+    assert image_report["classification_source"] == "user_input"
+
+
+@pytest.mark.parametrize(
+    ("category", "outcome"),
+    [("registration_plate", "ineligible"), ("document", "ineligible"), ("unknown", "classification_uncertain")],
+)
+def test_explicit_ineligible_or_unknown_category_never_invokes_provider(damage_api_fixture, category, outcome):
+    api = damage_api_fixture
+    uploaded = api.client.post(
+        f"/api/v1/assessments/{api.assessment_id}/images",
+        files={"file": ("unnamed.png", vehicle_png_bytes(), "image/png")},
+        data={"image_type": category},
+    )
+    assert uploaded.status_code == 201
+    response = api.client.post(
+        f"/api/v1/assessments/{api.assessment_id}/images/{uploaded.json()['id']}/damage"
+    )
+    assert response.status_code == 200
+    assert response.json()["status"] == "unavailable"
+    assert response.json()["inspection_outcome"] == outcome
+    assert api.provider.calls == []
 
 
 @pytest.fixture
@@ -402,10 +467,12 @@ def test_batch_damage_empty_detection_is_success_without_fabricated_findings(
     assert len(api.provider.calls) == 1
     with Session(api.engine) as session:
         marker = session.scalar(select(EvidenceRecord).where(EvidenceRecord.evidence_type == "damage_detection"))
-        assert marker.evidence_data == {
-            "status": "completed_no_findings",
-            "detection_count": 0,
-        }
+        assert marker.evidence_data["status"] == "completed_no_findings"
+        assert marker.evidence_data["detection_count"] == 0
+        assert marker.evidence_data["inspection_outcome"] == "completed_no_findings"
+        assert marker.evidence_data["damage_eligible"] is True
+        assert marker.evidence_data["condition_category"] == "no_visible_damage"
+        assert marker.evidence_data["inference_seconds"] == pytest.approx(0.2)
 
     from app.llm.schemas import LLMReportNarrative
 

@@ -30,6 +30,7 @@ from app.images.classification import (
 )
 from app.db.session import get_db
 from app.images.validation import InvalidImageError, inspect_image
+from app.pricing.condition import assess_condition
 from app.schemas.damage import (
     AssessmentDamageRequest,
     AssessmentDamageResponse,
@@ -73,6 +74,12 @@ def _analysis_response(
     *,
     reused: bool,
     status: DamageInspectionStatus | None = None,
+    image_type: str | None = None,
+    inspection_outcome: str | None = None,
+    condition_category: str | None = None,
+    requires_human_review: bool = False,
+    decision: ImageEligibilityDecision | None = None,
+    inference_seconds: float | None = None,
 ) -> ImageDamageResponse:
     ordered_findings = sorted(
         findings,
@@ -91,6 +98,18 @@ def _analysis_response(
         ),
         reused=reused,
         findings=[_finding_response(finding) for finding in ordered_findings],
+        image_type=image_type,
+        inspection_outcome=inspection_outcome or (
+            "completed_with_findings" if ordered_findings else "completed_no_findings"
+        ),
+        condition_category=condition_category,
+        requires_human_review=requires_human_review,
+        classification_source=decision.classification_source if decision else None,
+        damage_eligible=decision.eligible_for_damage_inference if decision else None,
+        damage_rejection_reason=decision.rejection_reason if decision else None,
+        classification_method=decision.classification_method if decision else None,
+        classification_evidence=decision.signals if decision else None,
+        inference_seconds=inference_seconds,
     )
 
 
@@ -127,8 +146,49 @@ def _existing_eligibility_scan(db: Session, assessment_id: UUID, image_id: UUID)
             EvidenceRecord.assessment_id == assessment_id,
             EvidenceRecord.image_id == image_id,
             EvidenceRecord.evidence_type == "damage_eligibility",
-        )
+        ).order_by(EvidenceRecord.created_at.desc(), EvidenceRecord.id.desc())
     )
+
+
+def _persist_eligibility_decision(
+    db: Session, assessment_id: UUID, image_id: UUID,
+    decision: ImageEligibilityDecision,
+) -> None:
+    """Persist classification evidence in its own transaction boundary."""
+    try:
+        db.rollback()
+        with db.begin():
+            image = db.scalar(select(UploadedImage).where(
+                UploadedImage.id == image_id,
+                UploadedImage.assessment_id == assessment_id,
+            ).with_for_update())
+            if image is None:
+                raise HTTPException(status_code=404, detail="Image not found for assessment.")
+            record = _existing_eligibility_scan(db, assessment_id, image_id)
+            if record is None:
+                record = EvidenceRecord(
+                    assessment_id=assessment_id,
+                    image_id=image_id,
+                    evidence_type="damage_eligibility",
+                    source_reference="image_classification",
+                )
+                db.add(record)
+            state = "eligible" if decision.eligible_for_damage_inference else (
+                "classification_uncertain" if decision.image_type == "unknown" else "ineligible"
+            )
+            record.evidence_data = {
+                **decision.as_metadata(),
+                "status": state,
+                "inspection_outcome": state,
+                "classification_source": decision.classification_source,
+                "damage_eligible": decision.eligible_for_damage_inference,
+                "reason": decision.rejection_reason,
+            }
+    except HTTPException:
+        raise
+    except SQLAlchemyError:
+        db.rollback()
+        raise HTTPException(status_code=500, detail="Unable to save image eligibility.") from None
 
 
 _COMPLETED_DAMAGE_STATUSES = {
@@ -171,6 +231,9 @@ def _record_inspection_outcome(
     reason: str | None = None,
     image_type: str | None = None,
     detection_count: int = 0,
+    decision: ImageEligibilityDecision | None = None,
+    inference_seconds: float | None = None,
+    inspection_outcome: str | None = None,
 ) -> None:
     try:
         db.rollback()
@@ -189,11 +252,36 @@ def _record_inspection_outcome(
             evidence_data = {
                 "status": status,
                 "detection_count": detection_count,
+                "inspection_outcome": inspection_outcome or (
+                    "inference_failed" if status == "failed" else
+                    "completed_no_findings" if status == "completed_no_findings" else
+                    "completed_with_findings" if status == "completed_with_findings" else
+                    "classification_uncertain" if image_type == "unknown" else
+                    "ineligible" if status == "unavailable" else status
+                ),
             }
+            if decision is not None:
+                evidence_data.update({
+                    "image_type": decision.image_type,
+                    "classification_source": decision.classification_source,
+                    "damage_eligible": decision.eligible_for_damage_inference,
+                    "damage_rejection_reason": decision.rejection_reason,
+                    "classification_method": decision.classification_method,
+                })
+            if inference_seconds is not None:
+                evidence_data["inference_seconds"] = inference_seconds
             if reason:
                 evidence_data["reason"] = reason
             if image_type:
                 evidence_data["image_type"] = image_type
+            outcome_condition = assess_condition(
+                [{"damage_eligible": True, "status": status}], []
+            ) if status in _COMPLETED_DAMAGE_STATUSES else {
+                "category": "inspection_failed" if status == "failed" else "inspection_unavailable",
+                "requires_human_review": True,
+            }
+            evidence_data["condition_category"] = outcome_condition["category"]
+            evidence_data["requires_human_review"] = outcome_condition["requires_human_review"]
             if record is None:
                 record = EvidenceRecord(
                     assessment_id=assessment_id,
@@ -215,6 +303,7 @@ def _persist_findings(
     assessment_id: UUID,
     image_id: UUID,
     result: DamageInferenceResult,
+    decision: ImageEligibilityDecision | None = None,
 ) -> ImageDamageResponse:
     try:
         db.rollback()
@@ -273,10 +362,30 @@ def _persist_findings(
                     else "completed_no_findings"
                 ),
                 "detection_count": len(findings),
+                "inspection_outcome": "completed_with_findings" if findings else "completed_no_findings",
+                "damage_types": [finding.damage_type for finding in findings],
+                "inference_seconds": result.inference_seconds,
+                "image_type": decision.image_type if decision else None,
+                "classification_source": decision.classification_source if decision else None,
+                "damage_eligible": decision.eligible_for_damage_inference if decision else None,
             }
+            condition = assess_condition(
+                [{"damage_eligible": True, "status": "completed_with_findings" if findings else "completed_no_findings"}],
+                [{"damage_type": finding.damage_type} for finding in findings],
+            )
+            scan.evidence_data["condition_category"] = condition["category"]
+            scan.evidence_data["requires_human_review"] = condition["requires_human_review"]
             db.flush()
 
-            response = _analysis_response(assessment_id, image_id, findings, reused=False)
+            response = _analysis_response(
+                assessment_id, image_id, findings, reused=False,
+                image_type=decision.image_type if decision else None,
+                inspection_outcome="completed_with_findings" if findings else "completed_no_findings",
+                condition_category=condition["category"],
+                requires_human_review=condition["requires_human_review"],
+                decision=decision,
+                inference_seconds=result.inference_seconds,
+            )
         return response
     except HTTPException:
         raise
@@ -361,16 +470,17 @@ def inspect_assessment_image_damage(
     # ineligible, so YOLO is never called for an unclassified image.
     classification_failed = False
     try:
-        decision = cached_decision(image, content, ocr_results)
+        metadata_decision = (image.image_metadata or {}).get("damage_eligibility")
+        if isinstance(metadata_decision, dict) and metadata_decision.get("classification_source") == "user_input":
+            decision = classify_image(content=content, selected_type=metadata_decision.get("image_type"))
+        else:
+            decision = cached_decision(image, content, ocr_results)
         if decision is None:
             decision = classify_image(
                 content=content,
                 ocr_results=ocr_results,
                 original_filename=image.original_filename,
             )
-            store_classification(image, decision)
-            db.add(image)
-            db.flush()
     except Exception as exc:
         classification_failed = True
         logger.warning("Image classification failed: %s", type(exc).__name__)
@@ -383,12 +493,15 @@ def inspect_assessment_image_damage(
             signals={},
             cache_key=classification_cache_key(content, ocr_results),
         )
-        store_classification(image, decision)
-        try:
-            db.add(image)
-            db.flush()
-        except SQLAlchemyError:
-            db.rollback()
+    store_classification(image, decision)
+    db.add(image)
+    try:
+        # A commit, rather than a flush, is required: later status helpers
+        # intentionally roll back their read transaction.
+        db.commit()
+    except SQLAlchemyError:
+        db.rollback()
+        raise HTTPException(status_code=500, detail="Unable to save image classification.") from None
 
     if classification_failed:
         reason = "Image eligibility classification failed; damage inference was not run."
@@ -396,57 +509,40 @@ def inspect_assessment_image_damage(
             db,
             assessment_id,
             image_id,
-            "failed",
+            "unavailable",
             reason=reason,
             image_type=decision.image_type,
+            decision=decision,
+            inspection_outcome="classification_uncertain",
         )
         return ImageDamageResponse(
             assessment_id=assessment_id,
             image_id=image_id,
             provider="image_classification",
-            status="failed",
+            status="unavailable",
             reused=False,
             findings=[],
             image_type=decision.image_type,
             reason=reason,
+            inspection_outcome="classification_uncertain",
+            condition_category="inspection_unavailable",
+            requires_human_review=True,
+            classification_source=decision.classification_source,
+            damage_eligible=False,
+            damage_rejection_reason=decision.rejection_reason,
+            classification_method=decision.classification_method,
+            classification_evidence=decision.signals,
         )
 
+    existing_eligibility = _existing_eligibility_scan(db, assessment_id, image_id)
+    eligibility_reused = existing_eligibility is not None
+    try:
+        _persist_eligibility_decision(db, assessment_id, image_id, decision)
+    except HTTPException:
+        raise
+
     if not decision.eligible_for_damage_inference:
-        existing_eligibility = _existing_eligibility_scan(db, assessment_id, image_id)
-        reused = existing_eligibility is not None
-        if existing_eligibility is None:
-            try:
-                db.rollback()
-                with db.begin():
-                    locked_image_id = db.scalar(
-                        select(UploadedImage.id).where(
-                            UploadedImage.id == image_id,
-                            UploadedImage.assessment_id == assessment_id,
-                        ).with_for_update()
-                    )
-                    if locked_image_id is None:
-                        raise HTTPException(status_code=404, detail="Image not found for assessment.")
-                    if _existing_eligibility_scan(db, assessment_id, image_id) is None:
-                        db.add(
-                            EvidenceRecord(
-                                assessment_id=assessment_id,
-                                image_id=image_id,
-                                evidence_type="damage_eligibility",
-                                source_reference="image_classification",
-                                evidence_data={
-                                    "status": "unavailable",
-                                    "image_type": decision.image_type,
-                                    "reason": decision.rejection_reason,
-                                    "classified_at": decision.classified_at.isoformat(),
-                                },
-                            )
-                        )
-                db.commit()
-            except HTTPException:
-                raise
-            except SQLAlchemyError:
-                db.rollback()
-                raise HTTPException(status_code=500, detail="Unable to save image eligibility.") from None
+        reused = eligibility_reused
         _record_inspection_outcome(
             db,
             assessment_id,
@@ -454,6 +550,8 @@ def inspect_assessment_image_damage(
             "unavailable",
             reason=decision.rejection_reason,
             image_type=decision.image_type,
+            decision=decision,
+            inspection_outcome="classification_uncertain" if decision.image_type == "unknown" else "ineligible",
         )
         return ImageDamageResponse(
             assessment_id=assessment_id,
@@ -464,6 +562,12 @@ def inspect_assessment_image_damage(
             findings=[],
             image_type=decision.image_type,
             reason=decision.rejection_reason,
+            inspection_outcome="classification_uncertain" if decision.image_type == "unknown" else "ineligible",
+            classification_source=decision.classification_source,
+            damage_eligible=False,
+            damage_rejection_reason=decision.rejection_reason,
+            classification_method=decision.classification_method,
+            classification_evidence=decision.signals,
         )
 
     try:
@@ -471,9 +575,17 @@ def inspect_assessment_image_damage(
         scan = _existing_scan(db, assessment_id, image_id)
         stored_status = _stored_damage_status(scan, existing)
         if stored_status in _COMPLETED_DAMAGE_STATUSES:
+            stored_evidence = scan.evidence_data if scan and isinstance(scan.evidence_data, dict) else {}
+            stored_classification = (image.image_metadata or {}).get("damage_eligibility", {})
             db.rollback()
             return _analysis_response(
-                assessment_id, image_id, existing, reused=True, status=stored_status
+                assessment_id, image_id, existing, reused=True, status=stored_status,
+                image_type=stored_evidence.get("image_type") or stored_classification.get("image_type"),
+                inspection_outcome=stored_evidence.get("inspection_outcome"),
+                condition_category=stored_evidence.get("condition_category"),
+                requires_human_review=bool(stored_evidence.get("requires_human_review")),
+                decision=decision,
+                inference_seconds=stored_evidence.get("inference_seconds"),
             )
         db.rollback()
     except SQLAlchemyError:
@@ -489,10 +601,10 @@ def inspect_assessment_image_damage(
         status_value = "unavailable"
         reason = "Damage inference is unavailable."
     except DamageWorkerTimeout:
-        status_value = "unavailable"
+        status_value = "failed"
         reason = "Damage inference timed out."
     except DamageWorkerInvalidResponse:
-        status_value = "unavailable"
+        status_value = "failed"
         reason = "Damage inference returned an invalid response."
     except DamageWorkerInferenceFailed as exc:
         logger.warning("Damage inference worker failed: %s", type(exc).__name__)
@@ -503,10 +615,12 @@ def inspect_assessment_image_damage(
         status_value = "failed"
         reason = "Damage inference failed."
     else:
-        return _persist_findings(db, assessment_id, image_id, result)
+        return _persist_findings(db, assessment_id, image_id, result, decision)
 
     _record_inspection_outcome(
-        db, assessment_id, image_id, status_value, reason=reason
+        db, assessment_id, image_id, status_value, reason=reason,
+        decision=decision,
+        inspection_outcome="inference_failed" if status_value == "failed" else "inference_unavailable",
     )
     return ImageDamageResponse(
         assessment_id=assessment_id,
@@ -516,6 +630,15 @@ def inspect_assessment_image_damage(
         reused=False,
         findings=[],
         reason=reason,
+        image_type=decision.image_type,
+        inspection_outcome="inference_failed" if status_value == "failed" else "inference_unavailable",
+        condition_category="inspection_failed" if status_value == "failed" else "inspection_unavailable",
+        requires_human_review=True,
+        classification_source=decision.classification_source,
+        damage_eligible=True,
+        damage_rejection_reason=decision.rejection_reason,
+        classification_method=decision.classification_method,
+        classification_evidence=decision.signals,
     )
 
 
@@ -555,6 +678,15 @@ def inspect_assessment_damage(
                     error=item.reason,
                     image_type=item.image_type,
                     reason=item.reason,
+                    inspection_outcome=item.inspection_outcome,
+                    condition_category=item.condition_category,
+                    requires_human_review=item.requires_human_review,
+                    classification_source=item.classification_source,
+                    damage_eligible=item.damage_eligible,
+                    damage_rejection_reason=item.damage_rejection_reason,
+                    classification_method=item.classification_method,
+                    classification_evidence=item.classification_evidence,
+                    inference_seconds=item.inference_seconds,
                 )
             )
         except HTTPException as exc:

@@ -9,7 +9,11 @@ from typing import Any, Iterable
 
 from PIL import Image, UnidentifiedImageError
 
-CLASSIFIER_VERSION = "1"
+CLASSIFIER_VERSION = "2"
+IMAGE_TYPES = {
+    "registration_plate", "vehicle_exterior", "vehicle_interior",
+    "damage_closeup", "document", "unknown",
+}
 
 
 @dataclass(frozen=True)
@@ -21,11 +25,13 @@ class ImageEligibilityDecision:
     classified_at: datetime
     signals: dict[str, Any]
     cache_key: str
+    classification_source: str = "automatic"
 
     def as_metadata(self) -> dict[str, Any]:
         return {
             "image_type": self.image_type,
             "classification_method": self.classification_method,
+            "classification_source": self.classification_source,
             "damage_eligible": self.eligible_for_damage_inference,
             "damage_rejection_reason": self.rejection_reason,
             "classified_at": self.classified_at.isoformat(),
@@ -119,11 +125,15 @@ def classify_image(
     content: bytes,
     ocr_results: Iterable[Any] | None = None,
     original_filename: str | None = None,
+    selected_type: str | None = None,
 ) -> ImageEligibilityDecision:
     classified_at = datetime.now(timezone.utc)
     content_hash = _content_sha256(content)
     ocr_signature = _ocr_result_signature(ocr_results)
     cache_key = hashlib.sha256(f"{content_hash}|{ocr_signature}|{CLASSIFIER_VERSION}".encode("utf-8")).hexdigest()
+
+    if selected_type is not None and selected_type not in IMAGE_TYPES:
+        raise ValueError("Unsupported image category")
 
     try:
         width, height = _image_dimensions(content)
@@ -136,6 +146,22 @@ def classify_image(
             classified_at=classified_at,
             signals={"error": str(exc)},
             cache_key=cache_key,
+        )
+
+    if selected_type is not None:
+        eligible = selected_type in {"vehicle_exterior", "vehicle_interior", "damage_closeup"}
+        return ImageEligibilityDecision(
+            image_type=selected_type,
+            classification_method="explicit_user_selection",
+            eligible_for_damage_inference=eligible,
+            rejection_reason=None if eligible else (
+                "image_category_not_eligible_for_damage_inference"
+                if selected_type != "unknown" else "classification_uncertain"
+            ),
+            classified_at=classified_at,
+            signals={"width": width, "height": height, "category_selected_by_user": True},
+            cache_key=cache_key,
+            classification_source="user_input",
         )
 
     aspect_ratio = width / height if height else 0.0
@@ -224,6 +250,7 @@ def classify_image(
         classified_at=classified_at,
         signals=signals,
         cache_key=cache_key,
+        classification_source="automatic",
     )
 def classification_cache_key(content: bytes, ocr_results: Iterable[Any] | None = None) -> str:
     content_hash = _content_sha256(content)
@@ -253,6 +280,7 @@ def cached_decision(image: Any, content: bytes, ocr_results: Iterable[Any] | Non
         classified_at=classified_at,
         signals=dict(cached.get("signals") or {}),
         cache_key=expected_key,
+        classification_source=str(cached.get("classification_source") or "automatic"),
     )
 
 

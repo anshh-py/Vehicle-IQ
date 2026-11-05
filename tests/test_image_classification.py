@@ -1,6 +1,7 @@
 from io import BytesIO
 
 from PIL import Image
+import pytest
 
 from app.images.classification import (
     cached_decision,
@@ -73,3 +74,27 @@ def test_stale_cache_invalidated():
 
     changed = png_bytes(size=(101, 101))
     assert cached_decision(image, changed, None) is None
+
+
+@pytest.mark.parametrize("category", ["vehicle_exterior", "vehicle_interior", "damage_closeup"])
+def test_explicit_eligible_category_does_not_depend_on_filename_or_ocr(category):
+    decision = classify_image(content=png_bytes(size=(415, 378)), selected_type=category)
+    assert decision.image_type == category
+    assert decision.classification_source == "user_input"
+    assert decision.eligible_for_damage_inference is True
+    assert decision.rejection_reason is None
+
+
+@pytest.mark.parametrize("category", ["registration_plate", "document"])
+def test_explicit_ineligible_categories_are_excluded(category):
+    decision = classify_image(content=png_bytes(), selected_type=category)
+    assert decision.image_type == category
+    assert decision.eligible_for_damage_inference is False
+    assert decision.classification_source == "user_input"
+
+
+def test_explicit_unknown_remains_classification_uncertain():
+    decision = classify_image(content=png_bytes(), selected_type="unknown")
+    assert decision.image_type == "unknown"
+    assert decision.eligible_for_damage_inference is False
+    assert decision.rejection_reason == "classification_uncertain"

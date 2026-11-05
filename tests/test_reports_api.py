@@ -13,6 +13,7 @@ from app.db.base import Base
 from app.db.models import (
     AssessmentReport,
     DamageFinding,
+    EvidenceRecord,
     OCRResult,
     PriceEstimate,
     UploadedImage,
@@ -77,6 +78,13 @@ def _add_pipeline_results(engine, assessment_id: str) -> None:
             content_type="image/png",
             byte_size=123,
             sha256="test-digest",
+            image_metadata={"damage_eligibility": {
+                "image_type": "vehicle_exterior",
+                "classification_source": "user_input",
+                "classification_method": "explicit_user_selection",
+                "damage_eligible": True,
+                "damage_rejection_reason": None,
+            }},
         )
         session.add(image)
         session.flush()
@@ -98,6 +106,23 @@ def _add_pipeline_results(engine, assessment_id: str) -> None:
                     confidence=0.91,
                     bounding_box={"x1": 1, "y1": 2, "x2": 5, "y2": 6},
                     model_name="test-damage-model",
+                ),
+                EvidenceRecord(
+                    assessment_id=assessment_uuid,
+                    image_id=image.id,
+                    evidence_type="damage_eligibility",
+                    source_reference="image_classification",
+                    evidence_data={
+                        "status": "eligible", "image_type": "vehicle_exterior",
+                        "classification_source": "user_input", "damage_eligible": True,
+                    },
+                ),
+                EvidenceRecord(
+                    assessment_id=assessment_uuid,
+                    image_id=image.id,
+                    evidence_type="damage_detection",
+                    source_reference="YOLO11m-Car-Damage-Detector",
+                    evidence_data={"status": "completed_no_findings", "detection_count": 0},
                 ),
                 PriceEstimate(
                     assessment_id=assessment_uuid,
@@ -122,6 +147,19 @@ def _add_pipeline_results(engine, assessment_id: str) -> None:
                 ),
             ]
         )
+        session.commit()
+
+
+def _mark_completed_empty_damage(engine, assessment_id: str) -> None:
+    with Session(engine) as session:
+        session.query(DamageFinding).filter_by(assessment_id=UUID(assessment_id)).delete()
+        session.query(EvidenceRecord).filter_by(
+            assessment_id=UUID(assessment_id), evidence_type="damage_detection"
+        ).update({"evidence_data": {
+            "status": "completed_no_findings", "detection_count": 0,
+            "inspection_outcome": "completed_no_findings", "damage_eligible": True,
+            "image_type": "vehicle_exterior",
+        }})
         session.commit()
 
 
@@ -156,7 +194,8 @@ def test_generate_report_gathers_and_persists_available_results(report_api):
     assert registration_ocr["raw_evidence"][0]["confidence"] == pytest.approx(0.99)
     assert body["report_data"]["damage_findings"][0]["damage_type"] == "dent"
     assert body["report_data"]["stages"]["damage_detection"]["image_results"][0]["status"] == "completed_with_findings"
-    assert body["report_data"]["price_estimates"][0]["amount"] == "625000.00"
+    assert body["report_data"]["price_estimates"][0]["amount"] is None
+    assert body["report_data"]["pricing_decision"]["audit"]["base_ml_estimate_inr"] == "625000.00"
     assert body["report_data"]["price_estimates"][0]["vehicle"] == {
         "make": "Example Motors",
         "odometer_km": 42000,
@@ -233,10 +272,14 @@ def test_buyer_recommendation_damage_takes_priority_and_refresh_persists(report_
 
     recommendation = first.json()["report_data"]["buyer_recommendation"]
     assert recommendation["status"] == "further_inspection"
-    assert recommendation["absolute_difference_inr"] == "0.00"
-    assert "no repair cost" in recommendation["explanation"]
+    assert recommendation["absolute_difference_inr"] is None
+    assert recommendation["ml_estimate_inr"] is None
+    assert recommendation["price_comparison"] == "unavailable"
+    assert first.json()["report_data"]["pricing_decision"]["audit"]["base_ml_estimate_inr"] == "625000.00"
+    assert "professional inspection" in recommendation["explanation"]
     assert refreshed.json()["report_data"]["buyer_recommendation"] == recommendation
     assert retrieved.json()["report_data"]["buyer_recommendation"] == recommendation
+    assert refreshed.json()["report_data"]["pricing_decision"] == first.json()["report_data"]["pricing_decision"]
 
 
 def test_buyer_recommendation_handles_missing_asking_with_prediction(report_api):
@@ -275,6 +318,84 @@ def test_buyer_recommendation_handles_missing_ml_prediction_and_configurable_thr
     recommendation = within_configured_tolerance.json()["report_data"]["buyer_recommendation"]
     assert recommendation["status"] == "reasonably_priced"
     assert recommendation["comparison_tolerance_percent"] == 15
+
+
+def test_complete_empty_damage_scan_permits_base_estimate_and_refresh_is_stable(report_api):
+    client, engine, assessment_id = report_api
+    _add_pipeline_results(engine, assessment_id)
+    with Session(engine) as session:
+        session.query(DamageFinding).filter_by(assessment_id=UUID(assessment_id)).delete()
+        session.query(EvidenceRecord).filter_by(
+            assessment_id=UUID(assessment_id), evidence_type="damage_detection"
+        ).update({"evidence_data": {"status": "completed_no_findings", "detection_count": 0, "inspection_outcome": "completed_no_findings"}})
+        assessment = session.get(VehicleAssessment, UUID(assessment_id))
+        assessment.asking_price_inr = Decimal("625000")
+        session.commit()
+
+    path = f"/api/v1/assessments/{assessment_id}/report"
+    first = client.post(path).json()["report_data"]
+    second = client.post(path).json()["report_data"]
+    assert first["condition_assessment"]["category"] == "no_visible_damage"
+    assert first["pricing_decision"]["status"] == "available"
+    assert first["pricing_decision"]["customer_facing_estimate_inr"] == "625000.00"
+    assert first["buyer_recommendation"]["ml_estimate_inr"] == "625000.00"
+    assert second["pricing_decision"] == first["pricing_decision"]
+    assert first["price_estimates"][-1]["customer_facing"] is True
+
+
+def test_severe_condition_suppresses_customer_estimate_but_preserves_labeled_audit_value(report_api):
+    client, engine, assessment_id = report_api
+    _add_pipeline_results(engine, assessment_id)
+    with Session(engine) as session:
+        session.query(DamageFinding).filter_by(assessment_id=UUID(assessment_id)).delete()
+        image = session.scalar(select(UploadedImage).where(UploadedImage.assessment_id == UUID(assessment_id)))
+        session.add(DamageFinding(
+            assessment_id=UUID(assessment_id), image_id=image.id, damage_type="major_collision",
+            confidence=0.8, bounding_box={"x1": 1, "y1": 1, "x2": 5, "y2": 5},
+        ))
+        scan = session.scalar(select(EvidenceRecord).where(
+            EvidenceRecord.assessment_id == UUID(assessment_id),
+            EvidenceRecord.evidence_type == "damage_detection",
+        ))
+        scan.evidence_data = {"status": "completed_with_findings", "detection_count": 1, "damage_types": ["major_collision"]}
+        assessment = session.get(VehicleAssessment, UUID(assessment_id))
+        assessment.asking_price_inr = Decimal("650000")
+        session.commit()
+
+    body = client.post(f"/api/v1/assessments/{assessment_id}/report").json()["report_data"]
+    decision = body["pricing_decision"]
+    assert decision["status"] == "withheld_severe_damage"
+    assert decision["customer_facing_estimate_inr"] is None
+    assert decision["audit"]["base_ml_estimate_inr"] == "625000.00"
+    recommendation = body["buyer_recommendation"]
+    assert recommendation["status"] == "further_inspection"
+    assert recommendation["ml_estimate_inr"] is None
+    assert recommendation["absolute_difference_inr"] is None
+    assert body["price_estimates"][-1]["valuation_role"] == "audit_only_base_ml_estimate"
+
+
+def test_llm_cannot_override_withheld_pricing_decision(report_api, monkeypatch):
+    from app.llm.schemas import LLMReportNarrative
+
+    client, engine, assessment_id = report_api
+    _add_pipeline_results(engine, assessment_id)
+    with Session(engine) as session:
+        assessment = session.get(VehicleAssessment, UUID(assessment_id))
+        assessment.asking_price_inr = Decimal("650000")
+        session.commit()
+    monkeypatch.setattr(
+        "app.api.v1.reports.generate_llm_narrative",
+        lambda _data: LLMReportNarrative(
+            vehicle_overview="Car.", overall_condition_summary="Looks fine.",
+            detected_damage_explanation="No finding.", potential_inspection_risks="None.",
+            buyer_recommendations="Negotiate against 625000.", price_estimate_explanation="Show 625000.",
+            missing_information_and_limitations="None.",
+        ),
+    )
+    body = client.post(f"/api/v1/assessments/{assessment_id}/report").json()["report_data"]
+    assert body["pricing_decision"]["pricing_eligible"] is False
+    assert "625000" not in body["llm_narrative"]["buyer_recommendations"]
+    assert body["llm_narrative"]["price_estimate_explanation"] == body["pricing_decision"]["withholding_message"]
 
 
 def test_buyer_recommendation_rejects_invalid_ml_estimate_safely():
@@ -338,6 +459,17 @@ def test_incomplete_results_are_reported_as_pending_or_unavailable(report_api):
             "unavailable_count": 0,
             "failed_count": 0,
             "image_results": [],
+            "condition_assessment": {
+                "category": "inspection_unavailable",
+                "inspection_status": "unavailable",
+                "finding_count": 0,
+                "requires_human_review": True,
+                "severity_basis": "inspection_evidence_status",
+                "limitations": [
+                    "Photographs cannot establish structural, airbag, chassis, or mechanical condition.",
+                    "Model detections are visual evidence and require human verification.",
+                ],
+            },
         },
         "pricing": {"status": "pending", "estimate_count": 0, "input_provenance": {}},
     }
@@ -505,6 +637,7 @@ def test_report_market_search_uses_persisted_vehicle_lookup_when_snapshot_fields
 def test_report_integrates_market_evidence_separately_from_asking_and_ml(report_api):
     client, engine, assessment_id = report_api
     _add_pipeline_results(engine, assessment_id)
+    _mark_completed_empty_damage(engine, assessment_id)
     with Session(engine) as session:
         assessment = session.get(VehicleAssessment, UUID(assessment_id))
         assessment.asking_price_inr = Decimal("900000.00")
@@ -554,6 +687,7 @@ def test_market_provider_without_valid_listings_returns_unavailable(
 ):
     client, engine, assessment_id = report_api
     _add_pipeline_results(engine, assessment_id)
+    _mark_completed_empty_damage(engine, assessment_id)
 
     class EmptyMarketProvider:
         def fetch_listings(self, _criteria):

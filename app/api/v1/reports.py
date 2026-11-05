@@ -25,6 +25,7 @@ from app.db.models import (
 )
 from app.db.session import get_db
 from app.ocr.registration import build_registration_ocr_assessment
+from app.ocr.sanitization import sanitize_ocr_text
 from app.pricing.market import (
     MIN_COMPARABLE_COUNT,
     MarketListingProvider,
@@ -38,6 +39,7 @@ from app.llm.report import (
     generate_llm_narrative,
     report_data_hash,
 )
+from app.pricing.condition import assess_condition, pricing_decision
 from app.schemas.reports import AssessmentReportResponse
 
 
@@ -762,6 +764,8 @@ def _build_report_data(
         status_value = data.get("status")
         if finding_count:
             outcome = "completed_with_findings"
+        elif status_value == "completed_with_findings" and data.get("detection_count", 0) > 0:
+            outcome = "completed_with_findings"
         elif (
             status_value == "completed_no_findings"
             and data.get("detection_count", 0) == 0
@@ -781,10 +785,44 @@ def _build_report_data(
                     outcome = "failed"
                 if isinstance(eligibility.evidence_data.get("reason"), str):
                     data = eligibility.evidence_data
-        reason = data.get("reason") if isinstance(data.get("reason"), str) else None
-        return {"image_id": str(image.id), "status": outcome, "reason": reason}
+        eligibility = latest_eligibility_scans.get(image.id)
+        eligibility_data = eligibility.evidence_data if eligibility and isinstance(eligibility.evidence_data, dict) else {}
+        metadata = (image.image_metadata or {}).get("damage_eligibility")
+        metadata = metadata if isinstance(metadata, dict) else {}
+        classification = {**eligibility_data, **metadata}
+        reason = data.get("reason") if isinstance(data.get("reason"), str) else classification.get("reason")
+        inspection_outcome = data.get("inspection_outcome") or (
+            "completed_with_findings" if outcome == "completed_with_findings" else
+            "completed_no_findings" if outcome == "completed_no_findings" else
+            "inference_failed" if outcome == "failed" else
+            "classification_uncertain" if classification.get("image_type") == "unknown" else
+            "ineligible" if classification.get("damage_eligible") is False else
+            "inspection_unavailable"
+        )
+        return {
+            "image_id": str(image.id),
+            "status": outcome,
+            "inspection_outcome": inspection_outcome,
+            "reason": reason,
+            "image_type": classification.get("image_type"),
+            "classification_source": classification.get("classification_source"),
+            "damage_eligible": classification.get("damage_eligible"),
+            "damage_rejection_reason": classification.get("damage_rejection_reason") or classification.get("reason"),
+            "classification_method": classification.get("classification_method"),
+            "classification_signals": classification.get("signals"),
+            "condition_category": data.get("condition_category"),
+            "requires_human_review": data.get("requires_human_review", False),
+            "detection_count": data.get("detection_count", finding_count),
+            "damage_types": data.get("damage_types", []),
+            "inference_seconds": data.get("inference_seconds"),
+        }
 
     damage_image_results = [damage_outcome(image) for image in images]
+    finding_evidence = [
+        {"damage_type": finding.damage_type, "confidence": finding.confidence, "bounding_box": finding.bounding_box}
+        for finding in damage_findings
+    ]
+    condition_assessment = assess_condition(damage_image_results, finding_evidence)
     damage_statuses = [item["status"] for item in damage_image_results]
     if damage_findings or "completed_with_findings" in damage_statuses:
         damage_status = "completed_with_findings"
@@ -807,13 +845,15 @@ def _build_report_data(
         selected_ocr_results,
         key=lambda item: (item.created_at or datetime.min.replace(tzinfo=timezone.utc), str(item.id)),
     ):
+        ocr_data = result.result_data if isinstance(result.result_data, dict) else {}
         report_ocr_results.append({
             "id": str(result.id),
             "image_id": str(result.image_id) if result.image_id else None,
             "result_type": result.result_type,
             "status": result.status,
             "provider": result.provider,
-            "text": result.raw_text,
+            "text": ocr_data.get("display_text") or sanitize_ocr_text(result.raw_text),
+            "raw_provider_evidence": result.raw_text,
             "confidence": _ocr_confidence(result),
             "created_at": _iso(result.created_at),
         })
@@ -899,6 +939,22 @@ def _build_report_data(
             "created_at": _iso(estimate.created_at),
         })
 
+    latest_estimate = price_estimates[-1] if price_estimates else None
+    deterministic_pricing = pricing_decision(
+        latest_estimate.amount if latest_estimate is not None else None,
+        latest_estimate.model_name if latest_estimate is not None else None,
+        condition_assessment,
+    )
+    for item in report_price_estimates:
+        item["valuation_role"] = "customer_facing_base_estimate" if deterministic_pricing["pricing_eligible"] else "audit_only_base_ml_estimate"
+        item["customer_facing"] = bool(deterministic_pricing["pricing_eligible"])
+        if not deterministic_pricing["pricing_eligible"]:
+            # Preserve the historical collection shape but do not return the
+            # suppressed amount in its ordinary estimate fields. The value is
+            # retained only in pricing_decision.audit with an explicit label.
+            item["amount"] = None
+            item["lower_bound"] = None
+            item["upper_bound"] = None
     report_data = {
         "assessment": {
             "id": str(assessment.id),
@@ -926,11 +982,18 @@ def _build_report_data(
                 "content_type": image.content_type,
                 "byte_size": image.byte_size,
                 "uploaded_at": _iso(image.uploaded_at),
-                "image_type": (image.image_metadata or {}).get("damage_eligibility", {}).get("image_type"),
-                "damage_eligible": (image.image_metadata or {}).get("damage_eligibility", {}).get("damage_eligible"),
-                "damage_rejection_reason": (image.image_metadata or {}).get("damage_eligibility", {}).get("damage_rejection_reason"),
+                "image_type": damage_image_results[index].get("image_type"),
+                "classification_source": damage_image_results[index].get("classification_source"),
+                "damage_eligible": damage_image_results[index].get("damage_eligible"),
+                "damage_rejection_reason": damage_image_results[index].get("damage_rejection_reason"),
+                "classification_method": damage_image_results[index].get("classification_method"),
+                "classification_signals": damage_image_results[index].get("classification_signals"),
+                "damage_inspection_status": damage_image_results[index].get("status"),
+                "inspection_outcome": damage_image_results[index].get("inspection_outcome"),
+                "condition_category": damage_image_results[index].get("condition_category"),
+                "requires_human_review": damage_image_results[index].get("requires_human_review"),
             }
-            for image in images
+            for index, image in enumerate(images)
         ],
         "stages": {
             "ocr": {
@@ -972,6 +1035,7 @@ def _build_report_data(
                     item["status"] == "failed" for item in damage_image_results
                 ),
                 "image_results": damage_image_results,
+                "condition_assessment": condition_assessment,
             },
             "pricing": report_pricing,
         },
@@ -1036,15 +1100,27 @@ def _build_report_data(
             for finding in damage_findings
         ],
         "price_estimates": report_price_estimates,
+        "condition_assessment": condition_assessment,
+        "pricing_decision": deterministic_pricing,
         "market_valuation": market_valuation,
         "limitations": [_DAMAGE_COMPLETION_LIMITATION],
     }
+    if not deterministic_pricing["pricing_eligible"]:
+        report_data["market_valuation"]["ml_prediction"] = {
+            "status": "withheld_by_condition_policy",
+            "amount_inr": None,
+        }
+        report_data["market_valuation"]["discrepancy"] = {
+            "status": "unavailable_due_to_condition_policy",
+            "combined_estimate": None,
+        }
     report_data["buyer_recommendation"] = _buyer_recommendation(
         assessment.asking_price_inr,
         price_estimates[-1] if price_estimates else None,
         damage_findings,
         ocr_status,
         market_valuation,
+        report_data.get("pricing_decision"),
     )
     return report_data
 
@@ -1055,6 +1131,7 @@ def _buyer_recommendation(
     damage_findings: list[DamageFinding],
     ocr_status: str,
     market_valuation: dict[str, Any],
+    pricing_decision_data: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build deterministic buyer guidance; ML is a comparison reference, not market value."""
     from decimal import Decimal, InvalidOperation
@@ -1070,7 +1147,13 @@ def _buyer_recommendation(
     # Use the stored estimate; if the estimate is missing or invalid, report
     # ml_estimate_inr as None rather than fabricating a prediction. The frontend
     # must never show a fallback or stale prediction as a genuine ML result.
-    predicted = positive_decimal(estimate.amount) if estimate is not None else None
+    if pricing_decision_data is not None:
+        predicted = positive_decimal(pricing_decision_data.get("customer_facing_estimate_inr"))
+    else:
+        # Backward-compatible direct helper callers without an inspection
+        # decision retain the legacy comparison behavior. Report generation
+        # always supplies the deterministic decision below.
+        predicted = positive_decimal(estimate.amount) if estimate is not None else None
     if predicted is None and estimate is not None and estimate.amount is not None:
         # Estimate exists but amount could not be parsed as a positive decimal;
         # treat as unavailable rather than showing a possibly stale value.
@@ -1085,7 +1168,17 @@ def _buyer_recommendation(
         >= market_valuation.get("minimum_evidence_count", MIN_COMPARABLE_COUNT)
     )
 
-    if damage_findings:
+    policy_withheld = pricing_decision_data is not None and not pricing_decision_data.get("pricing_eligible")
+    if policy_withheld:
+        if damage_findings or pricing_decision_data.get("condition_category") == "severe_damage":
+            recommendation = "further_inspection"
+            explanation = pricing_decision_data.get("withholding_message") or "Obtain a professional inspection and repair assessment before relying on a resale estimate."
+            next_steps = ["Obtain an in-person inspection and repair assessment before negotiating on price."]
+        else:
+            recommendation = "insufficient_evidence"
+            explanation = pricing_decision_data.get("withholding_message") or "A reliable condition-adjusted resale estimate is unavailable from the current inspection evidence."
+            next_steps = ["Complete a valid condition inspection and obtain repair-cost evidence where findings are present."]
+    elif damage_findings:
         recommendation = "further_inspection"
         explanation = (
             f"{len(damage_findings)} stored damage finding(s) are present. Have the vehicle "
@@ -1136,7 +1229,7 @@ def _buyer_recommendation(
 
     return {
         "status": recommendation,
-        "comparison_basis": "ml_estimate_only",
+        "comparison_basis": "none_due_to_valuation_policy" if policy_withheld else "ml_estimate_only",
         "comparison_tolerance_percent": int(tolerance),
         "asking_price_inr": format(asking, "f") if asking is not None else None,
         "asking_price_provenance": "user_input" if asking is not None else None,
@@ -1189,6 +1282,26 @@ def _normalize_legacy_damage_report(report_data: dict[str, Any]) -> dict[str, An
         )
         narrative["overall_condition_summary"] = damage_condition_summary(status_value)
     return normalized
+
+
+def _enforce_pricing_decision_in_narrative(report_data: dict[str, Any]) -> None:
+    """LLM text may explain, but cannot reverse the deterministic price gate."""
+    decision = report_data.get("pricing_decision")
+    narrative = report_data.get("llm_narrative")
+    if not isinstance(decision, dict) or decision.get("pricing_eligible") or not isinstance(narrative, dict):
+        return
+    message = decision.get("withholding_message") or "A customer-facing resale estimate is unavailable under the condition policy."
+    narrative["price_estimate_explanation"] = message
+    narrative["buyer_recommendations"] = message + " " + " ".join(
+        str(step) for step in _buyer_recommendation_next_steps(decision)
+    )
+
+
+def _buyer_recommendation_next_steps(decision: dict[str, Any]) -> list[str]:
+    category = decision.get("condition_category")
+    if category in {"severe_damage", "minor_cosmetic", "moderate_damage"}:
+        return ["Obtain a professional inspection and repair assessment before negotiating on price."]
+    return ["Complete a valid condition inspection before relying on a resale valuation."]
 
 
 def _load_stage_records(db: Session, assessment_id: UUID):
@@ -1329,6 +1442,7 @@ def _generate_assessment_report_snapshot(
                 narrative = generate_llm_narrative(report_data)
                 if narrative is not None:
                     report_data["llm_narrative"] = narrative.model_dump()
+            _enforce_pricing_decision_in_narrative(report_data)
             report_data["llm_narrative_input_hash"] = current_hash
             report_data = _normalize_legacy_damage_report(report_data)
             if report is None:

@@ -219,3 +219,34 @@ def test_legacy_metadata_without_database_bytes_is_not_treated_as_migrated(uploa
     response = client.get(f"/api/v1/assessments/{assessment_id}/images/{image_id}/content")
     assert response.status_code == 404
     assert response.json() == {"detail": "Image content not found."}
+
+
+def test_upload_persists_explicit_image_category(upload_api):
+    client, assessment_id, engine = upload_api
+    response = client.post(
+        f"/api/v1/assessments/{assessment_id}/images",
+        files={"file": ("front.png", image_bytes("PNG"), "image/png")},
+        data={"image_type": "vehicle_exterior"},
+    )
+    assert response.status_code == 201
+    assert response.json()["image_type"] == "vehicle_exterior"
+    assert response.json()["classification_source"] == "user_input"
+    assert response.json()["damage_eligible"] is True
+    with Session(engine) as session:
+        image = session.scalar(select(UploadedImage))
+        decision = image.image_metadata["damage_eligibility"]
+        assert decision["image_type"] == "vehicle_exterior"
+        assert decision["classification_source"] == "user_input"
+        assert decision["damage_eligible"] is True
+
+
+def test_upload_rejects_unrecognized_explicit_image_category(upload_api):
+    client, assessment_id, engine = upload_api
+    response = client.post(
+        f"/api/v1/assessments/{assessment_id}/images",
+        files={"file": ("front.png", image_bytes("PNG"), "image/png")},
+        data={"image_type": "truck"},
+    )
+    assert response.status_code == 422
+    with Session(engine) as session:
+        assert session.scalar(select(UploadedImage)) is None

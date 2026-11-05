@@ -467,10 +467,52 @@ def run_assessment_workflow(
             # Return the stored workflow response; pricing is the final stage and
             # its result is already persisted. The frontend can reuse the report
             # without re-running the entire workflow.
+            # Reconstruct all stages including vehicle_details_lookup and report
+            # from the stored report data.
+            reconstructed_stages = dict(stored_stages)
+            # Add vehicle_details_lookup from report_data
+            vehicle_lookup = existing_report.report_data.get("vehicle_details_lookup")
+            if vehicle_lookup is not None:
+                reconstructed_stages["vehicle_details_lookup"] = vehicle_lookup
+            # Add report stage from the stored report
+            reconstructed_stages["report"] = {
+                "status": "available",
+                "result": {
+                    "id": str(existing_report.id),
+                    "assessment_id": str(existing_report.assessment_id),
+                    "status": existing_report.status,
+                    "summary": existing_report.summary,
+                    "report_data": existing_report.report_data,
+                    "generated_at": existing_report.generated_at.isoformat() if existing_report.generated_at else None,
+                    "created_at": existing_report.created_at.isoformat() if existing_report.created_at else None,
+                },
+            }
+            # Compute workflow status from all stages
+            relevant_stages = {
+                key: value for key, value in reconstructed_stages.items()
+                if key != "vehicle_details_lookup" or settings.vehicle_lookup_enabled
+            }
+            successful_stages = sum(
+                (value.get("status") if isinstance(value, dict) else "")
+                in {
+                    "available",
+                    "completed_with_findings",
+                    "completed_no_findings",
+                }
+                for value in relevant_stages.values()
+            )
+            has_partial_or_failed = any(
+                (value.get("status") if isinstance(value, dict) else "")
+                in {"partial", "unavailable", "failed"}
+                for value in relevant_stages.values()
+            )
+            overall_status = (
+                "failed" if successful_stages == 0 else "partial" if has_partial_or_failed else "completed"
+            )
             return AssessmentWorkflowResponse(
                 assessment_id=assessment_id,
-                status=existing_report.status,
-                stages=stored_stages,
+                status=overall_status,
+                stages=reconstructed_stages,
             )
     try:
         if _persist_manual_pricing_specifications(assessment, payload.vehicle):
@@ -643,6 +685,30 @@ def run_assessment_workflow(
             pricing_workflow_state=pricing_state,
             vehicle_lookup_workflow_state=lookup_state,
         )
+        decision = (report_response.report_data or {}).get("pricing_decision", {})
+        if (
+            stages.get("pricing") is not None
+            and stages["pricing"].status == "available"
+            and isinstance(decision, dict)
+            and decision.get("pricing_eligible") is not True
+        ):
+            # The model prediction remains recorded in the report's explicitly
+            # audit-only section. Do not expose it as the workflow's resale
+            # estimate when the deterministic condition policy withholds it.
+            pricing_result = dict(stages["pricing"].result or {})
+            pricing_result.update({
+                "amount": None,
+                "lower_bound": None,
+                "upper_bound": None,
+                "valuation_status": decision.get("status"),
+                "withholding_reason": decision.get("withholding_reason"),
+                "withholding_message": decision.get("withholding_message"),
+                "customer_facing_estimate_inr": None,
+            })
+            stages["pricing"] = WorkflowStageResult(
+                status="available",
+                result=pricing_result,
+            )
         stages["report"] = WorkflowStageResult(
             status="available",
             result=report_response.model_dump(mode="json"),

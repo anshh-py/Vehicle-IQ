@@ -4,7 +4,7 @@ import hashlib
 from typing import Annotated
 from uuid import UUID, uuid4
 
-from fastapi import APIRouter, Depends, File, HTTPException, Response, UploadFile, status
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Response, UploadFile, status
 from sqlalchemy import select
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
@@ -13,6 +13,7 @@ from app.core.config import settings
 from app.db.models import UploadedImage, VehicleAssessment
 from app.db.session import get_db
 from app.images.validation import InvalidImageError, inspect_image
+from app.images.classification import IMAGE_TYPES, classify_image, store_classification
 from app.schemas.images import UploadedImageResponse
 from app.storage.images import ImageContentUnavailable, read_image_content
 
@@ -33,10 +34,24 @@ def _safe_original_filename(filename: str | None, extension: str) -> str:
     return (safe_name or f"upload.{extension}")[:255]
 
 
+def _image_response(image: UploadedImage) -> UploadedImageResponse:
+    response = UploadedImageResponse.model_validate(image)
+    decision = (image.image_metadata or {}).get("damage_eligibility")
+    if isinstance(decision, dict):
+        return response.model_copy(update={
+            "image_type": decision.get("image_type"),
+            "classification_source": decision.get("classification_source"),
+            "damage_eligible": decision.get("damage_eligible"),
+            "damage_rejection_reason": decision.get("damage_rejection_reason"),
+        })
+    return response
+
+
 @router.post("", response_model=UploadedImageResponse, status_code=status.HTTP_201_CREATED)
 def upload_assessment_image(
     assessment_id: UUID,
     file: Annotated[UploadFile, File(...)],
+    image_type: Annotated[str | None, Form()] = None,
     db: Session = Depends(get_db),
     max_bytes: int = Depends(get_image_upload_limit),
 ) -> UploadedImageResponse:
@@ -69,6 +84,8 @@ def upload_assessment_image(
             status_code=HTTP_422_UNPROCESSABLE_CONTENT,
             detail="Upload must contain a valid JPEG, PNG, or WebP image.",
         ) from None
+    if image_type is not None and image_type not in IMAGE_TYPES:
+        raise HTTPException(status_code=422, detail="Unsupported image category.")
     filename = _safe_original_filename(file.filename, extension)
     digest = hashlib.sha256(content).hexdigest()
 
@@ -85,10 +102,15 @@ def upload_assessment_image(
             sha256=digest,
             captured_at=None,
         )
+        if image_type is not None:
+            store_classification(
+                image,
+                classify_image(content=content, selected_type=image_type),
+            )
         db.add(image)
         db.flush()
         db.refresh(image)
-        response = UploadedImageResponse.model_validate(image)
+        response = _image_response(image)
         db.commit()
     except SQLAlchemyError:
         db.rollback()
@@ -111,7 +133,7 @@ def list_assessment_images(assessment_id: UUID, db: Session = Depends(get_db)) -
         raise
     except SQLAlchemyError:
         raise HTTPException(status_code=500, detail="Unable to list assessment images.") from None
-    return [UploadedImageResponse.model_validate(image) for image in images]
+    return [_image_response(image) for image in images]
 
 
 @router.get("/{image_id}/content")

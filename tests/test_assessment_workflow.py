@@ -628,7 +628,9 @@ def test_workflow_endpoint_runs_available_stages_and_returns_report(workflow_cli
     ]
     assert len(body["stages"]["ocr"]["result"]) == 2
     assert body["stages"]["damage_detection"]["result"]["processed_count"] == 2
-    assert body["stages"]["pricing"]["result"]["amount"] == "625000.00"
+    assert body["stages"]["pricing"]["result"]["amount"] is None
+    assert body["stages"]["pricing"]["result"]["valuation_status"] == "withheld_insufficient_adjustment_evidence"
+    assert body["stages"]["report"]["result"]["report_data"]["pricing_decision"]["audit"]["base_ml_estimate_inr"] == "625000.00"
     assert body["stages"]["report"]["result"]["report_data"]["market_valuation"]["status"] == "unavailable"
 
 
@@ -830,7 +832,8 @@ def test_workflow_can_be_completed_after_missing_vehicle_details_are_supplied(wo
     assert completed.status_code == 200
     body = completed.json()
     assert body["stages"]["pricing"]["status"] == "available"
-    assert body["stages"]["pricing"]["result"]["amount"] == "625000.00"
+    assert body["stages"]["pricing"]["result"]["amount"] is None
+    assert body["stages"]["pricing"]["result"]["valuation_status"] == "withheld_insufficient_adjustment_evidence"
     persisted = client.get(f"/api/v1/assessments/{assessment_id}/report").json()["report_data"]
     assert persisted["stages"]["pricing"]["status"] == "available"
     assert persisted["price_estimates"][-1]["vehicle"]["odometer_km"] == 42000

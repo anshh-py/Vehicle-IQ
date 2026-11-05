@@ -15,3 +15,7 @@ class UploadedImageResponse(BaseModel):
     sha256: str | None
     captured_at: datetime | None
     uploaded_at: datetime
+    image_type: str | None = None
+    classification_source: str | None = None
+    damage_eligible: bool | None = None
+    damage_rejection_reason: str | None = None
