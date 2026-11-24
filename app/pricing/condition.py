@@ -125,6 +125,16 @@ def pricing_decision(base_amount: Any, model_name: str | None, condition: dict[s
         "adjustment_methodology": None,
         "repair_cost_evidence": None,
         "human_review_required": bool(condition.get("requires_human_review")),
+        # The research model's raw, unadjusted output exposed as a distinct
+        # preliminary estimate. This is never a condition-adjusted resale value
+        # and is not shown as a customer-facing final estimate. Only the current
+        # assessment's persisted model result is used; nothing is hardcoded.
+        "preliminary_base_estimate_inr": format(amount, "f") if amount is not None else None,
+        "preliminary_base_estimate_currency": "INR" if amount is not None else None,
+        "preliminary_base_estimate_is_condition_adjusted": False,
+        "preliminary_base_estimate_unavailable_reason": (
+            None if amount is not None else "base_ml_estimate_unavailable"
+        ),
         "audit": {
             "base_ml_estimate_inr": format(amount, "f") if amount is not None else None,
             "model_name": model_name,

@@ -41,6 +41,7 @@ from app.llm.report import (
 )
 from app.pricing.condition import assess_condition, pricing_decision
 from app.schemas.reports import AssessmentReportResponse
+from app.vehicle_lookup.aggregate import build_normalized_vehicle_record
 
 
 router = APIRouter(prefix="/api/v1/assessments", tags=["assessment reports"])
@@ -896,6 +897,28 @@ def _build_report_data(
     vehicle_details_provenance.update(
         vehicle_lookup.get("field_provenance", {})
     )
+    # M3.2: normalized vehicle record (additive). Reuses the effective provenance
+    # (stored user-input + lookup) so the aggregate reflects the same sources as
+    # the existing vehicle_details_provenance section.
+    aggregate_vehicle_lookup = deepcopy(vehicle_lookup)
+    if isinstance(aggregate_vehicle_lookup, dict) and vehicle_details_provenance:
+        aggregate_vehicle_lookup["field_provenance"] = vehicle_details_provenance
+    challan_lookup = _latest_vehicle_service(
+        ocr_results,
+        "challan_lookup",
+        {"status", "records"},
+    )
+    fastag_lookup = _latest_vehicle_service(
+        ocr_results,
+        "fastag_lookup",
+        {"status", "issuing_bank", "issue_date", "vehicle_class"},
+    )
+    normalized_vehicle_record = build_normalized_vehicle_record(
+        assessment_id=assessment.id,
+        vehicle_lookup=aggregate_vehicle_lookup,
+        challan_lookup=challan_lookup,
+        fastag_lookup=fastag_lookup,
+    )
     report_pricing = {
         "status": "available" if price_estimates else "pending",
         "estimate_count": len(price_estimates),
@@ -1087,16 +1110,9 @@ def _build_report_data(
             if result.result_type == "registration_lookup"
         ],
         "vehicle_details_lookup": vehicle_lookup,
-        "challan_lookup": _latest_vehicle_service(
-            ocr_results,
-            "challan_lookup",
-            {"status", "records"},
-        ),
-        "fastag_lookup": _latest_vehicle_service(
-            ocr_results,
-            "fastag_lookup",
-            {"status", "issuing_bank", "issue_date", "vehicle_class"},
-        ),
+        "challan_lookup": challan_lookup,
+        "fastag_lookup": fastag_lookup,
+        "vehicle_aggregate": normalized_vehicle_record.model_dump(mode="json"),
         "damage_findings": [
             {
                 "id": str(finding.id),

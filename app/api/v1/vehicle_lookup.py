@@ -102,13 +102,10 @@ def save_manual_registration(
         }
         for row in ocr_rows
     ])
-    if ocr_assessment["status"] == "candidate":
-        db.rollback()
-        raise HTTPException(
-            status_code=409,
-            detail="A valid registration number was already extracted from the photos.",
-        )
-
+    # An OCR candidate is an unverified hypothesis, not a confirmed identity.
+    # Allowing the user to confirm or edit it through this endpoint is explicit
+    # user consent; the already-saved-number guard below still prevents silently
+    # overwriting a different confirmed registration.
     existing = normalize_manual_registration(assessment.registration_number) if assessment.registration_number else None
     if existing is not None and existing != registration_number:
         db.rollback()

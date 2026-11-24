@@ -39,17 +39,18 @@
       || /^[0-9]{2}BH[0-9]{4}[A-Z]{1,2}$/.test(value);
   }
 
-  function workflowHasValidOcrRegistration(workflow) {
+  function workflowHasOcrCandidate(workflow) {
     const report = workflow?.stages?.report?.result?.report_data || {};
     const registration = report.registration_ocr_assessment || {};
-    return registration.status === 'candidate'
-      && isSupportedRegistration(normalizeRegistration(registration.normalized_candidate));
+    // candidate and needs_review are both unverified OCR hypotheses that
+    // require explicit user confirmation before any vehicle lookup.
+    return registration.status === 'candidate' || registration.status === 'needs_review';
   }
 
   function ocrRegistrationCandidate(workflow) {
     const report = workflow?.stages?.report?.result?.report_data || {};
     const registration = report.registration_ocr_assessment || {};
-    if (registration.status !== 'needs_review') return '';
+    if (registration.status !== 'candidate' && registration.status !== 'needs_review') return '';
     return normalizeRegistration(registration.normalized_candidate || '');
   }
 
@@ -781,8 +782,19 @@
     setResultStatus('price-status', priceStatus, priceTone);
     const prediction = stage.result;
     if (decision.pricing_eligible !== true) {
+      const preliminaryBase = Number(decision.preliminary_base_estimate_inr != null
+        ? decision.preliminary_base_estimate_inr
+        : decision.audit?.base_ml_estimate_inr);
+      const hasPreliminaryBase = Number.isFinite(preliminaryBase) && preliminaryBase > 0;
+      if (hasPreliminaryBase) {
+        const prelim = node('div', 'price-highlight');
+        prelim.append(node('small', '', 'PRELIMINARY AI MODEL PREDICTION · INR'));
+        prelim.append(node('strong', '', money(preliminaryBase)));
+        prelim.append(node('p', '', 'Unadjusted research-model estimate before damage or repair-cost adjustment. Not verified market value.'));
+        content.append(prelim);
+      }
       content.append(node('p', 'valuation-withheld', decision.withholding_message || 'A reliable condition-adjusted resale estimate is unavailable.'));
-      if (decision.condition_category) content.append(node('p', 'quiet-copy', `Condition status: ${String(decision.condition_category).replace(/_/g, ' ')}. The base model prediction is retained for audit and is not shown as a resale estimate.`));
+      if (decision.condition_category) content.append(node('p', 'quiet-copy', `Condition status: ${String(decision.condition_category).replace(/_/g, ' ')}. Condition-adjusted valuation is withheld.`));
       if (decision.human_review_required) content.append(node('p', 'quiet-copy', 'A qualified in-person inspection is recommended before relying on a resale valuation.'));
     } else if (prediction && stage.status === 'available') {
       const highlight = node('div', 'price-highlight');
@@ -1254,14 +1266,14 @@
       if (sequence !== routeLoadSequence) return;
       latestWorkflow = workflow;
       workflowAssessmentId = id;
-      if (!manualRegistrationAlreadySaved && !workflowHasValidOcrRegistration(workflow)) {
+      if (!manualRegistrationAlreadySaved && workflowHasOcrCandidate(workflow)) {
         await closeOverlay();
         if (sequence === routeLoadSequence) {
           const ocrCandidate = ocrRegistrationCandidate(workflow);
           showRegistrationDialog(
             ocrCandidate || registrationPrefill,
             ocrCandidate
-              ? 'OCR detected this number, but it could not verify it. Please check and correct before continuing.'
+              ? 'OCR detected this number, but it is not confirmed. Please verify and correct before continuing.'
               : '',
           );
         }

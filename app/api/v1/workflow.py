@@ -112,32 +112,48 @@ def _workflow_lookup_stage(
 ) -> tuple[WorkflowStageResult, object | None]:
     if manual_registration is None:
         assessment = build_registration_ocr_assessment(ocr_results)
-        if assessment["status"] != "candidate":
-            if assessment["status"] == "needs_review":
-                return WorkflowStageResult(
-                    status="unavailable",
-                    result={
-                        "registration_number_candidate": assessment[
-                            "normalized_candidate"
-                        ],
-                        "confidence": assessment["confidence"],
-                        "requires_manual_correction": True,
-                    },
-                    errors=[WorkflowStageError(
-                        code="registration_needs_review",
-                        detail="OCR registration candidates need review; vehicle lookup was skipped.",
-                    )],
-                ), None
+        # An OCR reading alone is never consent. A candidate or needs_review
+        # result is an unverified registration hypothesis: vehicle lookup must
+        # not be triggered until the user explicitly confirms the number through
+        # the registration-number endpoint (which records a manual registration).
+        if assessment["status"] == "candidate":
             return WorkflowStageResult(
                 status="unavailable",
+                result={
+                    "registration_number_candidate": assessment[
+                        "normalized_candidate"
+                    ],
+                    "confidence": assessment["confidence"],
+                    "requires_manual_correction": True,
+                },
                 errors=[WorkflowStageError(
-                    code="registration_not_found",
-                    detail="No readable registration candidate was available for vehicle lookup.",
+                    code="registration_needs_confirmation",
+                    detail="OCR registration candidate requires user confirmation; vehicle lookup was skipped.",
                 )],
             ), None
-        candidate = assessment["normalized_candidate"]
-    else:
-        candidate = manual_registration
+        if assessment["status"] == "needs_review":
+            return WorkflowStageResult(
+                status="unavailable",
+                result={
+                    "registration_number_candidate": assessment[
+                        "normalized_candidate"
+                    ],
+                    "confidence": assessment["confidence"],
+                    "requires_manual_correction": True,
+                },
+                errors=[WorkflowStageError(
+                    code="registration_needs_review",
+                    detail="OCR registration candidates need review; vehicle lookup was skipped.",
+                )],
+            ), None
+        return WorkflowStageResult(
+            status="unavailable",
+            errors=[WorkflowStageError(
+                code="registration_not_found",
+                detail="No readable registration candidate was available for vehicle lookup.",
+            )],
+        ), None
+    candidate = manual_registration
 
     saved = _saved_lookup_for_candidate(db, assessment_id, candidate)
     if saved is not None:

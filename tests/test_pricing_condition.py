@@ -28,6 +28,11 @@ def test_minor_scratch_without_repair_evidence_has_no_fabricated_deduction():
     assert decision["condition_adjustment_inr"] is None
     assert "adjusted_estimate_inr" not in decision
     assert decision["customer_facing_estimate_inr"] is None
+    # The unadjusted base prediction must remain visible as a distinct
+    # preliminary estimate, while the condition-adjusted value stays withheld.
+    assert decision["preliminary_base_estimate_inr"] == "500000"
+    assert decision["preliminary_base_estimate_is_condition_adjusted"] is False
+    assert decision["preliminary_base_estimate_currency"] == "INR"
 
 
 def test_moderate_damage_without_validated_method_withholds_estimate():
@@ -37,6 +42,8 @@ def test_moderate_damage_without_validated_method_withholds_estimate():
     assert decision["pricing_eligible"] is False
     assert decision["adjustment_methodology"] is None
     assert decision["repair_cost_evidence"] is None
+    assert decision["preliminary_base_estimate_inr"] == "500000"
+    assert decision["preliminary_base_estimate_is_condition_adjusted"] is False
 
 
 def test_supported_major_collision_class_withholds_and_retains_base_for_audit():
@@ -101,6 +108,10 @@ def test_unavailable_condition_without_base_amount_stays_unavailable():
     assert decision["pricing_eligible"] is False
     assert decision["customer_facing_estimate_inr"] is None
     assert decision["withholding_reason"] == "base_ml_estimate_unavailable"
+    # Missing base prediction: preliminary estimate is honestly unavailable with
+    # the actual reason, never fabricated.
+    assert decision["preliminary_base_estimate_inr"] is None
+    assert decision["preliminary_base_estimate_unavailable_reason"] == "base_ml_estimate_unavailable"
 
 
 def test_condition_available_and_clean_permits_base_estimate():
@@ -109,6 +120,8 @@ def test_condition_available_and_clean_permits_base_estimate():
     assert decision["status"] == "available"
     assert decision["pricing_eligible"] is True
     assert decision["customer_facing_estimate_inr"] == "625000"
+    assert decision["preliminary_base_estimate_inr"] == "625000"
+    assert decision["preliminary_base_estimate_is_condition_adjusted"] is False
 
 
 def test_actual_damage_findings_still_withhold_base_estimate():
@@ -120,3 +133,8 @@ def test_actual_damage_findings_still_withhold_base_estimate():
     assert decision["status"] == "withheld_insufficient_adjustment_evidence"
     assert decision["pricing_eligible"] is False
     assert decision["customer_facing_estimate_inr"] is None
+    # The base prediction must remain visible (preliminary, unadjusted) even
+    # though the condition-adjusted valuation is withheld.
+    assert decision["audit"]["base_ml_estimate_inr"] == "625000"
+    assert decision["audit"]["is_condition_adjusted"] is False
+    assert decision["audit"]["provenance"] == "research_only_xgboost_prediction"

@@ -192,6 +192,14 @@ def test_workflow_duplicate_submission_returns_stored_result(
     client = workflow_client.client
     assessment_id, image_ids = _create_workflow_assessment_with_images(client)
 
+    # OCR returns a high-confidence candidate; per the confirmation flow the
+    # user must explicitly confirm it before vehicle lookup / pricing may run.
+    conf = client.post(
+        f"/api/v1/assessments/{assessment_id}/registration-number",
+        json={"registration_number": "RJ45CA1879"},
+    )
+    assert conf.status_code == 200
+
     # Vehicle payload required for pricing
     vehicle_payload = {"odometer_km": 50000, "seller_type": "Individual"}
 
@@ -233,6 +241,14 @@ def test_workflow_failure_preserves_error_state_and_dispatches_correct_status(
 
     client = workflow_client.client
     assessment_id, image_ids = _create_workflow_assessment_with_images(client)
+
+    # OCR returns a high-confidence candidate; confirm it explicitly so the
+    # workflow may proceed to vehicle lookup and pricing (the failing provider).
+    conf = client.post(
+        f"/api/v1/assessments/{assessment_id}/registration-number",
+        json={"registration_number": "RJ45CA1879"},
+    )
+    assert conf.status_code == 200
 
     # Create a price estimate with a failing provider mock
     class BrokenPrice:

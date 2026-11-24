@@ -406,6 +406,10 @@ def test_severe_condition_suppresses_customer_estimate_but_preserves_labeled_aud
     assert decision["status"] == "withheld_severe_damage"
     assert decision["customer_facing_estimate_inr"] is None
     assert decision["audit"]["base_ml_estimate_inr"] == "625000.00"
+    # The actual persisted base prediction is exposed as a distinct preliminary,
+    # unadjusted estimate in the report API even when the final valuation is withheld.
+    assert decision["preliminary_base_estimate_inr"] == "625000.00"
+    assert decision["preliminary_base_estimate_is_condition_adjusted"] is False
     recommendation = body["buyer_recommendation"]
     assert recommendation["status"] == "further_inspection"
     assert recommendation["risk_level"] == "high"
@@ -1137,3 +1141,217 @@ def test_report_generation_retries_missing_narrative(monkeypatch, report_api):
     second = client.post(f"/api/v1/assessments/{assessment_id}/report")
     assert second.status_code == 200
     assert second.json()["report_data"]["llm_narrative"]["vehicle_overview"] == "second"
+
+
+def _add_vehicle_lookup_results(
+    engine,
+    assessment_id: str,
+    *,
+    registration: dict | None = None,
+    challan: dict | None = None,
+    fastag: dict | None = None,
+) -> None:
+    """Insert registration / challan / FASTag lookup results for an assessment."""
+    with Session(engine) as session:
+        assessment_uuid = UUID(assessment_id)
+        rows = []
+        if registration is not None:
+            rows.append(OCRResult(
+                assessment_id=assessment_uuid,
+                result_type="registration_lookup",
+                status="completed",
+                provider="test-vehicle-lookup",
+                result_data=registration,
+            ))
+        if challan is not None:
+            rows.append(OCRResult(
+                assessment_id=assessment_uuid,
+                result_type="challan_lookup",
+                status="completed",
+                provider="test-challan-lookup",
+                result_data=challan,
+            ))
+        if fastag is not None:
+            rows.append(OCRResult(
+                assessment_id=assessment_uuid,
+                result_type="fastag_lookup",
+                status="completed",
+                provider="test-fastag-lookup",
+                result_data=fastag,
+            ))
+        session.add_all(rows)
+        session.commit()
+
+
+def test_report_integrates_normalized_vehicle_aggregate(report_api):
+    client, engine, assessment_id = report_api
+    _add_pipeline_results(engine, assessment_id)
+    _add_vehicle_lookup_results(
+        engine,
+        assessment_id,
+        registration={
+            "make": "Example Motors",
+            "model": "City",
+            "variant": "ZXI",
+            "fuel_type": "petrol",
+            "insurance_expiry": "2025-12-31",
+        },
+        challan={
+            "state": "available",
+            "details": {
+                "records": [
+                    {"amount": "1000.00", "payment_status": "unpaid"},
+                    {"amount": "2500.50", "payment_status": "paid"},
+                ]
+            },
+        },
+        fastag={
+            "state": "available",
+            "details": {
+                "issuing_bank": "ICICI Bank",
+                "issue_date": "2023-01-15",
+                "vehicle_class": "LMV",
+            },
+        },
+    )
+
+    response = client.post(f"/api/v1/assessments/{assessment_id}/report")
+
+    assert response.status_code == 200
+    data = response.json()["report_data"]
+    aggregate = data["vehicle_aggregate"]
+
+    # The normalized record appears as an additive report field.
+    assert aggregate["status"] == "available"
+    assert aggregate["assessment_id"] == assessment_id
+    assert aggregate["vehicle_specs"]["make"] == "Example Motors"
+    assert aggregate["vehicle_specs"]["model"] == "City"
+    assert aggregate["vehicle_specs"]["variant"] == "ZXI"
+    assert aggregate["insurance"]["status"] == "available"
+    assert aggregate["insurance"]["expiry"] == "2025-12-31"
+    assert aggregate["challan"]["status"] == "available"
+    assert aggregate["challan"]["records"] == 2
+    assert aggregate["challan"]["total_amount_inr"] == "3500.50"
+    assert aggregate["challan"]["unpaid_count"] == 1
+    assert aggregate["fastag"]["status"] == "available"
+    assert aggregate["fastag"]["issuing_bank"] == "ICICI Bank"
+    assert aggregate["fastag"]["issue_date"] == "2023-01-15"
+    assert aggregate["sources"]["registration"]["status"] == "available"
+    assert aggregate["sources"]["challan"]["status"] == "available"
+    assert aggregate["sources"]["fastag"]["status"] == "available"
+    assert aggregate["errors"] == []
+
+    # Existing report fields remain present and unchanged.
+    assert data["vehicle_details_lookup"]["status"] == "available"
+    assert data["challan_lookup"]["status"] == "available"
+    assert data["fastag_lookup"]["status"] == "available"
+    assert data["assessment"]["vehicle_details_provenance"]["make"] == "vehicle_api"
+    # Existing valuation output is unchanged by the additive field.
+    assert data["pricing_decision"]["audit"]["base_ml_estimate_inr"] == "625000.00"
+    # With damage findings present, pricing is withheld and the report suppresses
+    # the market ML-prediction amount (existing behavior, unaffected by the
+    # additive aggregate field).
+    assert data["price_estimates"][-1]["amount"] is None
+    assert data["market_valuation"]["ml_prediction"]["status"] == "withheld_by_condition_policy"
+    assert data["market_valuation"]["ml_prediction"]["amount_inr"] is None
+
+
+def test_report_missing_vehicle_providers_yield_unavailable_aggregate(report_api):
+    client, _engine, assessment_id = report_api
+
+    response = client.post(f"/api/v1/assessments/{assessment_id}/report")
+
+    assert response.status_code == 200
+    data = response.json()["report_data"]
+    aggregate = data["vehicle_aggregate"]
+
+    assert aggregate["status"] == "unavailable"
+    assert aggregate["vehicle_specs"] == {}
+    assert aggregate["sources"]["registration"]["status"] == "unavailable"
+    assert aggregate["sources"]["challan"]["status"] == "unavailable"
+    assert aggregate["sources"]["fastag"]["status"] == "unavailable"
+    assert aggregate["insurance"]["status"] == "unavailable"
+    # The report layer marks absent challan/FASTag sources with the existing
+    # "not_run" error code; registration has no provider error code.
+    assert aggregate["errors"] == [
+        {"source": "challan", "code": "not_run"},
+        {"source": "fastag", "code": "not_run"},
+    ]
+
+    # Report generation still completes normally for the rest of the pipeline.
+    assert data["stages"]["damage_detection"]["status"] == "unavailable"
+    assert data["market_valuation"]["status"] == "unavailable"
+
+
+def test_report_aggregate_represents_partial_and_failed_providers(report_api):
+    client, engine, assessment_id = report_api
+    _add_pipeline_results(engine, assessment_id)
+    _add_vehicle_lookup_results(
+        engine,
+        assessment_id,
+        registration={"make": "Example Motors", "model": "City", "insurance_expiry": "2025-06-30"},
+        challan={
+            "state": "partial",
+            "details": {
+                "records": [
+                    {"amount": "500.00", "payment_status": "pending"},
+                    {"amount": "300.50", "payment_status": "unpaid"},
+                ]
+            },
+        },
+        fastag={"state": "failed", "error_code": "provider_down", "details": {}},
+    )
+
+    response = client.post(f"/api/v1/assessments/{assessment_id}/report")
+
+    assert response.status_code == 200
+    aggregate = response.json()["report_data"]["vehicle_aggregate"]
+
+    assert aggregate["status"] == "partial"
+    assert aggregate["challan"]["status"] == "partial"
+    assert aggregate["challan"]["records"] == 2
+    assert aggregate["challan"]["total_amount_inr"] == "800.50"
+    assert aggregate["challan"]["unpaid_count"] == 2
+    assert aggregate["fastag"]["status"] == "failed"
+    assert aggregate["sources"]["fastag"]["status"] == "failed"
+    assert aggregate["sources"]["fastag"]["error_code"] == "provider_down"
+    assert aggregate["errors"] == [{"source": "fastag", "code": "provider_down"}]
+    assert aggregate["insurance"]["status"] == "available"
+
+
+def test_report_aggregate_preserves_field_provenance(report_api):
+    client, engine, assessment_id = report_api
+    _add_pipeline_results(engine, assessment_id)
+    with Session(engine) as session:
+        assessment = session.get(VehicleAssessment, UUID(assessment_id))
+        assessment.vehicle_details = {
+            "make": "Example Motors",
+            "model": "City",
+            "owner_count": 2,
+        }
+        session.commit()
+    _add_vehicle_lookup_results(
+        engine,
+        assessment_id,
+        registration={"make": "Example Motors", "model": "City", "variant": "ZXI"},
+    )
+
+    response = client.post(f"/api/v1/assessments/{assessment_id}/report")
+
+    assert response.status_code == 200
+    data = response.json()["report_data"]
+    aggregate = data["vehicle_aggregate"]
+
+    # Lookup-backed fields are attributed to the vehicle API (the lookup wins in
+    # the report merge, consistent with vehicle_details_provenance).
+    assert aggregate["vehicle_specs"]["make"] == "Example Motors"
+    assert aggregate["vehicle_specs"]["variant"] == "ZXI"
+    assert aggregate["field_provenance"]["make"] == "vehicle_api"
+    assert aggregate["field_provenance"]["variant"] == "vehicle_api"
+    assert data["assessment"]["vehicle_details_provenance"]["make"] == "vehicle_api"
+
+    # Every aggregate spec key carries a provenance entry aligned with the
+    # report's effective provenance for that key.
+    for key in aggregate["vehicle_specs"]:
+        assert key in aggregate["field_provenance"]
+        assert aggregate["field_provenance"][key] == data["assessment"]["vehicle_details_provenance"][key]

@@ -144,10 +144,10 @@ def test_registration_fallback_runs_after_ocr_and_before_report_presentation():
     assert "We couldn't extract the vehicle registration number from your photos." in page
     assert "Enter vehicle registration number (e.g. RJ14AB1234)" in page
     assert "Continue to Inspection" in page
-    assert "workflowHasValidOcrRegistration(workflow)" in resume
-    assert "registration.status === 'candidate'" in script
+    assert "workflowHasOcrCandidate(workflow)" in resume
+    assert "registration.status === 'candidate' || registration.status === 'needs_review'" in script
     assert resume.index("post(`/${encodeURIComponent(id)}/workflow`") < resume.index("showRegistrationDialog(")
-    assert "if (!manualRegistrationAlreadySaved && !workflowHasValidOcrRegistration(workflow))" in resume
+    assert "if (!manualRegistrationAlreadySaved && workflowHasOcrCandidate(workflow))" in resume
     assert "if (!isSupportedRegistration(registrationNumber))" in manual_submit
     assert manual_submit.index("if (!isSupportedRegistration(registrationNumber))") < manual_submit.index("/registration-number")
     assert manual_submit.index("/registration-number") < manual_submit.index("/workflow") < manual_submit.index("navigate(`/report/${encodeURIComponent(id)}`)")
@@ -437,6 +437,21 @@ def test_report_explains_registration_lookup_failures_without_provider_payloads(
     assert "provider_unavailable: 'The vehicle details provider was unavailable" in script
     assert "provider_failed: 'The vehicle details provider did not return usable" in script
     assert "error_message" not in script
+
+
+def test_preliminary_ai_model_prediction_shown_when_adjusted_valuation_withheld():
+    script = (FRONTEND / "app.js").read_text(encoding="utf-8")
+    price = script.split("function renderPrice(workflow)", maxsplit=1)[1].split("function renderLLMNarrative", maxsplit=1)[0]
+
+    # The preliminary base prediction must be read from the decision's exposed
+    # top-level preliminary field (with audit fallback) and rendered separately
+    # from the withheld condition-adjusted status.
+    assert "preliminary_base_estimate_inr" in price
+    assert "base_ml_estimate_inr" in price
+    assert "PRELIMINARY AI MODEL PREDICTION · INR" in price
+    assert "Unadjusted research-model estimate before damage or repair-cost adjustment" in price
+    assert "Condition-adjusted valuation is withheld" in price
+    assert "Condition-adjusted valuation is withheld" not in price.replace("Condition-adjusted valuation is withheld", "")
 
 
 def test_dark_mobile_layout_and_accessible_upload_controls():
