@@ -146,7 +146,7 @@ def test_registration_fallback_runs_after_ocr_and_before_report_presentation():
     assert "Continue to Inspection" in page
     assert "workflowHasValidOcrRegistration(workflow)" in resume
     assert "registration.status === 'candidate'" in script
-    assert resume.index("post(`/${encodeURIComponent(id)}/workflow`") < resume.index("showRegistrationDialog(registrationPrefill)")
+    assert resume.index("post(`/${encodeURIComponent(id)}/workflow`") < resume.index("showRegistrationDialog(")
     assert "if (!manualRegistrationAlreadySaved && !workflowHasValidOcrRegistration(workflow))" in resume
     assert "if (!isSupportedRegistration(registrationNumber))" in manual_submit
     assert manual_submit.index("if (!isSupportedRegistration(registrationNumber))") < manual_submit.index("/registration-number")

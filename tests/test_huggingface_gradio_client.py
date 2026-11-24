@@ -5,6 +5,7 @@ import httpx
 import pytest
 
 from app.ocr.client import (
+    AnprGradioOCRClient,
     BaiduUnlimitedOCRClient,
     HybridOCRClient,
     HuggingFaceGradioOCRClient,
@@ -71,7 +72,8 @@ def test_gradio_space_environment_settings_are_canonical(monkeypatch):
         _env_file=None,
         database_url="postgresql+psycopg://user:pass@localhost/vehicle_iq",
     )
-    assert defaults.ocr_service_provider == "huggingface_gradio"
+    assert defaults.ocr_service_provider == "anpr_gradio"
+    assert defaults.ocr_anpr_gradio_space_url == "https://hung102004-demo-licenseplate.hf.space"
     assert defaults.ocr_gradio_space_url == BASE_URL
 
     monkeypatch.setenv("OCR_SERVICE_PROVIDER", "huggingface_gradio")
@@ -382,6 +384,19 @@ def test_provider_selection_defaults_and_keeps_local_baidu_provider(monkeypatch)
     assert public_client.base_url == f"{BASE_URL}/"
     assert public_client.mode == "base"
     assert public_client.timeout.read == 600
+
+    monkeypatch.setattr(
+        ocr_api,
+        "settings",
+        SimpleNamespace(
+            ocr_service_provider="anpr_gradio",
+            ocr_service_url=None,
+            ocr_anpr_gradio_space_url="https://hung102004-demo-licenseplate.hf.space",
+        ),
+    )
+    anpr_client = ocr_api.get_ocr_client()
+    assert isinstance(anpr_client, AnprGradioOCRClient)
+    assert anpr_client.space_url == "https://hung102004-demo-licenseplate.hf.space"
 
     monkeypatch.setattr(
         ocr_api,

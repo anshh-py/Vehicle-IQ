@@ -581,6 +581,21 @@ def inspect_assessment_image_damage(
         raise
 
     if not decision.eligible_for_damage_inference:
+        # Structured, privacy-safe rejection log: identifiers and classification
+        # metadata only — never image bytes, OCR text, registration numbers, or
+        # provider secrets.
+        logger.info(
+            "Damage image classification rejected for damage inference",
+            extra={
+                "event": "damage_image_classification_rejected",
+                "assessment_id": str(assessment_id),
+                "image_id": str(image_id),
+                "image_type": decision.image_type,
+                "classification_method": decision.classification_method,
+                "classification_source": decision.classification_source,
+                "rejection_reason": decision.rejection_reason,
+            },
+        )
         reused = eligibility_reused
         _record_inspection_outcome(
             db,

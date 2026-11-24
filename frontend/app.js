@@ -46,6 +46,13 @@
       && isSupportedRegistration(normalizeRegistration(registration.normalized_candidate));
   }
 
+  function ocrRegistrationCandidate(workflow) {
+    const report = workflow?.stages?.report?.result?.report_data || {};
+    const registration = report.registration_ocr_assessment || {};
+    if (registration.status !== 'needs_review') return '';
+    return normalizeRegistration(registration.normalized_candidate || '');
+  }
+
   function requestError(message, status) {
     const error = new Error(message);
     error.status = status;
@@ -1249,7 +1256,15 @@
       workflowAssessmentId = id;
       if (!manualRegistrationAlreadySaved && !workflowHasValidOcrRegistration(workflow)) {
         await closeOverlay();
-        if (sequence === routeLoadSequence) showRegistrationDialog(registrationPrefill);
+        if (sequence === routeLoadSequence) {
+          const ocrCandidate = ocrRegistrationCandidate(workflow);
+          showRegistrationDialog(
+            ocrCandidate || registrationPrefill,
+            ocrCandidate
+              ? 'OCR detected this number, but it could not verify it. Please check and correct before continuing.'
+              : '',
+          );
+        }
         return;
       }
       const complete = workflow.status === 'completed' || workflow.status === 'partial';
@@ -1318,9 +1333,9 @@
   const registrationForm = $('registration-form');
   let registrationSubmissionInProgress = false;
 
-  function showRegistrationDialog(prefill = '') {
+  function showRegistrationDialog(prefill = '', warning = '') {
     $('manual-registration').value = prefill;
-    setMessage($('registration-message'), '');
+    setMessage($('registration-message'), warning);
     if (!registrationDialog.open) registrationDialog.showModal();
     document.body.classList.add('modal-open');
     $('manual-registration').focus({ preventScroll: true });

@@ -10,4 +10,6 @@ venv/
 .local-storage/
 __pycache__/
 .pytest_cache/
+.pytest-*/
+.test-tmp/
 *.py[cod]

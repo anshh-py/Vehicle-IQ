@@ -149,7 +149,7 @@ def classify_image(
         )
 
     if selected_type is not None:
-        eligible = selected_type in {"vehicle_exterior", "vehicle_interior", "damage_closeup"}
+        eligible = selected_type in {"vehicle_exterior", "damage_closeup"}
         return ImageEligibilityDecision(
             image_type=selected_type,
             classification_method="explicit_user_selection",
@@ -239,6 +239,25 @@ def classify_image(
             rejection_reason=None if eligible else "low_resolution_or_unsupported_image",
             classified_at=classified_at,
             signals=signals,
+            cache_key=cache_key,
+        )
+
+    # Conservative fall-through: an otherwise-unclassified image that is large
+    # enough and has a plausible photographic aspect ratio, with no positive
+    # plate/document/interior/closeup signals, is admitted as a *candidate* for
+    # exterior damage inference. This keeps ordinary vehicle photos with
+    # generic filenames usable without treating every small or thumbnail image
+    # as a vehicle. It is a heuristic, not a positive vehicle identification:
+    # we only admit, we do not claim confidence or that the image is a vehicle.
+    if sufficiently_large and reasonable_aspect:
+        candidate_signals = {**signals, "heuristic_vehicle_candidate": True}
+        return ImageEligibilityDecision(
+            image_type="vehicle_exterior",
+            classification_method="dimensions_only_conservative",
+            eligible_for_damage_inference=True,
+            rejection_reason=None,
+            classified_at=classified_at,
+            signals=candidate_signals,
             cache_key=cache_key,
         )
 

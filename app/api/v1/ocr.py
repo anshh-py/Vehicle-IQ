@@ -11,12 +11,14 @@ from app.db.models import OCRResult, UploadedImage, VehicleAssessment
 from app.db.session import get_db
 from app.images.validation import InvalidImageError, inspect_image
 from app.ocr.client import (
+    AnprGradioOCRClient,
     BaiduUnlimitedOCRClient,
     HybridOCRClient,
     HuggingFaceGradioOCRClient,
     OCRClient,
     OCRInferenceFailed,
     OCRInvalidResponse,
+    OCRNoPlateDetected,
     OCRServiceUnavailable,
     OCRUnreadableText,
     PaddleOCRLocalClient,
@@ -73,6 +75,8 @@ def get_ocr_client() -> OCRClient | None:
             mode=settings.ocr_gradio_mode,
             read_timeout_seconds=settings.ocr_timeout_seconds,
         )
+    if settings.ocr_service_provider == "anpr_gradio":
+        return AnprGradioOCRClient(settings.ocr_anpr_gradio_space_url)
     if settings.ocr_service_provider == "hybrid":
         return HybridOCRClient(
             PaddleOCRLocalClient(
@@ -176,6 +180,12 @@ def recognize_assessment_image(
             _diagnostic(attempt_provider_name(), "invalid_response", "Provider returned an invalid response."),
         )
         raise HTTPException(status_code=502, detail="OCR service returned an invalid response.") from None
+    except OCRNoPlateDetected:
+        _persist_ocr_attempt_status(
+            db, assessment_id, image_id, attempt_provider_name(), "no_plate", "no_plate_detected",
+            _diagnostic(attempt_provider_name(), "no_plate", "Provider detected no vehicle number plate in the image."),
+        )
+        raise HTTPException(status_code=422, detail="No vehicle number plate was detected in the image.") from None
     except OCRUnreadableText:
         _persist_ocr_attempt_status(
             db, assessment_id, image_id, attempt_provider_name(), "unreadable", "no_readable_text",

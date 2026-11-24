@@ -99,6 +99,37 @@ def test_supported_damage_classes_are_preserved():
     )
 
 
+def test_all_eight_space_classess_normalize_into_schema():
+    # The Space exposes exactly eight classes (t0..t7): the "no damage"
+    # sentinel plus seven genuine damage classes. Every documented class must
+    # flow through: the sentinel is filtered, all damage classes are preserved
+    # verbatim into Vehicle IQ's DamageDetection schema (including "broken glass",
+    # which is part of the threshold contract but absent from other tests).
+    rows = [
+        ["no damage", 0.9, "[0.5, 0.5, 1.0, 1.0]"],
+        ["lost parts", 0.6, "[0.5, 0.5, 0.2, 0.4]"],
+        ["torn", 0.6, "[0.5, 0.5, 0.2, 0.4]"],
+        ["dent", 0.6, "[0.5, 0.5, 0.2, 0.4]"],
+        ["paint scratch", 0.6, "[0.5, 0.5, 0.2, 0.4]"],
+        ["hole", 0.6, "[0.5, 0.5, 0.2, 0.4]"],
+        ["broken glass", 0.6, "[0.5, 0.5, 0.2, 0.4]"],
+        ["broken lamp", 0.6, "[0.5, 0.5, 0.2, 0.4]"],
+    ]
+    fake = FakeClient(result=(
+        "/tmp/a.webp", dataframe(YOLO_HEADERS, rows), "/tmp/a.csv", "/tmp/a.txt"
+    ))
+    outcome = make_provider(fake).detect(make_png(), "png")
+
+    assert [d.class_name for d in outcome.detections] == [
+        "lost parts", "torn", "dent", "paint scratch",
+        "hole", "broken glass", "broken lamp",
+    ]
+    assert set(d.class_name for d in outcome.detections) == {
+        "lost parts", "torn", "dent", "paint scratch",
+        "hole", "broken glass", "broken lamp",
+    }
+
+
 def test_unknown_class_is_preserved_not_dropped():
     rows = [["weird_class", 0.55, "[0.5, 0.5, 0.2, 0.4]"]]
     fake = FakeClient(result=(

@@ -8,6 +8,8 @@ import re
 import logging
 import tempfile
 import threading
+import time
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as ExecutorTimeoutError
 from typing import ClassVar, Protocol
 from urllib.parse import quote, urljoin
 
@@ -27,6 +29,10 @@ class OCRInvalidResponse(Exception):
 
 class OCRUnreadableText(Exception):
     """The OCR service completed but did not find readable text."""
+
+
+class OCRNoPlateDetected(OCRUnreadableText):
+    """The OCR service completed but detected no vehicle number plate."""
 
 
 class OCRInferenceFailed(Exception):
@@ -514,3 +520,115 @@ class HuggingFaceGradioOCRClient:
         value = re.sub(r"[\r\n\x00-\x1f\x7f]", " ", value)
         value = " ".join(value.split())[:300]
         return value or "the Space returned no safe error details"
+
+
+class AnprGradioOCRClient:
+    """External ANPR Gradio Space adapter for vehicle number-plate recognition."""
+
+    provider_name = "anpr_gradio"
+    API_NAME = "/recognize_license_plate"
+    NO_PLATE_MARKERS = (
+        "không phát hiện được biển số",
+        "không phát hiện được biển số trong ảnh",
+        "khong phat hien duoc bien so",
+        "no license plate detected",
+        "no plate detected",
+    )
+    PREFIX_RE = re.compile(r"[Bb]iển\s*số\s*:?\s*(.+)")
+    _executor: ClassVar[ThreadPoolExecutor] = ThreadPoolExecutor(
+        max_workers=4, thread_name_prefix="vehicle-iq-anpr-gradio"
+    )
+
+    def __init__(
+        self,
+        space_url: str,
+        api_name: str = API_NAME,
+        timeout_seconds: float | None = None,
+        max_retries: int = 2,
+        client_factory=None,
+    ):
+        self.space_url = space_url.rstrip("/")
+        self.api_name = api_name
+        self.timeout_seconds = timeout_seconds if timeout_seconds is not None else float(settings.ocr_timeout_seconds)
+        self.max_retries = max_retries
+        self._client_factory = client_factory or self._default_client_factory
+
+    @staticmethod
+    def _default_client_factory(space_url: str):
+        from gradio_client import Client
+
+        return Client(space_url)
+
+    def recognize(self, content: bytes, filename: str, content_type: str) -> OCRRecognition:
+        if content_type not in {"image/jpeg", "image/png", "image/webp"}:
+            raise OCRInvalidResponse("ANPR Space received an unsupported image type")
+        suffix = {"image/jpeg": ".jpg", "image/png": ".png", "image/webp": ".webp"}[content_type]
+        temp_path: str | None = None
+        try:
+            with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as image_file:
+                image_file.write(content)
+                temp_path = image_file.name
+            return self._recognize_with_retry(temp_path)
+        finally:
+            if temp_path is not None:
+                Path(temp_path).unlink(missing_ok=True)
+
+    def _recognize_with_retry(self, image_path: str) -> OCRRecognition:
+        last_error: Exception | None = None
+        for attempt in range(self.max_retries + 1):
+            try:
+                return self._predict_once(image_path)
+            except OCRServiceUnavailable as exc:
+                last_error = exc
+                if attempt < self.max_retries:
+                    time.sleep(1.5 * (attempt + 1))
+        assert last_error is not None
+        raise last_error
+
+    def _predict_once(self, image_path: str) -> OCRRecognition:
+        future = self._executor.submit(self._call_space, image_path)
+        try:
+            crop, text = future.result(timeout=self.timeout_seconds)
+        except ExecutorTimeoutError:
+            future.cancel()
+            raise OCRServiceUnavailable("ANPR Space request timed out") from None
+        except Exception as exc:
+            if isinstance(exc, (OCRServiceUnavailable, OCRInvalidResponse, OCRNoPlateDetected, OCRUnreadableText, OCRInferenceFailed)):
+                raise
+            raise OCRServiceUnavailable(f"ANPR Space request failed ({type(exc).__name__}).") from None
+        return self._parse_result(crop, text)
+
+    def _call_space(self, image_path: str):
+        client = self._client_factory(self.space_url)
+        try:
+            from gradio_client import handle_file
+
+            result = client.predict(handle_file(image_path), api_name=self.api_name)
+        finally:
+            try:
+                client.close()
+            except Exception:
+                pass
+        if not isinstance(result, (tuple, list)) or len(result) != 2:
+            raise OCRInvalidResponse("ANPR Space returned an invalid response shape")
+        return result[0], result[1]
+
+    @classmethod
+    def _parse_result(cls, crop, text) -> OCRRecognition:
+        if not isinstance(text, str):
+            raise OCRInvalidResponse("ANPR Space returned an invalid OCR output")
+        folded = text.strip().casefold()
+        if any(marker in folded for marker in cls.NO_PLATE_MARKERS):
+            raise OCRNoPlateDetected("No vehicle number plate was detected in the image.")
+        match = cls.PREFIX_RE.search(text)
+        candidate = match.group(1) if match else text
+        normalized = cls._normalize(candidate)
+        if not normalized:
+            raise OCRUnreadableText("ANPR Space returned unreadable plate text.")
+        return OCRRecognition(text=normalized, provider=cls.provider_name)
+
+    @staticmethod
+    def _normalize(value: str) -> str:
+        text = re.sub(r"\s+", " ", value).strip()
+        text = re.sub(r"[^A-Za-z0-9 ]", "", text)
+        return " ".join(text.upper().split())

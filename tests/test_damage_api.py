@@ -128,7 +128,7 @@ def damage_api(tmp_path, *, content=None, provider=None) -> Generator[DamageAPIF
         engine.dispose()
 
 
-@pytest.mark.parametrize("category", ["vehicle_exterior", "vehicle_interior", "damage_closeup"])
+@pytest.mark.parametrize("category", ["vehicle_exterior", "damage_closeup"])
 def test_explicit_eligible_categories_invoke_provider_even_when_ocr_failed(damage_api_fixture, category):
     api = damage_api_fixture
     content = vehicle_png_bytes()
@@ -168,7 +168,7 @@ def test_explicit_eligible_categories_invoke_provider_even_when_ocr_failed(damag
 
 @pytest.mark.parametrize(
     ("category", "outcome"),
-    [("registration_plate", "ineligible"), ("document", "ineligible"), ("unknown", "classification_uncertain")],
+    [("registration_plate", "ineligible"), ("document", "ineligible"), ("vehicle_interior", "ineligible"), ("unknown", "classification_uncertain")],
 )
 def test_explicit_ineligible_or_unknown_category_never_invokes_provider(damage_api_fixture, category, outcome):
     api = damage_api_fixture
@@ -804,3 +804,57 @@ def test_valuation_withheld_for_moderate_damage_condition():
     decision = pricing_decision(2000000, "test-model", condition)
     assert decision["pricing_eligible"] is False
     assert decision["status"] == "withheld_insufficient_adjustment_evidence"
+
+
+def test_generic_filename_large_vehicle_photo_invokes_provider(damage_api_fixture):
+    api = damage_api_fixture
+    content = vehicle_png_bytes()
+    uploaded = api.client.post(
+        f"/api/v1/assessments/{api.assessment_id}/images",
+        files={"file": ("IMG_0001.png", content, "image/png")},
+    )
+    assert uploaded.status_code == 201
+    image_id = uploaded.json()["id"]
+    response = api.client.post(
+        f"/api/v1/assessments/{api.assessment_id}/images/{image_id}/damage"
+    )
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["status"] == "completed_with_findings"
+    assert payload["image_type"] == "vehicle_exterior"
+    assert payload["inspection_outcome"] == "completed_with_findings"
+    assert len(api.provider.calls) == 1
+    assert api.provider.calls[0][0] == content
+
+
+def test_rejected_image_logs_structured_non_sensitive_record(damage_api_fixture, caplog):
+    import logging
+
+    api = damage_api_fixture
+    uploaded = api.client.post(
+        f"/api/v1/assessments/{api.assessment_id}/images",
+        files={"file": ("IMG_0001.png", png_bytes(), "image/png")},
+    )
+    assert uploaded.status_code == 201
+    image_id = uploaded.json()["id"]
+    with caplog.at_level(logging.INFO, logger="app.api.v1.damage"):
+        response = api.client.post(
+            f"/api/v1/assessments/{api.assessment_id}/images/{image_id}/damage"
+        )
+    assert response.status_code == 200
+    assert response.json()["status"] == "unavailable"
+    assert response.json()["inspection_outcome"] == "classification_uncertain"
+    assert response.json()["damage_eligible"] is False
+    assert api.provider.calls == []
+
+    records = [
+        r for r in caplog.records
+        if getattr(r, "event", None) == "damage_image_classification_rejected"
+    ]
+    assert records
+    record = records[0]
+    assert record.image_type == "unknown"
+    assert record.rejection_reason == "insufficient_classification_evidence"
+    assert record.classification_method == "insufficient_evidence"
+    assert record.classification_source == "automatic"
+    assert record.message == "Damage image classification rejected for damage inference"
