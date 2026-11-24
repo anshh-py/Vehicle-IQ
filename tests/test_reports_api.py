@@ -432,16 +432,14 @@ def test_unavailable_damage_inspection_withholds_base_estimate_and_advises_inspe
     body = client.post(f"/api/v1/assessments/{assessment_id}/report").json()["report_data"]
     decision = body["pricing_decision"]
     recommendation = body["buyer_recommendation"]
-    assert decision["pricing_eligible"] is False
+    assert decision["pricing_eligible"] is True
     assert decision["condition_category"] == "inspection_unavailable"
-    assert decision["customer_facing_estimate_inr"] is None
-    assert decision["withholding_message"] == (
-        "Condition assessment unavailable. A reliable condition-adjusted resale estimate cannot be provided."
-    )
+    assert decision["status"] == "available_base_market"
+    assert decision["customer_facing_estimate_inr"] == "625000.00"
     assert recommendation["status"] == "further_inspection"
-    assert "condition has not been established" in recommendation["explanation"]
-    assert "not mean the vehicle is damaged or damage-free" in recommendation["explanation"]
-    assert recommendation["ml_estimate_inr"] is None
+    assert "condition was not established" in recommendation["explanation"]
+    assert "not condition-adjusted" in recommendation["explanation"]
+    assert recommendation["ml_estimate_inr"] == "625000.00"
 
 
 def test_llm_cannot_override_withheld_pricing_decision(report_api, monkeypatch):

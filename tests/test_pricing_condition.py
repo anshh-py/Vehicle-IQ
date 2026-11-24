@@ -55,11 +55,68 @@ def test_inspection_unavailable_and_failed_are_not_no_damage():
     failed = assess_condition([{"image_type": "vehicle_exterior", "damage_eligible": True, "status": "failed"}], [])
     assert unavailable["category"] == "inspection_unavailable"
     assert failed["category"] == "inspection_failed"
-    assert pricing_decision("500000", "research-model", unavailable)["withholding_message"] == INSPECTION_WITHHOLDING_MESSAGE
-    assert pricing_decision("500000", "research-model", failed)["status"] == "withheld_inspection_failed"
+    decision_unavailable = pricing_decision("500000", "research-model", unavailable)
+    decision_failed = pricing_decision("500000", "research-model", failed)
+    assert decision_unavailable["status"] == "available_base_market"
+    assert decision_unavailable["pricing_eligible"] is True
+    assert decision_unavailable["customer_facing_estimate_inr"] == "500000"
+    assert decision_failed["status"] == "available_base_market"
+    assert decision_failed["pricing_eligible"] is True
+    assert decision_failed["customer_facing_estimate_inr"] == "500000"
 
 
 def test_confidence_alone_does_not_change_damage_condition_category():
     low = assess_condition([completed_image()], [{"damage_type": "dent", "confidence": 0.01}])
     high = assess_condition([completed_image()], [{"damage_type": "dent", "confidence": 0.99}])
     assert low["category"] == high["category"] == "minor_cosmetic"
+
+
+def test_unavailable_condition_surfaces_labeled_base_market_valuation():
+    """A valid base ML estimate is shown as a base (unadjusted) valuation when
+    condition evidence is unavailable, instead of being fully withheld."""
+    condition = assess_condition(
+        [{"image_type": "unknown", "damage_eligible": False, "status": "unavailable"}],
+        [],
+    )
+    decision = pricing_decision("625000", "research-model", condition)
+    assert decision["status"] == "available_base_market"
+    assert decision["pricing_eligible"] is True
+    assert decision["customer_facing_estimate_inr"] == "625000"
+    assert decision["customer_facing_currency"] == "INR"
+    assert decision["condition_category"] == "inspection_unavailable"
+    assert decision["human_review_required"] is True
+    assert decision["audit"]["base_ml_estimate_inr"] == "625000"
+    assert decision["audit"]["is_condition_adjusted"] is False
+    assert decision["adjustment_methodology"] is None
+    assert "not condition-adjusted" in decision["withholding_message"]
+
+
+def test_unavailable_condition_without_base_amount_stays_unavailable():
+    condition = assess_condition(
+        [{"image_type": "unknown", "damage_eligible": False, "status": "unavailable"}],
+        [],
+    )
+    decision = pricing_decision(None, "research-model", condition)
+    assert decision["status"] == "unavailable"
+    assert decision["pricing_eligible"] is False
+    assert decision["customer_facing_estimate_inr"] is None
+    assert decision["withholding_reason"] == "base_ml_estimate_unavailable"
+
+
+def test_condition_available_and_clean_permits_base_estimate():
+    condition = assess_condition([completed_image()], [])
+    decision = pricing_decision("625000", "research-model", condition)
+    assert decision["status"] == "available"
+    assert decision["pricing_eligible"] is True
+    assert decision["customer_facing_estimate_inr"] == "625000"
+
+
+def test_actual_damage_findings_still_withhold_base_estimate():
+    condition = assess_condition(
+        [completed_image()],
+        [{"damage_type": "broken_lamp", "confidence": 0.9}],
+    )
+    decision = pricing_decision("625000", "research-model", condition)
+    assert decision["status"] == "withheld_insufficient_adjustment_evidence"
+    assert decision["pricing_eligible"] is False
+    assert decision["customer_facing_estimate_inr"] is None

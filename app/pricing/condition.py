@@ -80,9 +80,23 @@ def pricing_decision(base_amount: Any, model_name: str | None, condition: dict[s
     if category == "severe_damage":
         status, reason, message = "withheld_severe_damage", "potentially_severe_damage", SEVERE_WITHHOLDING_MESSAGE
     elif category == "inspection_failed":
-        status, reason, message = "withheld_inspection_failed", "inspection_failed", INSPECTION_WITHHOLDING_MESSAGE
+        if amount is not None:
+            status, reason, message = "available_base_market", None, (
+                "Base research-model estimate shown because image condition assessment failed. "
+                "It is not condition-adjusted; arrange a professional inspection before relying on it."
+            )
+            customer_amount = format(amount, "f")
+        else:
+            status, reason, message = "unavailable", "base_ml_estimate_unavailable", INSPECTION_WITHHOLDING_MESSAGE
     elif category == "inspection_unavailable":
-        status, reason, message = "withheld_inspection_unavailable", "inspection_unavailable", INSPECTION_WITHHOLDING_MESSAGE
+        if amount is not None:
+            status, reason, message = "available_base_market", None, (
+                "Condition assessment unavailable; a base research-model estimate is shown. "
+                "It is not condition-adjusted; arrange a professional inspection before relying on it."
+            )
+            customer_amount = format(amount, "f")
+        else:
+            status, reason, message = "unavailable", "base_ml_estimate_unavailable", INSPECTION_WITHHOLDING_MESSAGE
     elif category in {"minor_cosmetic", "moderate_damage"}:
         status = "withheld_insufficient_adjustment_evidence"
         reason = "no_validated_condition_adjustment_method"

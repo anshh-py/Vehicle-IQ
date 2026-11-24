@@ -1183,7 +1183,15 @@ def _buyer_recommendation(
 
     policy_withheld = pricing_decision_data is not None and not pricing_decision_data.get("pricing_eligible")
     high_risk = False
-    if policy_withheld:
+    if pricing_decision_data is not None and pricing_decision_data.get("status") == "available_base_market":
+        recommendation = "further_inspection"
+        explanation = (
+            "A base research-model estimate is shown, but the vehicle's condition was not "
+            "established by image inspection. It is not condition-adjusted; arrange a "
+            "professional inspection before relying on it."
+        )
+        next_steps = ["Arrange a qualified in-person inspection before relying on the resale valuation."]
+    elif policy_withheld:
         if pricing_decision_data.get("condition_category") == "severe_damage":
             recommendation = "further_inspection"
             high_risk = True
