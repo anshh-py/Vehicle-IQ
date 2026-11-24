@@ -47,6 +47,14 @@ logger = logging.getLogger(__name__)
 
 
 def get_damage_provider() -> DamageProvider:
+    if settings.damage_provider == "gradio_external":
+        from app.damage.gradio_provider import GradioDamageProvider
+
+        return GradioDamageProvider(
+            space=settings.damage_gradio_space_url,
+            timeout_seconds=settings.damage_gradio_timeout_seconds,
+            resize_flag=settings.damage_gradio_resize_flag,
+        )
     return IsolatedDamageProvider(
         settings.damage_inference_python,
         settings.damage_checkpoint_path,
@@ -73,6 +81,7 @@ def _analysis_response(
     findings: list[DamageFinding],
     *,
     reused: bool,
+    provider_name: str = IsolatedDamageProvider.provider_name,
     status: DamageInspectionStatus | None = None,
     image_type: str | None = None,
     inspection_outcome: str | None = None,
@@ -92,7 +101,7 @@ def _analysis_response(
     return ImageDamageResponse(
         assessment_id=assessment_id,
         image_id=image_id,
-        provider=IsolatedDamageProvider.provider_name,
+        provider=provider_name,
         status=status or (
             "completed_with_findings" if ordered_findings else "completed_no_findings"
         ),
@@ -113,28 +122,52 @@ def _analysis_response(
     )
 
 
-def _existing_findings(db: Session, assessment_id: UUID, image_id: UUID) -> list[DamageFinding]:
+def _provider_model_name(provider: DamageProvider) -> str:
+    """Return the persistence model identifier for a damage provider.
+
+    Local YOLO detections keep the canonical local MODEL_NAME. External
+    providers (e.g. Gradio) carry their own accurate identity via an optional
+    ``model_name`` attribute, falling back to a stable derived identifier.
+    """
+    if provider.provider_name == IsolatedDamageProvider.provider_name:
+        return MODEL_NAME
+    return getattr(provider, "model_name", f"external:{provider.provider_name}")
+
+
+def _existing_findings(
+    db: Session,
+    assessment_id: UUID,
+    image_id: UUID,
+    *,
+    model_name: str = MODEL_NAME,
+) -> list[DamageFinding]:
     return list(
         db.scalars(
             select(DamageFinding)
             .where(
                 DamageFinding.assessment_id == assessment_id,
                 DamageFinding.image_id == image_id,
-                DamageFinding.model_name == MODEL_NAME,
+                DamageFinding.model_name == model_name,
             )
             .order_by(DamageFinding.created_at, DamageFinding.id)
         ).all()
     )
 
 
-def _existing_scan(db: Session, assessment_id: UUID, image_id: UUID) -> EvidenceRecord | None:
+def _existing_scan(
+    db: Session,
+    assessment_id: UUID,
+    image_id: UUID,
+    *,
+    model_name: str = MODEL_NAME,
+) -> EvidenceRecord | None:
     return db.scalar(
         select(EvidenceRecord)
         .where(
             EvidenceRecord.assessment_id == assessment_id,
             EvidenceRecord.image_id == image_id,
             EvidenceRecord.evidence_type == "damage_detection",
-            EvidenceRecord.source_reference == MODEL_NAME,
+            EvidenceRecord.source_reference == model_name,
         )
         .order_by(EvidenceRecord.created_at.desc(), EvidenceRecord.id.desc())
     )
@@ -234,6 +267,7 @@ def _record_inspection_outcome(
     decision: ImageEligibilityDecision | None = None,
     inference_seconds: float | None = None,
     inspection_outcome: str | None = None,
+    model_name: str = MODEL_NAME,
 ) -> None:
     try:
         db.rollback()
@@ -248,7 +282,7 @@ def _record_inspection_outcome(
             )
             if locked_image_id is None:
                 raise HTTPException(status_code=404, detail="Image not found for assessment.")
-            record = _existing_scan(db, assessment_id, image_id)
+            record = _existing_scan(db, assessment_id, image_id, model_name=model_name)
             evidence_data = {
                 "status": status,
                 "detection_count": detection_count,
@@ -287,7 +321,7 @@ def _record_inspection_outcome(
                     assessment_id=assessment_id,
                     image_id=image_id,
                     evidence_type="damage_detection",
-                    source_reference=MODEL_NAME,
+                    source_reference=model_name,
                 )
                 db.add(record)
             record.evidence_data = evidence_data
@@ -304,6 +338,8 @@ def _persist_findings(
     image_id: UUID,
     result: DamageInferenceResult,
     decision: ImageEligibilityDecision | None = None,
+    provider_name: str = IsolatedDamageProvider.provider_name,
+    model_name: str = MODEL_NAME,
 ) -> ImageDamageResponse:
     try:
         db.rollback()
@@ -316,14 +352,15 @@ def _persist_findings(
             if locked_image_id is None:
                 raise HTTPException(status_code=404, detail="Image not found for assessment.")
 
-            existing = _existing_findings(db, assessment_id, image_id)
-            scan = _existing_scan(db, assessment_id, image_id)
+            existing = _existing_findings(db, assessment_id, image_id, model_name=model_name)
+            scan = _existing_scan(db, assessment_id, image_id, model_name=model_name)
             if _stored_damage_status(scan, existing) in _COMPLETED_DAMAGE_STATUSES:
                 return _analysis_response(
                     assessment_id,
                     image_id,
                     existing,
                     reused=True,
+                    provider_name=provider_name,
                     status=_stored_damage_status(scan, existing),
                 )
 
@@ -343,7 +380,7 @@ def _persist_findings(
                         "y2": y2,
                         "coordinate_space": "original_image_pixels",
                     },
-                    model_name=MODEL_NAME,
+                    model_name=model_name,
                 )
                 db.add(finding)
                 findings.append(finding)
@@ -352,7 +389,7 @@ def _persist_findings(
                     assessment_id=assessment_id,
                     image_id=image_id,
                     evidence_type="damage_detection",
-                    source_reference=MODEL_NAME,
+                    source_reference=model_name,
                 )
                 db.add(scan)
             scan.evidence_data = {
@@ -379,6 +416,7 @@ def _persist_findings(
 
             response = _analysis_response(
                 assessment_id, image_id, findings, reused=False,
+                provider_name=provider_name,
                 image_type=decision.image_type if decision else None,
                 inspection_outcome="completed_with_findings" if findings else "completed_no_findings",
                 condition_category=condition["category"],
@@ -404,6 +442,7 @@ def inspect_assessment_image_damage(
     db: Session = Depends(get_db),
     provider: DamageProvider = Depends(get_damage_provider),
 ) -> ImageDamageResponse:
+    model_name = _provider_model_name(provider)
     try:
         assessment = db.get(VehicleAssessment, assessment_id)
         if assessment is None:
@@ -431,7 +470,7 @@ def inspect_assessment_image_damage(
         return ImageDamageResponse(
             assessment_id=assessment_id,
             image_id=image_id,
-            provider=IsolatedDamageProvider.provider_name,
+            provider=provider.provider_name,
             status="unavailable",
             reused=False,
             findings=[],
@@ -450,7 +489,7 @@ def inspect_assessment_image_damage(
         return ImageDamageResponse(
             assessment_id=assessment_id,
             image_id=image_id,
-            provider=IsolatedDamageProvider.provider_name,
+            provider=provider.provider_name,
             status="unavailable",
             reused=False,
             findings=[],
@@ -571,8 +610,8 @@ def inspect_assessment_image_damage(
         )
 
     try:
-        existing = _existing_findings(db, assessment_id, image_id)
-        scan = _existing_scan(db, assessment_id, image_id)
+        existing = _existing_findings(db, assessment_id, image_id, model_name=model_name)
+        scan = _existing_scan(db, assessment_id, image_id, model_name=model_name)
         stored_status = _stored_damage_status(scan, existing)
         if stored_status in _COMPLETED_DAMAGE_STATUSES:
             stored_evidence = scan.evidence_data if scan and isinstance(scan.evidence_data, dict) else {}
@@ -580,6 +619,7 @@ def inspect_assessment_image_damage(
             db.rollback()
             return _analysis_response(
                 assessment_id, image_id, existing, reused=True, status=stored_status,
+                provider_name=provider.provider_name,
                 image_type=stored_evidence.get("image_type") or stored_classification.get("image_type"),
                 inspection_outcome=stored_evidence.get("inspection_outcome"),
                 condition_category=stored_evidence.get("condition_category"),
@@ -615,17 +655,22 @@ def inspect_assessment_image_damage(
         status_value = "failed"
         reason = "Damage inference failed."
     else:
-        return _persist_findings(db, assessment_id, image_id, result, decision)
+        return _persist_findings(
+            db, assessment_id, image_id, result, decision,
+            provider_name=provider.provider_name,
+            model_name=model_name,
+        )
 
     _record_inspection_outcome(
         db, assessment_id, image_id, status_value, reason=reason,
         decision=decision,
         inspection_outcome="inference_failed" if status_value == "failed" else "inference_unavailable",
+        model_name=model_name,
     )
     return ImageDamageResponse(
         assessment_id=assessment_id,
         image_id=image_id,
-        provider=IsolatedDamageProvider.provider_name,
+        provider=provider.provider_name,
         status=status_value,
         reused=False,
         findings=[],

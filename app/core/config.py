@@ -57,6 +57,10 @@ class Settings(BaseSettings):
     )
     damage_checkpoint_path: Path = PROJECT_ROOT / ".local-storage" / "damage-poc" / "trained.pt"
     damage_inference_timeout_seconds: int = Field(default=180, gt=0, le=600)
+    damage_provider: Literal["local_yolo", "gradio_external"] = "local_yolo"
+    damage_gradio_space_url: str = "svuppu/car-damage-detection"
+    damage_gradio_resize_flag: bool = False
+    damage_gradio_timeout_seconds: int = Field(default=120, gt=0, le=600)
     vehicle_lookup_enabled: bool = False
     vehicle_lookup_base_url: str = "https://vehiclex.profilework239.workers.dev/"
     vehicle_lookup_timeout_seconds: float = Field(default=10.0, gt=0, le=30)

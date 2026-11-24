@@ -33,7 +33,6 @@ def vehicle_png_bytes() -> bytes:
 
 class FakeDamageProvider:
     provider_name = "yolo11m_local"
-
     def __init__(self, result=None, error=None):
         self.result = result or DamageInferenceResult(
             detections=(
@@ -63,6 +62,11 @@ class SequenceDamageProvider(FakeDamageProvider):
         if isinstance(result, Exception):
             raise result
         return result
+
+
+class ExternalGradioDamageProvider(FakeDamageProvider):
+    provider_name = "huggingface_gradio_damage"
+    model_name = "huggingface_gradio_damage"
 
 
 class DamageAPIFixture:
@@ -609,3 +613,194 @@ def test_ineligible_plate_image_is_not_evaluated_and_provider_not_called():
     finally:
         app.dependency_overrides.clear()
         engine.dispose()
+
+
+def test_external_gradio_provider_persists_external_model_provenance(tmp_path):
+    with damage_api(tmp_path, provider=ExternalGradioDamageProvider()) as api:
+        response = api.client.post(
+            f"/api/v1/assessments/{api.assessment_id}/images/{api.image_id}/damage"
+        )
+        assert response.status_code == 200
+        payload = response.json()
+        assert payload["provider"] == "huggingface_gradio_damage"
+        assert payload["findings"]
+        assert all(f["model_name"] == "huggingface_gradio_damage" for f in payload["findings"])
+
+        with Session(api.engine) as session:
+            findings = session.scalars(
+                select(DamageFinding).where(DamageFinding.assessment_id == UUID(api.assessment_id))
+            ).all()
+            assert findings
+            assert all(f.model_name == "huggingface_gradio_damage" for f in findings)
+            scan = session.scalar(
+                select(EvidenceRecord).where(
+                    EvidenceRecord.evidence_type == "damage_detection",
+                    EvidenceRecord.assessment_id == UUID(api.assessment_id),
+                )
+            )
+            assert scan is not None
+            assert scan.source_reference == "huggingface_gradio_damage"
+
+
+def test_local_provider_keeps_local_model_provenance(damage_api_fixture):
+    api = damage_api_fixture
+    response = api.client.post(
+        f"/api/v1/assessments/{api.assessment_id}/images/{api.image_id}/damage"
+    )
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["provider"] == "yolo11m_local"
+    assert all(f["model_name"] == MODEL_NAME for f in payload["findings"])
+
+    with Session(api.engine) as session:
+        findings = session.scalars(
+            select(DamageFinding).where(DamageFinding.assessment_id == UUID(api.assessment_id))
+        ).all()
+        assert findings
+        assert all(f.model_name == MODEL_NAME for f in findings)
+        scan = session.scalar(
+            select(EvidenceRecord).where(
+                EvidenceRecord.evidence_type == "damage_detection",
+                EvidenceRecord.assessment_id == UUID(api.assessment_id),
+            )
+        )
+        assert scan is not None
+        assert scan.source_reference == MODEL_NAME
+
+
+def test_external_provider_findings_are_reused_without_duplication(tmp_path):
+    with damage_api(tmp_path, provider=ExternalGradioDamageProvider()) as api:
+        path = f"/api/v1/assessments/{api.assessment_id}/images/{api.image_id}/damage"
+        first = api.client.post(path)
+        second = api.client.post(path)
+
+        assert first.status_code == second.status_code == 200
+        assert second.json()["reused"] is True
+        assert second.json()["findings"] == first.json()["findings"]
+        assert len(api.provider.calls) == 1
+
+        with Session(api.engine) as session:
+            count = session.scalar(select(func.count()).select_from(DamageFinding)) or 0
+            assert count == len(first.json()["findings"])
+
+
+def test_gradio_no_damage_response_is_not_a_finding_and_condition_clean(tmp_path):
+    from app.damage.gradio_provider import GradioDamageProvider
+
+    class LocalFakeClient:
+        def __init__(self):
+            self.calls = []
+
+        def predict(self, **kwargs):
+            self.calls.append(kwargs)
+            headers = ["Class", "Confidence", "YOLO [x_center, y_center, w, h]"]
+            return (
+                "/tmp/a.webp",
+                {"headers": headers, "data": [["no damage", 0.989, "[0.5, 0.5, 1.0, 1.0]"]]},
+                "/tmp/a.csv",
+                "/tmp/a.txt",
+            )
+
+    fake = LocalFakeClient()
+    provider = GradioDamageProvider(client_factory=lambda: fake)
+    with damage_api(tmp_path, provider=provider) as api:
+        path = f"/api/v1/assessments/{api.assessment_id}/images/{api.image_id}/damage"
+        response = api.client.post(path)
+        assert response.status_code == 200
+        payload = response.json()
+        assert payload["provider"] == "huggingface_gradio_damage"
+        assert payload["status"] == "completed_no_findings"
+        assert payload["findings"] == []
+        assert payload["condition_category"] == "no_visible_damage"
+        assert payload["requires_human_review"] is False
+        assert count_findings(api.engine) == 0
+
+        with Session(api.engine) as session:
+            scan = session.scalar(
+                select(EvidenceRecord).where(EvidenceRecord.evidence_type == "damage_detection")
+            )
+            assert scan is not None
+            assert scan.evidence_data["status"] == "completed_no_findings"
+            assert scan.evidence_data["detection_count"] == 0
+            assert scan.evidence_data["condition_category"] == "no_visible_damage"
+            assert scan.source_reference == "huggingface_gradio_damage"
+
+
+def test_batch_clean_and_damaged_images_aggregate_distinctly(tmp_path):
+    # Two images: the first yields an empty result (clean vehicle after the
+    # provider filters the "no damage" sentinel); the second yields real damage.
+    results = [
+        DamageInferenceResult(detections=(), inference_seconds=0.3),
+        DamageInferenceResult(
+            detections=(DamageDetection("dent", 0.91, (1.0, 2.0, 10.0, 11.0)),),
+            inference_seconds=0.5,
+        ),
+    ]
+    with damage_api(tmp_path, provider=SequenceDamageProvider(results)) as api:
+        clean_id = api.image_id
+        damaged_id = add_stored_image(api, api.content)
+        response = api.client.post(
+            f"/api/v1/assessments/{api.assessment_id}/damage",
+            json={"image_ids": [clean_id, damaged_id]},
+        )
+        assert response.status_code == 200
+        body = response.json()
+        assert body["status"] == "completed_with_findings"
+        assert body["processed_count"] == 2
+        assert body["failed_count"] == 0
+        assert body["unavailable_count"] == 0
+        by_image = {r["image_id"]: r for r in body["results"]}
+        assert by_image[clean_id]["status"] == "completed_no_findings"
+        assert by_image[clean_id]["findings"] == []
+        assert by_image[clean_id]["condition_category"] == "no_visible_damage"
+        assert by_image[damaged_id]["status"] == "completed_with_findings"
+        assert len(by_image[damaged_id]["findings"]) == 1
+        assert by_image[damaged_id]["findings"][0]["damage_type"] == "dent"
+        assert count_findings(api.engine) == 1
+
+
+def test_valuation_not_withheld_for_no_visible_damage_condition():
+    from app.pricing.condition import assess_condition, pricing_decision
+
+    condition = assess_condition(
+        [{"damage_eligible": True, "status": "completed_no_findings"}], []
+    )
+    assert condition["category"] == "no_visible_damage"
+    assert condition["requires_human_review"] is False
+
+    decision = pricing_decision(2000000, "test-model", condition)
+    assert decision["pricing_eligible"] is True
+    assert decision["status"] == "available"
+    assert decision["customer_facing_estimate_inr"] == "2000000"
+
+
+def test_valuation_withheld_for_minor_cosmetic_damage_condition():
+    from app.pricing.condition import assess_condition, pricing_decision
+
+    # "dent" is in the supported minor set -> minor_cosmetic (still withheld).
+    condition = assess_condition(
+        [{"damage_eligible": True, "status": "completed_with_findings"}],
+        [{"damage_type": "dent"}],
+    )
+    assert condition["category"] == "minor_cosmetic"
+    assert condition["requires_human_review"] is True
+
+    decision = pricing_decision(2000000, "test-model", condition)
+    assert decision["pricing_eligible"] is False
+    assert decision["status"] == "withheld_insufficient_adjustment_evidence"
+
+
+def test_valuation_withheld_for_moderate_damage_condition():
+    from app.pricing.condition import assess_condition, pricing_decision
+
+    # A non-minor class (e.g. "broken lamp") -> moderate_damage (withheld).
+    condition = assess_condition(
+        [{"damage_eligible": True, "status": "completed_with_findings"}],
+        [{"damage_type": "broken lamp"}],
+    )
+    assert condition["category"] == "moderate_damage"
+    assert condition["requires_human_review"] is True
+
+    decision = pricing_decision(2000000, "test-model", condition)
+    assert decision["pricing_eligible"] is False
+    assert decision["status"] == "withheld_insufficient_adjustment_evidence"
